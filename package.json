@@ -4,9 +4,21 @@
   "description": "Reusable ParaMagic parametric drawing editor and document engine",
   "type": "module",
   "sideEffects": false,
+  "files": [
+    "src",
+    "vendor/xlsx-0.20.3.tgz",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kevinLamm/paramagic-core.git"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
   "dependencies": {
     "@techstark/opencv-js": "5.0.0-release.1",
-    "xlsx": "file:../../vendor/xlsx-0.20.3.tgz"
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
   },
   "exports": {
     ".": "./src/index.js",

@@ -6,6 +6,12 @@ The package exposes the interactive editor, document codec and merge behavior, s
 geometry systems, and exporters through separate browser-compatible ES module entry points.
 Host applications provide their own product shell and persistence UI.
 
+Install the tagged public package directly from GitHub:
+
+```sh
+npm install github:kevinLamm/paramagic-core#v0.1.0
+```
+
 Public entry points:
 
 - `@paramagic/core/editor` — interactive canvas, tools, and editor systems.
