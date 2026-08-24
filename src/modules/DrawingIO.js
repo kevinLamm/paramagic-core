@@ -435,8 +435,8 @@ export function parseDxf(text) {
     const fields = entityFields(pairs.slice(index + 1, end));
     const number = (code, occurrence = 0) => Number(fields.get(code)?.[occurrence] || 0) * factor;
     const point = (xCode, yCode, occurrence = 0) => [number(xCode, occurrence), -number(yCode, occurrence)];
-    if (type === 'LINE') entities.push({ type: 'line', start: point(10, 20), end: point(11, 21) });
-    if (type === 'CIRCLE') entities.push({ type: 'circle', center: point(10, 20), radius: number(40) });
+    if (type === 'LINE') entities.push({ id: newId('dxf-line'), type: 'line', start: point(10, 20), end: point(11, 21) });
+    if (type === 'CIRCLE') entities.push({ id: newId('dxf-circle'), type: 'circle', center: point(10, 20), radius: number(40) });
     if (type === 'ARC') {
       const center = point(10, 20);
       const radius = number(40);
@@ -444,7 +444,7 @@ export function parseDxf(text) {
       const endAngleRaw = Number(fields.get(51)?.[0] || 0) * Math.PI / 180;
       const endAngle = endAngleRaw < startAngle ? endAngleRaw + Math.PI * 2 : endAngleRaw;
       const at = (angle) => [center[0] + radius * Math.cos(angle), center[1] - radius * Math.sin(angle)];
-      entities.push({ type: 'arc', start: at(startAngle), arcPoint: at((startAngle + endAngle) / 2), end: at(endAngle), center, radius, ccw: false });
+      entities.push({ id: newId('dxf-arc'), type: 'arc', start: at(startAngle), arcPoint: at((startAngle + endAngle) / 2), end: at(endAngle), center, radius, ccw: false });
     }
     if (type === 'LWPOLYLINE') {
       const vertices = lwPolylineVertices(pairs.slice(index + 1, end), factor);
@@ -454,7 +454,7 @@ export function parseDxf(text) {
       const hasBulges = vertices.slice(0, segmentCount)
         .some(({ bulge }) => Math.abs(Number(bulge) || 0) > 1e-12);
       if (points.length >= 2 && !hasBulges) {
-        entities.push({ type: closed ? 'polygon' : 'polyline', points });
+        entities.push({ id: newId('dxf-polyline'), type: closed ? 'polygon' : 'polyline', points });
       } else if (segmentCount > 0) {
         const compositeId = newId('dxf-polyline');
         for (let segment = 0; segment < segmentCount; segment += 1) {
