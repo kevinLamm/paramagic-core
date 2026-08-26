@@ -1,5 +1,6 @@
 import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { arcSweepFromAngles } from './ArcGeometry.js';
+import { isSwellEntity, swellDefinitionForEntity, withSwellDefinition } from './SwellGeometry.js';
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const subtract = (a, b) => [a[0] - b[0], a[1] - b[1]];
@@ -12,6 +13,23 @@ const cross = (a, b) => a[0] * b[1] - a[1] * b[0];
 const midpoint = (a, b) => scale(add(a, b), 0.5);
 const perpendicular = (point) => [-point[1], point[0]];
 const EPSILON = 1e-8;
+
+export function inheritSwellFilletArc(arc, sourceEntities = [], { sourceEndpoints = [] } = {}) {
+  const source = sourceEntities.find((entity) => isSwellEntity(entity));
+  if (!source) return arc;
+  const inherited = withSwellDefinition(arc, swellDefinitionForEntity(source));
+  return {
+    ...inherited,
+    composite: {
+      ...inherited.composite,
+      swellFillet: {
+        sourceEndpoints: sourceEndpoints
+          .filter((endpoint) => endpoint?.recordId && [0, 2].includes(Number(endpoint.index)))
+          .map((endpoint) => ({ recordId: endpoint.recordId, index: Number(endpoint.index) })),
+      },
+    },
+  };
+}
 
 function unit(point) {
   const size = length(point);
@@ -802,13 +820,19 @@ export function createFilletSystem({
       return null;
     }
     const { derivedFromFillet: _derivedFromFillet, ...plainArc } = evaluated.arc;
-    const arc = assignStack(assignClass({
+    let arc = assignStack(assignClass({
       ...plainArc,
       id: arcId,
       type: 'arc',
       construction: fillet.construction,
       appearance: fillet.appearance,
     }), first.entity.stackId);
+    arc = inheritSwellFilletArc(arc, [first.entity, second.entity], {
+      sourceEndpoints: [
+        { recordId: first.id, index: corner.indexA },
+        { recordId: second.id, index: corner.indexB },
+      ],
+    });
     const constraints = regularFilletConstraints({
       arcId,
       filletArc: arc,

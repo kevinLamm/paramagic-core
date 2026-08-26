@@ -366,6 +366,27 @@ function matrixFromRows(rows, variables) {
   return rows.map((row) => variables.map((variable) => row.get(variable.id) || 0));
 }
 
+function normalizedConstraintDirection(constraint) {
+  const value = constraint?.direction;
+  if (!Array.isArray(value) || value.length < 2) return null;
+  const x = Number(value[0]);
+  const y = Number(value[1]);
+  const size = Math.hypot(x, y);
+  return Number.isFinite(size) && size > DIFFERENTIABILITY_EPSILON ? [x / size, y / size] : null;
+}
+
+function directionBranchRow(vector, constraint, desired) {
+  const direction = normalizedConstraintDirection(constraint);
+  if (!direction) return null;
+  const scale = Math.max(1, Math.abs(desired));
+  if (dot(vector.value, direction) >= 0) return new Map();
+  const row = new Map();
+  for (const [variableId, derivative] of vector.derivatives) {
+    row.set(variableId, dot(derivative, direction) / scale);
+  }
+  return row;
+}
+
 function targetValue(constraint, dimensions) {
   if (constraint.dimensionRef) return dimensions.value(constraint.dimensionRef);
   return Number.isFinite(constraint.value) ? constraint.value : null;
@@ -477,7 +498,8 @@ function distance({ model, constraint, dimensions, variables }) {
   const row = new Map();
   accumulatePointGradient(row, first, delta, 2 * residualDerivative);
   accumulatePointGradient(row, second, delta, -2 * residualDerivative);
-  return matrixFromRows([row], variables);
+  const branch = directionBranchRow(vectorBetween(first, second), constraint, desired);
+  return matrixFromRows(branch ? [row, branch] : [row], variables);
 }
 
 function axisDistance({ model, constraint, dimensions, variables }, coordinate) {
@@ -525,7 +547,9 @@ function pointLineDistance({ model, constraint, dimensions, variables }) {
   }
   const measuredSquared = squaredLengthScalar(vectorBetween(projected, point));
   const normalized = normalizedDifference(measuredSquared, { value: desired ** 2, gradient: new Map() });
-  return normalized ? matrixFromRows([normalized.gradient], variables) : null;
+  if (!normalized) return null;
+  const branch = directionBranchRow(vectorBetween(projected, point), constraint, desired);
+  return matrixFromRows(branch ? [normalized.gradient, branch] : [normalized.gradient], variables);
 }
 
 function lineLineDistance({ model, constraint, dimensions, variables }) {

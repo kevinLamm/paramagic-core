@@ -737,7 +737,50 @@ export function createNotchBoundaryResolver({
   getSubtractBoundaryFeatureFromWorld = () => null,
   getSubtractBoundaryInwardTarget = () => null,
   getResolvedBoundaries = null,
+  derivedBoundaryProviders = new Set(),
 }) {
+  const providers = () => [...derivedBoundaryProviders];
+
+  function derivedBoundaryForHost(host) {
+    for (const provider of providers()) {
+      const boundary = provider.boundaryForHost?.(host);
+      if (boundary) return boundary;
+    }
+    return null;
+  }
+
+  function derivedFeatureForHost(host, context = null) {
+    for (const provider of providers()) {
+      const feature = provider.featureForHost?.(host, context);
+      if (feature) return feature;
+    }
+    return null;
+  }
+
+  function derivedBoundaryFeatures(host) {
+    for (const provider of providers()) {
+      const features = provider.boundaryFeatures?.(host);
+      if (features?.length) return features;
+    }
+    return [];
+  }
+
+  function derivedInwardTarget(host, boundaryPoint, tangent, context = null) {
+    for (const provider of providers()) {
+      const target = provider.inwardTarget?.(host, boundaryPoint, tangent, context);
+      if (target) return target;
+    }
+    return null;
+  }
+
+  function derivedHostIsClosed(host) {
+    return providers().some((provider) => provider.isClosedHost?.(host) === true);
+  }
+
+  function derivedBoundaries() {
+    return providers().flatMap((provider) => provider.boundaries?.() || []);
+  }
+
   function featuresForEntity(entity) {
     if (!entity) return [];
     if (['line', 'rect', 'polygon', 'polyline'].includes(entity.type)) {
@@ -820,6 +863,8 @@ export function createNotchBoundaryResolver({
     if (subtractFeature) return subtractFeature;
     const resolvedFeature = resolvedFeatureForHost(host, context);
     if (resolvedFeature) return resolvedFeature;
+    const derivedFeature = derivedFeatureForHost(host, context);
+    if (derivedFeature) return derivedFeature;
     return sourceFeatureForHost(host);
   }
 
@@ -829,6 +874,8 @@ export function createNotchBoundaryResolver({
     if (subtractFeatures.length) return subtractFeatures;
     const boundary = currentResolvedBoundary(host);
     if (boundary) return boundary.features;
+    const derivedFeatures = derivedBoundaryFeatures(host);
+    if (derivedFeatures.length) return derivedFeatures;
     const hostRecord = records.find((record) => record.id === host?.recordId);
     if (!hostRecord) return [];
     if (['circle', 'rect', 'polygon'].includes(hostRecord.entity.type)) {
@@ -847,6 +894,8 @@ export function createNotchBoundaryResolver({
   function polygonForHost(host) {
     const boundary = currentResolvedBoundary(host);
     if (boundary?.polygon?.length >= 3) return boundary.polygon.map((point) => [...point]);
+    const derivedBoundary = derivedBoundaryForHost(host);
+    if (derivedBoundary?.polygon?.length >= 3) return derivedBoundary.polygon.map((point) => [...point]);
     const hostRecord = records.find((record) => record.id === host?.recordId);
     if (hostRecord?.entity.type === 'rect') {
       const { x, y, width, height } = hostRecord.entity;
@@ -870,6 +919,8 @@ export function createNotchBoundaryResolver({
     const feature = featureForHost(host, context);
     const subtractTarget = getSubtractBoundaryInwardTarget(feature, boundaryPoint, tangent);
     if (subtractTarget) return subtractTarget;
+    const providerTarget = derivedInwardTarget(host, boundaryPoint, tangent, context);
+    if (providerTarget) return providerTarget;
     const polygon = polygonForHost(host);
     const localTarget = inwardTargetFromBoundary(boundaryPoint, tangent, polygon);
     if (localTarget) return localTarget;
@@ -895,6 +946,7 @@ export function createNotchBoundaryResolver({
 
   function isClosedHost(feature) {
     if (currentResolvedBoundary(feature)) return true;
+    if (derivedHostIsClosed(feature)) return true;
     const record = records.find((candidate) => candidate.id === feature?.recordId);
     if (!record || record.entity.construction) return false;
     if (!['geometry', 'fillet'].includes(record.recordType)) return false;
@@ -919,9 +971,13 @@ export function createNotchBoundaryResolver({
 
   function featureFromEvent(event) {
     const target = event.paramagicSelectionTarget || event.target;
+    const world = screenToWorld(event.clientX, event.clientY);
+    for (const provider of providers()) {
+      const feature = provider.featureFromEvent?.({ event, target, world });
+      if (feature) return feature;
+    }
     const recordElement = target.closest?.('.canvas-record, .canvas-handle-group');
     const record = records.find((candidate) => candidate.id === recordElement?.dataset.recordId);
-    const world = screenToWorld(event.clientX, event.clientY);
     const subtractFeature = getSubtractBoundaryFeatureFromWorld(world, record?.id);
     if (subtractFeature) return subtractFeature;
     if (!record && target.classList?.contains('closed-constrained-region')) {
@@ -958,8 +1014,9 @@ export function createNotchBoundaryResolver({
   }
 
   return {
-    boundaryForHost: currentResolvedBoundary,
+    boundaryForHost: (host) => currentResolvedBoundary(host) || derivedBoundaryForHost(host),
     boundaryFeatures,
+    derivedBoundaries,
     featureForHost,
     featureFromEvent,
     featuresForEntity,
@@ -1241,7 +1298,7 @@ export function createNotchSystem({
       inwardResolver(host),
       undefined,
       normalizeNotchType(notchType, DEFAULT_NOTCH_TYPE),
-    ), records.find((record) => record.id === feature.recordId)?.entity?.stackId);
+    ), records.find((record) => record.id === (feature.sourceId || feature.recordId))?.entity?.stackId);
     requestHistoryCheckpoint('notch-add');
     const record = createRecord(entity);
     if (!record) return null;

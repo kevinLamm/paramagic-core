@@ -401,16 +401,19 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
   }
 
   function featureWorldPoint(ref) {
+    const external = () => [...constraintOperations]
+      .map((operation) => operation.resolveFeature?.(ref))
+      .find(Boolean);
     if (ref.kind === 'point') {
       const feature = canvas.getPointFeature(ref.recordId, ref.index, { pointRole: ref.pointRole, rendered: true })
-        || [...constraintOperations].map((operation) => operation.resolveFeature?.(ref)).find(Boolean);
+        || external();
       return feature?.point || null;
     }
     if (ref.kind === 'segment') {
-      const segment = canvas.getSegmentFeature(ref.recordId, ref.index);
+      const segment = canvas.getSegmentFeature(ref.recordId, ref.index) || external();
       return constraintHelperPoint(segment ? { kind: 'segment', ...segment } : null);
     }
-    return constraintHelperPoint(canvas.getEntityFeature(ref.recordId));
+    return constraintHelperPoint(canvas.getEntityFeature(ref.recordId) || external());
   }
 
   function tangentWorldPoint(featureRefs, mode = null) {

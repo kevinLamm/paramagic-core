@@ -1,5 +1,7 @@
 import { resolveVectorDrawingPoint } from './DrawingTools.js';
 import { dimensionFeatureDistance, nearestDimensionFeature, resolveDimensionFeatureSet, transformDimensionFeatureSet } from './DimensionSystem.js';
+import { isSwellEntity } from './SwellGeometry.js';
+import { splitDerivedPresentationNodes } from './CanvasPaintOrder.js';
 
 export const DUPLICATE_ICON = '<rect x="4" y="4" width="11" height="11" rx="1"/><rect x="9" y="9" width="11" height="11" rx="1"/>';
 export const SYMMETRIC_ICON = '<path d="M3.5 6.5l5.5 2.4v6.2l-5.5 2.4zM20.5 6.5L15 8.9v6.2l5.5 2.4z"/><path d="M12 3v3m0 2v4m0 2v3m0 2v2" stroke-width="2"/>';
@@ -180,7 +182,12 @@ export function seamDependsOnSelectedSources(entity, selectedSourceIds) {
   return ownerIds.size > 0 && [...ownerIds].every((id) => selectedSourceIds.has(id));
 }
 export function isMirrorableEntity(entity) {
-  return Boolean(entity?.id && !isSymmetricCenterline(entity) && entity.construction !== true && !String(entity.type || '').includes('dimension'));
+  return Boolean(
+    entity?.id
+    && !isSymmetricCenterline(entity)
+    && (entity.construction !== true || isSwellEntity(entity))
+    && !String(entity.type || '').includes('dimension')
+  );
 }
 export function isDuplicableEntity(entity) {
   return Boolean(entity?.id && !isSymmetricCenterline(entity) && !isDerivedSeamEntity(entity) && !String(entity.type || '').includes('dimension'));
@@ -188,9 +195,15 @@ export function isDuplicableEntity(entity) {
 
 export function selectionIdsFromTarget(target) {
   if (!target?.closest) return [];
+  const selectionSet = target.closest('[data-selection-record-ids]');
+  if (selectionSet) return String(selectionSet.dataset.selectionRecordIds || '').split(',').map((id) => id.trim()).filter(Boolean);
   const region = target.closest('.closed-constrained-region[data-parent-ids]');
   if (region) return String(region.dataset.parentIds || '').split(',').map((id) => id.trim()).filter(Boolean);
-  const record = target.closest('.canvas-record[data-record-id]');
+  const record = target.closest([
+    '.canvas-record[data-record-id]',
+    '.canvas-handle-group[data-record-id]',
+    '.table-handle-group[data-record-id]',
+  ].join(','));
   return record?.dataset.recordId ? [record.dataset.recordId] : [];
 }
 
@@ -257,6 +270,8 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       const node = recordNode(id);
       if (node) holder.appendChild(sanitizeClone(node.cloneNode(true), 'duplicate'));
     });
+    (canvas.getDerivedPresentationNodes?.(sourceIds) || [])
+      .forEach((node) => holder.appendChild(sanitizeClone(node.cloneNode(true), 'duplicate')));
     if (!holder.childNodes.length) return null;
     objectLayer.appendChild(holder);
     let bounds = null;
@@ -301,6 +316,8 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
   function syncSourceHighlights() {
     clearSourceHighlights();
     pendingSourceIds.forEach((id) => recordNode(id)?.classList.add('linked-copy-source-selected'));
+    (canvas.getDerivedPresentationNodes?.([...pendingSourceIds]) || [])
+      .forEach((node) => node.classList.add('linked-copy-source-selected'));
   }
   function dependentIds(entities, sourceIds) {
     const selected = new Set(sourceIds);
@@ -320,7 +337,21 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
 
   function templateFor(definition, entities) {
     const template = createSvg('g', { class: 'linked-copy-template' });
-    [...definition.sourceIds, ...dependentIds(entities, definition.sourceIds)].forEach((id) => {
+    const derivedPresentationNodes = canvas.getDerivedPresentationNodes?.(definition.sourceIds) || [];
+    const explicitDependentIds = definition.sourceIds.filter((id) => {
+      const entity = entities.get(id);
+      return entity?.type === 'notch' || entity?.composite?.kind === 'finish-size-offset';
+    });
+    const sourceIds = definition.sourceIds.filter((id) => !explicitDependentIds.includes(id));
+    const dependentSourceIds = uniqueIds([
+      ...explicitDependentIds,
+      ...dependentIds(entities, definition.sourceIds),
+    ]);
+    const derived = splitDerivedPresentationNodes(derivedPresentationNodes);
+    derived.before.forEach((node) => {
+      template.appendChild(sanitizeClone(node.cloneNode(true), definition.type));
+    });
+    sourceIds.forEach((id) => {
       const source = recordNode(id);
       if (!source) return;
       let copy = sanitizeClone(source.cloneNode(true), definition.type);
@@ -328,7 +359,19 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       copy.setAttribute('data-linked-copy-source-id', id);
       template.appendChild(copy);
     });
-    (canvas.getSeamLinePresentationNodes?.(definition.sourceIds) || []).forEach((node) => template.appendChild(sanitizeClone(node.cloneNode(true), definition.type)));
+    derived.after.forEach((node) => {
+      template.appendChild(sanitizeClone(node.cloneNode(true), definition.type));
+    });
+    (canvas.getSeamLinePresentationNodes?.(definition.sourceIds) || [])
+      .filter((node) => !derivedPresentationNodes.some((presentation) => presentation.contains(node)))
+      .forEach((node) => template.appendChild(sanitizeClone(node.cloneNode(true), definition.type)));
+    dependentSourceIds.forEach((id) => {
+      const source = recordNode(id);
+      if (!source) return;
+      const copy = sanitizeClone(source.cloneNode(true), definition.type);
+      copy.setAttribute('data-linked-copy-source-id', id);
+      template.appendChild(copy);
+    });
     regionNodes(definition.sourceIds).forEach((node) => template.insertBefore(sanitizeClone(node.cloneNode(true), definition.type), template.firstChild));
     return template;
   }

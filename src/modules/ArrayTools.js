@@ -7,6 +7,7 @@ import {
   resolveDimensionFeatureSet,
   transformDimensionFeatureSet,
 } from './DimensionSystem.js';
+import { splitDerivedPresentationNodes } from './CanvasPaintOrder.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MAX_ARRAY_ITEMS = 500;
@@ -491,25 +492,16 @@ function createSvg(tag, attributes = {}) {
   return node;
 }
 
-function sourceIdsFromTarget(target) {
-  if (!target?.closest) return [];
-  const region = target.closest('.closed-constrained-region[data-parent-ids]');
-  if (region) {
-    return String(region.dataset.parentIds || '')
-      .split(',')
-      .map((id) => id.trim())
-      .filter(Boolean);
-  }
-  const record = target.closest('.canvas-record[data-record-id]');
-  return record?.dataset.recordId ? [record.dataset.recordId] : [];
-}
-
 function isArrayableEntity(entity) {
   if (!entity?.id || String(entity.type || '').includes('dimension')) return false;
   if (isArrayCenterPointEntity(entity)) return false;
   if (entity.composite?.kind === 'finish-size-offset') return false;
   if (entity.composite?.kind === 'symmetric-centerline') return false;
   return true;
+}
+
+export function arraySourceIdsFromSelection(recordIds = [], entities = new Map()) {
+  return uniqueIds(recordIds).filter((id) => isArrayableEntity(entities.get(id)));
 }
 
 function sanitizeClone(node) {
@@ -816,8 +808,21 @@ export function createArrayTools({ toolbar, canvas }) {
 
   function templateFor(definition, entities) {
     const template = createSvg('g', { class: 'array-item-template' });
-    const dependentIds = arrayDependentVisualIds(entities, definition.sourceIds);
-    [...definition.sourceIds, ...dependentIds].forEach((recordId) => {
+    const explicitDependentIds = definition.sourceIds.filter((recordId) => {
+      const entity = entities.get(recordId);
+      return entity?.type === 'notch' || entity?.composite?.kind === 'finish-size-offset';
+    });
+    const sourceIds = definition.sourceIds.filter((recordId) => !explicitDependentIds.includes(recordId));
+    const dependentIds = uniqueIds([
+      ...explicitDependentIds,
+      ...arrayDependentVisualIds(entities, definition.sourceIds),
+    ]);
+    const derivedPresentationNodes = canvas.getDerivedPresentationNodes?.(definition.sourceIds) || [];
+    const derived = splitDerivedPresentationNodes(derivedPresentationNodes);
+    derived.before.forEach((node) => {
+      template.appendChild(sanitizeClone(node.cloneNode(true)));
+    });
+    sourceIds.forEach((recordId) => {
       const node = recordNode(recordId);
       if (node) {
         const copy = sanitizeClone(node.cloneNode(true));
@@ -825,8 +830,21 @@ export function createArrayTools({ toolbar, canvas }) {
         template.appendChild(copy);
       }
     });
-    (canvas.getSeamLinePresentationNodes?.(definition.sourceIds) || []).forEach((node) => {
+    derived.after.forEach((node) => {
       template.appendChild(sanitizeClone(node.cloneNode(true)));
+    });
+    (canvas.getSeamLinePresentationNodes?.(definition.sourceIds) || [])
+      .filter((node) => !derivedPresentationNodes.some((presentation) => presentation.contains(node)))
+      .forEach((node) => {
+        template.appendChild(sanitizeClone(node.cloneNode(true)));
+      });
+    dependentIds.forEach((recordId) => {
+      const node = recordNode(recordId);
+      if (node) {
+        const copy = sanitizeClone(node.cloneNode(true));
+        copy.setAttribute('data-array-source-id', recordId);
+        template.appendChild(copy);
+      }
     });
     regionNodesFor(definition.sourceIds).forEach((region) => {
       template.insertBefore(sanitizeClone(region.cloneNode(true)), template.firstChild);
@@ -1164,6 +1182,8 @@ export function createArrayTools({ toolbar, canvas }) {
     svg.querySelectorAll('.array-source-selected').forEach((node) => node.classList.remove('array-source-selected'));
     if (mode !== 'selecting-sources') return;
     pendingSourceIds.forEach((id) => recordNode(id)?.classList.add('array-source-selected'));
+    (canvas.getDerivedPresentationNodes?.([...pendingSourceIds]) || [])
+      .forEach((node) => node.classList.add('array-source-selected'));
   }
 
   function deactivate() {
@@ -1199,28 +1219,12 @@ export function createArrayTools({ toolbar, canvas }) {
     if (mode === 'selecting-sources') return finishSourceSelection();
     mode = 'selecting-sources';
     pendingSourceIds = new Set(editingDraft.sourceIds);
-    canvas.clearSelection();
-    canvas.setFeatureCommandDelegate(delegate);
+    canvas.setFeatureCommandDelegate(null);
+    if (canvas.selectRecords) canvas.selectRecords([...pendingSourceIds]);
+    else canvas.clearSelection();
     updateButton();
     updatePopupFromDraft();
     syncSourceHighlights();
-    return true;
-  }
-
-  function toggleSources(event) {
-    const entities = entityMap();
-    const ids = sourceIdsFromTarget(event.paramagicSelectionTarget || event.target)
-      .filter((id) => isArrayableEntity(entities.get(id)));
-    if (!ids.length) return false;
-    event.preventDefault();
-    event.stopPropagation();
-    const remove = ids.every((id) => pendingSourceIds.has(id));
-    ids.forEach((id) => remove ? pendingSourceIds.delete(id) : pendingSourceIds.add(id));
-    editingDraft.sourceIds = [...pendingSourceIds];
-    editingSourceBounds = sourceBounds(editingDraft.sourceIds);
-    syncSourceHighlights();
-    updatePopupFromDraft();
-    commitDraft();
     return true;
   }
 
@@ -1230,6 +1234,8 @@ export function createArrayTools({ toolbar, canvas }) {
       const node = recordNode(id);
       if (node) group.appendChild(sanitizeClone(node.cloneNode(true)));
     });
+    (canvas.getDerivedPresentationNodes?.(sourceIds) || [])
+      .forEach((node) => group.appendChild(sanitizeClone(node.cloneNode(true))));
     if (!group.childNodes.length) return null;
     objectLayer.appendChild(group);
     let bounds;
@@ -1396,16 +1402,14 @@ export function createArrayTools({ toolbar, canvas }) {
 
   const delegate = {
     pointerDown(event) {
-      if (event.button !== 0) return false;
-      if (mode === 'selecting-sources') return toggleSources(event);
-      if (mode !== 'selecting-center' || !editingDraft) return false;
+      if (event.button !== 0 || mode !== 'selecting-center' || !editingDraft) return false;
       event.preventDefault();
       event.stopPropagation();
       finishCenterSelection(event);
       return true;
     },
     pointerMove(event) {
-      if (mode !== 'selecting-center') return mode === 'selecting-sources';
+      if (mode !== 'selecting-center') return false;
       const result = resolveVectorDrawingPoint({
         rawPoint: canvas.screenToWorld(event.clientX, event.clientY),
         anchor: null,
@@ -1416,10 +1420,6 @@ export function createArrayTools({ toolbar, canvas }) {
       return true;
     },
     keyDown(event) {
-      if (mode === 'selecting-sources' && event.key === 'Enter') {
-        event.preventDefault();
-        return finishSourceSelection();
-      }
       if (mode === 'selecting-center' && event.key === 'Escape') {
         event.preventDefault();
         mode = 'editing';
@@ -1428,10 +1428,6 @@ export function createArrayTools({ toolbar, canvas }) {
         canvas.clearObjectSnapCandidate?.();
         updateButton();
         return true;
-      }
-      if (mode === 'selecting-sources' && event.key === 'Escape') {
-        event.preventDefault();
-        return finishSourceSelection();
       }
       return false;
     },
@@ -1610,6 +1606,16 @@ export function createArrayTools({ toolbar, canvas }) {
     ) closeEditor({ deselect: true });
   }, true);
   window.addEventListener('keydown', (event) => {
+    if (
+      mode === 'selecting-sources'
+      && ['Enter', 'Escape'].includes(event.key)
+      && !event.target.closest?.('input, textarea, select, [contenteditable="true"]')
+    ) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      finishSourceSelection();
+      return;
+    }
     if (!selectedArrayId || !['Delete', 'Backspace'].includes(event.key)) return;
     if (event.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
     event.preventDefault();
@@ -1634,8 +1640,10 @@ export function createArrayTools({ toolbar, canvas }) {
   canvas.onSelectionChange((properties = {}) => {
     if (mode !== 'selecting-sources') return;
     const entities = entityMap();
-    (properties.recordIds || []).filter((id) => isArrayableEntity(entities.get(id)))
-      .forEach((id) => pendingSourceIds.add(id));
+    pendingSourceIds = new Set(arraySourceIdsFromSelection(
+      canvas.getSelectedRecordIds?.() || properties.recordIds || [],
+      entities,
+    ));
     editingDraft.sourceIds = [...pendingSourceIds];
     editingSourceBounds = sourceBounds(editingDraft.sourceIds);
     syncSourceHighlights();

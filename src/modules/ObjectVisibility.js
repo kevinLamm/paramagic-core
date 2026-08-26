@@ -7,6 +7,18 @@ export const OBJECT_VISIBILITY_ICON = `
 `;
 
 const unique = (values = []) => [...new Set([...values].filter(Boolean).map(String))];
+const isGeometryVisibilityRecord = (record) => (
+  record?.recordType === 'geometry' || record?.recordType === 'fillet'
+);
+
+function singleRecordVisibilityOwner(record) {
+  return {
+    id: record.id,
+    entity: record.entity,
+    recordIds: [record.id],
+    kind: 'primitive',
+  };
+}
 
 export function normalizeVisibleExpression(expression, fallback = 'TRUE') {
   const value = String(expression ?? '').trim();
@@ -153,10 +165,39 @@ export function createObjectVisibilitySystem({
     );
   }
 
+  function visibilityOwners() {
+    const result = new Map();
+    (owners() || []).forEach((owner) => {
+      if (owner?.id) result.set(owner.id, owner);
+    });
+    const coveredRecordIds = new Set([...result.values()]
+      .flatMap((owner) => owner.recordIds || []));
+    records.filter(isGeometryVisibilityRecord).forEach((record) => {
+      if (!coveredRecordIds.has(record.id)) {
+        result.set(record.id, singleRecordVisibilityOwner(record));
+      }
+    });
+    return [...result.values()];
+  }
+
+  function visibilityOwnerForRecord(recordId, currentOwners) {
+    const suppliedOwner = ownerForRecord(recordId);
+    if (suppliedOwner?.id) return suppliedOwner;
+    const resolvedOwner = currentOwners.find((owner) => (
+      (owner.recordIds || []).includes(recordId)
+    ));
+    if (resolvedOwner) return resolvedOwner;
+    const record = records.find((candidate) => (
+      candidate.id === recordId && isGeometryVisibilityRecord(candidate)
+    ));
+    return record ? singleRecordVisibilityOwner(record) : null;
+  }
+
   function targetsForRecordIds(recordIds = []) {
     const result = new Map();
+    const currentOwners = visibilityOwners();
     unique(recordIds).forEach((recordId) => {
-      const owner = ownerForRecord(recordId);
+      const owner = visibilityOwnerForRecord(recordId, currentOwners);
       if (owner?.id) result.set(owner.id, owner);
     });
     return [...result.values()];
@@ -190,7 +231,7 @@ export function createObjectVisibilitySystem({
     const targetIds = new Set(targets.flatMap((owner) => owner.recordIds || []));
     if (!targets.length || targetIds.size !== requestedIds.size
       || [...requestedIds].some((id) => !targetIds.has(id))) {
-      return { success: false, error: 'Select one or more complete closed objects.' };
+      return { success: false, error: 'Select one or more complete geometry objects.' };
     }
     const expression = patch.visibleExpression !== undefined
       ? normalizeVisibleExpression(patch.visibleExpression)
@@ -241,7 +282,7 @@ export function createObjectVisibilitySystem({
 
   function syncPresentation(regionNodes = []) {
     const next = new Map(records.map((record) => [record.id, true]));
-    owners().forEach((owner) => {
+    visibilityOwners().forEach((owner) => {
       const state = stateForOwner(owner);
       (owner.recordIds || []).forEach((recordId) => {
         next.set(recordId, state.value);

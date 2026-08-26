@@ -1,7 +1,12 @@
 import { ConstraintRegistry } from './ConstraintRegistry.js';
 import { ConstraintGraph } from './ConstraintGraph.js';
 import { solveConstraintComponents, solveConstraintScope } from './ComponentSolver.js';
-import { DimensionRepository, featureLength, isSuccessfulSolve } from './NumericSolverCore.js';
+import {
+  DEFAULT_SOLVE_TOLERANCE,
+  DimensionRepository,
+  featureLength,
+  isSuccessfulSolve,
+} from './NumericSolverCore.js';
 import { SketchModel, createStableId } from './SolverModel.js';
 import { findDrivingDimensionLoop, formatDrivingDimensionLoopMessage } from './DimensionConflictDiagnostics.js';
 import { formatDrivenDimensionValue, formatUnitlessValue, unitFactors } from './Units.js';
@@ -36,6 +41,13 @@ const signedLineLineDistance = (reference, measured) => {
     (measured.start[1] + measured.end[1]) / 2,
   ];
   return (dx * (midpoint[1] - reference.start[1]) - dy * (midpoint[0] - reference.start[0])) / size;
+};
+const normalizedDirection = (value) => {
+  if (!Array.isArray(value) || value.length < 2) return null;
+  const x = Number(value[0]);
+  const y = Number(value[1]);
+  const size = Math.hypot(x, y);
+  return Number.isFinite(size) && size > 1e-12 ? [x / size, y / size] : null;
 };
 const drawingUnits = new Set(['in', 'mm', 'cm', 'm', 'ft']);
 const simpleLength = /^([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?)\s*(in|mm|cm|m|ft)?$/i;
@@ -337,6 +349,79 @@ function normalizeDimensionOrientation(dimension) {
     dimension.measureEnd || dimension.end,
   );
   return dimension;
+}
+
+function dimensionMeasurementPoints(dimension, model) {
+  const lineToLine = dimension?.anchors?.lineToLine;
+  if (lineToLine && model) {
+    const reference = model.resolveSegment(lineToLine.reference);
+    const measured = model.resolveSegment(lineToLine.measured);
+    if (reference && measured) {
+      const measuredPoint = [
+        (measured.start[0] + measured.end[0]) / 2,
+        (measured.start[1] + measured.end[1]) / 2,
+      ];
+      return [projectionOnSegment(measuredPoint, reference, 'line'), measuredPoint];
+    }
+  }
+  const pointToSegment = dimension?.anchors?.pointToSegment;
+  if (pointToSegment && model) {
+    const point = model.resolvePoint(pointToSegment.point);
+    const segment = model.resolveSegment(pointToSegment.segment);
+    if (point && segment) {
+      return [projectionOnSegment(point, segment, pointToSegment.projectionMode), point];
+    }
+  }
+  if (model) {
+    const start = model.resolvePoint(dimension?.anchors?.measureStart || dimension?.anchors?.start);
+    const end = model.resolvePoint(dimension?.anchors?.measureEnd || dimension?.anchors?.end);
+    if (start && end) return [start, end];
+  }
+  const start = dimension?.measureStart || dimension?.start;
+  const end = dimension?.measureEnd || dimension?.end;
+  return Array.isArray(start) && Array.isArray(end) ? [start, end] : null;
+}
+
+function derivedDimensionDirection(dimension, model = null) {
+  const stored = normalizedDirection(dimension?.direction);
+  if (stored) return stored;
+  if (dimension?.type === 'dimension-line') {
+    const points = dimensionMeasurementPoints(dimension, model);
+    if (!points) return null;
+    const [start, end] = points;
+    if (dimension.subtype === 'horizontal') {
+      return [Math.sign(end[0] - start[0]) || 1, 0];
+    }
+    if (dimension.subtype === 'vertical') {
+      return [0, Math.sign(end[1] - start[1]) || 1];
+    }
+    return normalizedDirection([end[0] - start[0], end[1] - start[1]]) || [1, 0];
+  }
+  if (dimension?.type === 'radius-dimension') {
+    const center = model?.resolvePoint(dimension.anchors?.center) || dimension.center;
+    const target = dimension.elbow || dimension.label || dimension.target;
+    return center && target
+      ? normalizedDirection([target[0] - center[0], target[1] - center[1]]) || [1, 0]
+      : [1, 0];
+  }
+  if (dimension?.type === 'angle-dimension') {
+    const target = dimension.label || dimension.start;
+    return dimension.vertex && target
+      ? normalizedDirection([target[0] - dimension.vertex[0], target[1] - dimension.vertex[1]]) || [1, 0]
+      : [1, 0];
+  }
+  return null;
+}
+
+function normalizeDimensionDirection(dimension, model = null) {
+  const direction = derivedDimensionDirection(dimension, model);
+  if (direction) dimension.direction = direction;
+  return dimension;
+}
+
+function constraintDirection(constraint, annotation, model) {
+  return normalizedDirection(constraint?.direction)
+    || derivedDimensionDirection(annotation, model);
 }
 
 function constraintOrientation(constraint, annotation, model) {
@@ -692,7 +777,12 @@ export class SolverController {
     const parameters = snapshot?.parameters || snapshot?.dimensions;
     if (parameters) this.dimensions.restore(parameters);
     (snapshot?.dimensionAnnotations || []).forEach((annotation) => {
-      if (annotation.dimensionId) this.setDimensionAnnotation(annotation.dimensionId, normalizeDimensionOrientation(annotation));
+      if (annotation.dimensionId) {
+        this.setDimensionAnnotation(
+          annotation.dimensionId,
+          normalizeDimensionDirection(normalizeDimensionOrientation(annotation), this.model),
+        );
+      }
     });
     this.dimensions.list().forEach((entry) => {
       if (!entry.computed) return;
@@ -712,6 +802,12 @@ export class SolverController {
         this.model,
       );
       if (orientation) constraint.orientation = orientation;
+      const direction = constraintDirection(
+        constraint,
+        this.dimensionAnnotations.get(constraint.dimensionRef),
+        this.model,
+      );
+      if (direction) constraint.direction = direction;
       if (constraint.enabled !== false) {
         try {
           if (constraint.type === 'Length' && !Number.isFinite(Number(constraint.value))) {
@@ -1273,7 +1369,10 @@ export class SolverController {
   }
 
   addDimension(entity) {
-    const dimension = normalizeDimensionOrientation(clone({ id: entity.id || createStableId('dimension-annotation'), ...entity }));
+    const dimension = normalizeDimensionDirection(
+      normalizeDimensionOrientation(clone({ id: entity.id || createStableId('dimension-annotation'), ...entity })),
+      this.model,
+    );
     const value = dimensionValue(dimension);
     const driving = dimension.dimensionMode === 'driving';
     const unit = dimension.type === 'angle-dimension' ? 'deg' : this.drawingUnit;
@@ -1313,6 +1412,7 @@ export class SolverController {
         source: 'dimension',
         subtype: 'aligned',
         orientation: dimension.orientation,
+        direction: dimension.direction,
         featureRefs: [lineToLine.reference, lineToLine.measured],
         dimensionRef: entry.id,
       } : pointToSegment ? {
@@ -1320,6 +1420,7 @@ export class SolverController {
         source: 'dimension',
         subtype: dimension.subtype,
         orientation: dimension.orientation,
+        direction: dimension.direction,
         ...(pointToSegment.projectionMode ? { projectionMode: pointToSegment.projectionMode } : {}),
         featureRefs: [
           { kind: 'point', ...pointToSegment.point },
@@ -1333,6 +1434,7 @@ export class SolverController {
         featureRefs: [],
         dimensionRef: entry.id,
         orientation: dimension.orientation,
+        direction: dimension.direction,
       };
     }
     if (dimension.type === 'radius-dimension') {
@@ -1341,6 +1443,7 @@ export class SolverController {
         source: 'dimension',
         featureRefs: [{ kind: 'circle', recordId: dimension.anchors?.center?.recordId }],
         dimensionRef: entry.id,
+        direction: dimension.direction,
       };
     }
     if (dimension.type === 'angle-dimension') {
@@ -1352,6 +1455,7 @@ export class SolverController {
         firstRaySign: dimension.firstRaySign || 1,
         secondRaySign: dimension.secondRaySign || 1,
         angleOrientation: dimension.angleOrientation || 1,
+        direction: dimension.direction,
       };
     }
     if (!constraint || constraint.featureRefs?.some((ref) => !ref) || (constraint.anchors && (!constraint.anchors.start || !constraint.anchors.end))) {
@@ -1576,6 +1680,7 @@ export class SolverController {
       source: 'dimension',
       featureRefs: [{ kind: 'circle', recordId }],
       dimensionRef: dimensionId,
+      direction: annotation.direction,
     };
     let result = null;
     try {
@@ -1608,9 +1713,14 @@ export class SolverController {
   }
 
   solveDimensionStep(options = {}) {
-    let result = this.solve({ ...options, tolerance: options.tolerance ?? 1e-6 });
+    let result = this.solve({ ...options, tolerance: options.tolerance ?? DEFAULT_SOLVE_TOLERANCE });
     if (result?.status === 'max-iterations') {
-      result = this.solve({ ...options, tolerance: options.tolerance ?? 1e-6, jacobianMode: 'blocks', maxIterations: 10000 });
+      result = this.solve({
+        ...options,
+        tolerance: options.tolerance ?? DEFAULT_SOLVE_TOLERANCE,
+        jacobianMode: 'blocks',
+        maxIterations: 10000,
+      });
     }
     return result;
   }

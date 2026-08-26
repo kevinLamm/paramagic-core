@@ -49,6 +49,12 @@ import { formatDrivenDimensionValue, formatUnitlessValue } from './solver/Units.
 import { entityStackId, normalizeStackState } from './StackSystem.js';
 import { filterVisibleResolvedEntities } from './ObjectVisibility.js';
 import { arcExtentPoints, arcSweepFromAngles } from './ArcGeometry.js';
+import {
+  deriveSwellGeometry,
+  isSwellEntity,
+  swellBoundariesFromDerived,
+  swellBoundaryPath,
+} from './SwellGeometry.js';
 import { buildDocumentVariables, normalizeDocumentMetadata } from './DocumentVariables.js';
 import {
   DEFAULT_CLASS_ID,
@@ -1074,6 +1080,18 @@ export function materializeDrawingInstances(drawing = {}, {
   const rawById = new Map(rawEntities.filter(({ id }) => id).map((entity) => [entity.id, entity]));
   const evaluated = evaluatedEntities(drawing);
   const evaluatedById = new Map(evaluated.filter(({ id }) => id).map((entity) => [entity.id, entity]));
+  const swellDerived = deriveSwellGeometry({
+    entities: evaluated,
+    constraints: drawing.constraints || [],
+    evaluateLength,
+  });
+  const presentationBoundsEntities = (sourceIds, sources) => {
+    const selected = new Set(sourceIds);
+    const pieces = [...swellDerived.values()]
+      .filter(({ ownerId }) => selected.has(ownerId))
+      .flatMap(({ pieces: derivedPieces }) => derivedPieces.map(({ entity }) => entity));
+    return [...sources, ...pieces];
+  };
   const ownsTargetStack = (entity) => stackId === null || (entity.stackId || 'stack-default') === stackId;
   const baseEntities = evaluated.filter(ownsTargetStack);
   const dimensionAnnotations = (drawing.dimensionAnnotations || []).filter(ownsTargetStack);
@@ -1086,7 +1104,7 @@ export function materializeDrawingInstances(drawing = {}, {
       const directSources = sourceIds
         .map((id) => evaluatedById.get(id) || rawById.get(id))
         .filter((entity) => definition.type === 'symmetric' ? isMirrorableEntity(entity) : isDuplicableEntity(entity));
-      const sourceBounds = entityDataBounds(directSources);
+      const sourceBounds = entityDataBounds(presentationBoundsEntities(sourceIds, directSources));
       if (!sourceBounds) return;
       const sourceAnchor = [sourceBounds.x + sourceBounds.width / 2, sourceBounds.y + sourceBounds.height / 2];
       const matrix = linkedCopyMatrix(definition, sourceAnchor);
@@ -1111,7 +1129,7 @@ export function materializeDrawingInstances(drawing = {}, {
       const dependentIds = arrayDependentVisualIds(rawById, definition.sourceIds || []);
       const sourceIds = [...new Set([...(definition.sourceIds || []), ...dependentIds])];
       const sources = sourceIds.map((id) => evaluatedById.get(id) || rawById.get(id)).filter(Boolean);
-      const sourceBounds = entityDataBounds(sources);
+      const sourceBounds = entityDataBounds(presentationBoundsEntities(definition.sourceIds || [], sources));
       if (!sourceBounds) return;
       const centerEntity = rawById.get(definition.centerRef?.recordId);
       const referencedCenter = pointFeature(centerEntity, Number(definition.centerRef?.index) || 0);
@@ -1163,6 +1181,74 @@ export function materializeDrawingInstances(drawing = {}, {
     });
 
   return { ...drawing, entities: [...baseEntities, ...derived], dimensionAnnotations };
+}
+
+function materializeSwellScenePresentation(drawing, entities, evaluateLength) {
+  const derived = deriveSwellGeometry({
+    entities: evaluatedEntities(drawing),
+    constraints: drawing.constraints || [],
+    evaluateLength,
+  });
+  if (!derived.size) return entities;
+  const boundaries = swellBoundariesFromDerived(derived);
+  const closedOwnerIds = new Set(boundaries.flatMap(({ recordIds }) => recordIds));
+  const results = [];
+  const instancesFor = (ownerIds) => {
+    const owners = new Set(ownerIds);
+    const instances = new Map();
+    entities.forEach((entity) => {
+      if (!owners.has(thumbnailSourceId(entity))) return;
+      const key = `${entity.stackId || 'stack-default'}:${thumbnailMatrixKey(entity._resolvedMatrix)}`;
+      if (!instances.has(key)) instances.set(key, entity);
+    });
+    return instances;
+  };
+  boundaries.forEach((boundary) => {
+    instancesFor(boundary.recordIds).forEach((anchor, key) => {
+      const appearanceSource = entities.find((entity) => (
+        thumbnailSourceId(entity) === boundary.appearanceSourceId
+        && thumbnailMatrixKey(entity._resolvedMatrix) === thumbnailMatrixKey(anchor._resolvedMatrix)
+      )) || anchor;
+      results.push({
+        id: `swell-presentation:${boundary.id}:${key}`,
+        type: 'resolved-boundary',
+        stackId: anchor.stackId || boundary.stackId,
+        d: swellBoundaryPath(boundary.features),
+        points: clone(boundary.points),
+        appearance: clone(appearanceSource.appearance || {}),
+        _resolvedMatrix: anchor._resolvedMatrix,
+        _resolvedSourceId: boundary.appearanceSourceId,
+        _resolvedSourceIds: [...boundary.recordIds],
+        _resolvedFeatures: clone(boundary.features),
+        composite: {
+          kind: 'swell-derived-presentation',
+          ownerRecordId: boundary.appearanceSourceId,
+          sourceRecordIds: [...boundary.recordIds],
+        },
+      });
+    });
+  });
+  derived.forEach((result, ownerId) => {
+    if (closedOwnerIds.has(ownerId)) return;
+    instancesFor([ownerId]).forEach((anchor, key) => {
+      result.pieces.forEach((piece, index) => results.push({
+        ...clone(piece.entity),
+        id: `swell-presentation:${piece.id}:${key}:${index}`,
+        stackId: anchor.stackId || result.sourceEntity?.stackId || 'stack-default',
+        appearance: clone(anchor.appearance || {}),
+        _resolvedMatrix: anchor._resolvedMatrix,
+        _resolvedSourceId: ownerId,
+        _resolvedSourceIds: [ownerId],
+        composite: {
+          kind: 'swell-derived-presentation',
+          ownerRecordId: ownerId,
+          sourceRecordIds: [ownerId],
+          pieceId: piece.id,
+        },
+      }));
+    });
+  });
+  return [...entities, ...results];
 }
 
 function geometryStyle(entity, { closed = false, fillOverride = null } = {}) {
@@ -1503,7 +1589,7 @@ function applySubtractScenePresentation(drawing, entities, {
 }
 
 function applyResolvedBoundaryScenePresentation(drawing, entities) {
-  const sourceEntities = drawing?.entities || [];
+  const sourceEntities = (drawing?.entities || []).filter((entity) => !isSwellEntity(entity));
   const boundaries = [
     ...resolveClosedBoundaries(sourceEntities, drawing?.constraints || []),
     ...resolveClosedBoundaries(
@@ -1588,12 +1674,16 @@ export function resolveDrawingScene(drawing, {
     evaluateNumeric: resolvedEvaluateNumeric,
     evaluateLength: resolvedEvaluateLength,
   });
+  const swellPresented = materializeSwellScenePresentation(
+    drawingWithSeams,
+    Array.isArray(materialized.entities) ? materialized.entities : [],
+    resolvedEvaluateLength,
+  );
   const entities = filterVisibleResolvedEntities(drawingWithSeams, applySubtractScenePresentation(
     drawingWithSeams,
     applyResolvedBoundaryScenePresentation(
       drawingWithSeams,
-      (Array.isArray(materialized.entities) ? materialized.entities : [])
-        .filter((entity) => !excludeConstruction || entity.construction !== true),
+      swellPresented.filter((entity) => !excludeConstruction || entity.construction !== true),
     ),
     {
       evaluateExpression: resolvedEvaluateExpression,

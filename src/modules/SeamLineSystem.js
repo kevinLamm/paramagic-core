@@ -1,5 +1,6 @@
 import { projectPointToNotchFeature, sampleNotchFeature } from './NotchSystem.js';
 import { resolveClosedBoundaries } from './BoundaryTopology.js';
+import { deriveSwellBoundaries } from './SwellGeometry.js';
 import {
   isSubtractCutterEntity,
   subtractCutterAppliesTo,
@@ -1009,7 +1010,7 @@ function sameRecordSet(first = [], second = []) {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
-function boundaryForDefinition(definition, subtractPresentation, resolvedBoundaries) {
+function boundaryForDefinition(definition, subtractPresentation, resolvedBoundaries, swellBoundaries = []) {
   const subtractResult = subtractPresentation.results.find((result) => (
     result.ownerId === definition.regionId
     || (definition.recordIds.length && sameRecordSet(result.recordIds, definition.recordIds))
@@ -1026,14 +1027,16 @@ function boundaryForDefinition(definition, subtractPresentation, resolvedBoundar
       appearance: subtractResult.appearance,
     };
   }
+  const swell = swellBoundaries.find((boundary) => (
+    boundary.id === definition.regionId
+    || (definition.recordIds.length && sameRecordSet(boundary.recordIds, definition.recordIds))
+  ));
+  if (swell) return { ...swell, appearance: null };
   const resolved = resolvedBoundaries.find((boundary) => (
     boundary.id === definition.regionId
     || (definition.recordIds.length && sameRecordSet(boundary.recordIds, definition.recordIds))
   ));
-  return resolved ? {
-    ...resolved,
-    appearance: null,
-  } : null;
+  return resolved ? { ...resolved, appearance: null } : null;
 }
 
 function explicitSeamLineDefinition(definition, features = []) {
@@ -1062,9 +1065,14 @@ export function migrateSeamLineDrawingToExplicitEdges(drawing = {}, options = {}
     migrated.entities || [],
     migrated.constraints || [],
   );
+  const swellBoundaries = deriveSwellBoundaries({
+    entities: migrated.entities || [],
+    constraints: migrated.constraints || [],
+    evaluateLength: options.evaluateLength || Number,
+  });
   const definitions = extension.definitions
     .map((definition) => {
-      const boundary = boundaryForDefinition(definition, subtractPresentation, resolvedBoundaries);
+      const boundary = boundaryForDefinition(definition, subtractPresentation, resolvedBoundaries, swellBoundaries);
       return boundary?.features?.length
         ? explicitSeamLineDefinition(definition, boundary.features)
         : normalizeSeamLineDefinition(definition);
@@ -1121,8 +1129,13 @@ export function materializeSeamLineEntitiesForDrawing(drawing = {}, options = {}
     migrated.entities || [],
     migrated.constraints || [],
   );
+  const swellBoundaries = deriveSwellBoundaries({
+    entities: migrated.entities || [],
+    constraints: migrated.constraints || [],
+    evaluateLength: options.evaluateLength || Number,
+  });
   return extension.definitions.flatMap((definition) => {
-    const boundary = boundaryForDefinition(definition, subtractPresentation, resolvedBoundaries);
+    const boundary = boundaryForDefinition(definition, subtractPresentation, resolvedBoundaries, swellBoundaries);
     if (!boundary?.features?.length) return [];
     const enabledFeatures = boundary.features.filter((feature) => seamLineEnabledForFeature(definition, feature));
     if (!enabledFeatures.length) return [];
@@ -1207,6 +1220,7 @@ export function createSeamLineSystem({
   syncGeometryStacking,
   getScale = () => 1,
   getDrawingSnapshot = () => ({ entities: [] }),
+  evaluateLength = Number,
   resolvePresentationHost = () => null,
   isStackVisible = () => true,
   isStackActive = () => true,
@@ -1382,7 +1396,7 @@ export function createSeamLineSystem({
           ...(drawing.extensions || {}),
           seamLines: state,
         },
-      });
+      }, { evaluateLength });
     } catch {
       entities = [];
     }

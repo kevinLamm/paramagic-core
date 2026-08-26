@@ -366,6 +366,22 @@ function projectionOnSegment(pointValue, line, projectionMode = 'segment') {
   return [line.start[0] + direction[0] * ratio, line.start[1] + direction[1] * ratio];
 }
 
+function normalizedConstraintDirection(constraint) {
+  const value = constraint?.direction;
+  if (!Array.isArray(value) || value.length < 2) return null;
+  const x = Number(value[0]);
+  const y = Number(value[1]);
+  const size = Math.hypot(x, y);
+  return Number.isFinite(size) && size > 1e-12 ? [x / size, y / size] : null;
+}
+
+function directionBranchResidual(offset, constraint, desired) {
+  const direction = normalizedConstraintDirection(constraint);
+  if (!direction) return null;
+  const orientedDistance = dot(offset, direction) / Math.max(1, Math.abs(desired));
+  return Math.min(0, orientedDistance);
+}
+
 function derivedFilletArc(model, ref, dimensions) {
   const definition = required(model.derivedEntity(ref?.recordId), 'Constraint requires a valid fillet feature.');
   const radius = definition.radiusDimensionId
@@ -437,7 +453,9 @@ export const residualImplementations = {
       return [pointValue[1] - projected[1] - sign * desired];
     }
     const measured2 = pointDistance2(pointValue, projected);
-    return [(measured2 - desired ** 2) / safeScale(measured2, desired ** 2)];
+    const distanceResidual = (measured2 - desired ** 2) / safeScale(measured2, desired ** 2);
+    const branchResidual = directionBranchResidual(subtract(pointValue, projected), constraint, desired);
+    return branchResidual === null ? [distanceResidual] : [distanceResidual, branchResidual];
   },
   'Line Line Distance'(model, constraint, dimensions) {
     const [reference, measured] = constraint.featureRefs.map((ref) => segment(model, ref));
@@ -568,7 +586,9 @@ export const residualImplementations = {
     const b = point(model, constraint.anchors?.end || constraint.featureRefs[1]);
     const desired = target(constraint, dimensions);
     const measured2 = pointDistance2(a, b);
-    return [(measured2 - desired ** 2) / safeScale(measured2, desired ** 2)];
+    const distanceResidual = (measured2 - desired ** 2) / safeScale(measured2, desired ** 2);
+    const branchResidual = directionBranchResidual(subtract(b, a), constraint, desired);
+    return branchResidual === null ? [distanceResidual] : [distanceResidual, branchResidual];
   },
   'Horizontal Distance'(model, constraint, dimensions) {
     const a = point(model, constraint.anchors?.start || constraint.featureRefs[0]);
@@ -757,6 +777,7 @@ function createHalfChordArcProjection(model, dimensions) {
 }
 
 export const DEFAULT_MAX_ITERATIONS = 2000;
+export const DEFAULT_SOLVE_TOLERANCE = 1e-3;
 export const DEFAULT_MATRIX_FREE_VARIABLE_THRESHOLD = 192;
 export const INTERACTIVE_MATRIX_FREE_VARIABLE_THRESHOLD = 48;
 const MAX_LEVENBERG_MARQUARDT_DAMPING = 1e12;
@@ -766,7 +787,7 @@ export function solveLevenbergMarquardt({
   registry,
   dimensions,
   maxIterations = DEFAULT_MAX_ITERATIONS,
-  tolerance = 1e-8,
+  tolerance = DEFAULT_SOLVE_TOLERANCE,
   solveMode = 'final',
   timeBudgetMs = Infinity,
   shouldCancel = null,

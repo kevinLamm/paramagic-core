@@ -18,6 +18,7 @@ const resyncMethods = new Set([
   'setDocumentContext',
   'setDocumentMetadata',
   'setDrawingProperties',
+  'solve',
   'updateCurveControlPoints',
   'updateDimensionAnnotation',
   'updateEntity',

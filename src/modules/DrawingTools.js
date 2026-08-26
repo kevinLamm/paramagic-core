@@ -203,7 +203,12 @@ export function resolveVectorDrawingPoint({
   return { point: rawPoint, snap: null };
 }
 
-export function createDrawingTools({ toolbar, canvas, drawingHint = null }) {
+export function createDrawingTools({
+  toolbar,
+  canvas,
+  drawingHint = null,
+  decorateEntity = (entity) => entity,
+}) {
   let activeTool = null;
   let points = [];
   let pointSnaps = [];
@@ -271,7 +276,7 @@ export function createDrawingTools({ toolbar, canvas, drawingHint = null }) {
   }
 
   function withConstruction(entity) {
-    return isConstructionMode() ? { ...entity, construction: true } : entity;
+    return decorateEntity(isConstructionMode() ? { ...entity, construction: true } : entity);
   }
 
   function addDrawingObject(entity) {

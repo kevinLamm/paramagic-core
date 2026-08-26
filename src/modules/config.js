@@ -1,4 +1,4 @@
-export const drawingTools = ['Select', 'Line', 'Arc', 'Polyline', 'Circle', 'Rectangle', 'Curve / Spline', 'Fillet', 'Subtract', 'Duplicate', 'Symmetric', 'Array', 'Notch', 'Text', 'Table'];
+export const drawingTools = ['Select', 'Line', 'Arc', 'Polyline', 'Circle', 'Rectangle', 'Curve / Spline', 'Fillet', 'Subtract', 'Duplicate', 'Symmetric', 'Array', 'Swell', 'Notch', 'Text', 'Table'];
 export const constraintGroups = [
   { label: 'Assembly', items: ['Coincident', 'Concentric', 'Collinear', 'Fixed', 'Length'] },
   { label: 'Orientation', items: ['Parallel', 'Perpendicular', 'Horizontal', 'Vertical', 'Equal'] },

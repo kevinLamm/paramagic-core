@@ -55,6 +55,8 @@ import {
   filletTopologyConstraints,
   isFilletEntity,
 } from './FilletSystem.js';
+import { organizeDerivedPaintNodes } from './CanvasPaintOrder.js';
+import { canvasPointerDragReady } from './CanvasPointerDrag.js';
 
 export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver }) {
   const defaultCamera = () => ({ x: canvas.clientWidth / 2, y: canvas.clientHeight / 2, scale: 1 });
@@ -93,6 +95,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const selectionChangeListeners = new Set();
   const drawingExtensionProviders = new Map();
   const derivedDimensionFeatureProviders = new Set();
+  const derivedBoundaryFeatureProviders = new Set();
+  const derivedPresentationProviders = new Set();
   const subtractOperandProviders = new Set();
   const selectionPropertyProviders = new Set();
   let loadedDrawingExtensions = {};
@@ -460,12 +464,19 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       : geometryAppearanceSystem.appearance(record.entity);
   }
 
+  function currentDerivedPaintPlan() {
+    return organizeDerivedPaintNodes(
+      objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]'),
+    );
+  }
+
   function editableStackOrder() {
+    const { anchorRecordIds } = currentDerivedPaintPlan();
     return records
       .map((record, originalIndex) => ({ record, originalIndex }))
       .filter(({ record }) => (
         ['geometry', 'image', 'fillet', 'text', 'table', 'control'].includes(record.recordType)
-        && !record.entity.construction
+        && (!record.entity.construction || anchorRecordIds.has(record.id))
       ))
       .sort((a, b) => {
         const stackDelta = stackSystem.orderForEntity(a.record.entity) - stackSystem.orderForEntity(b.record.entity);
@@ -478,26 +489,27 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function syncGeometryStacking() {
+    const derivedNodes = [...objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]')];
+    const {
+      beforeByRecordId,
+      afterByRecordId,
+      unanchored,
+      anchorRecordIds,
+    } = organizeDerivedPaintNodes(derivedNodes);
     const editable = editableStackOrder();
-    const construction = records.filter((record) => ['geometry', 'image', 'fillet', 'table'].includes(record.recordType) && record.entity.construction);
+    const construction = records.filter((record) => (
+      ['geometry', 'image', 'fillet', 'table'].includes(record.recordType)
+      && record.entity.construction
+      && !anchorRecordIds.has(record.id)
+    ));
     const notches = records.filter((record) => record.recordType === 'notch');
     const dimensions = records.filter((record) => record.recordType === 'dimension');
-    const derivedNodes = [...objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]')];
-    const derivedByAnchorId = new Map();
-    const unanchoredDerived = [];
-    derivedNodes.forEach((node) => {
-      const anchorId = node.dataset.paintAfterRecordId;
-      if (!anchorId) {
-        unanchoredDerived.push(node);
-        return;
-      }
-      if (!derivedByAnchorId.has(anchorId)) derivedByAnchorId.set(anchorId, []);
-      derivedByAnchorId.get(anchorId).push(node);
-    });
     const appendRecord = (record) => {
+      (beforeByRecordId.get(record.id) || []).forEach((node) => objectLayer.appendChild(node));
+      beforeByRecordId.delete(record.id);
       objectLayer.appendChild(record.group);
-      (derivedByAnchorId.get(record.id) || []).forEach((node) => objectLayer.appendChild(node));
-      derivedByAnchorId.delete(record.id);
+      (afterByRecordId.get(record.id) || []).forEach((node) => objectLayer.appendChild(node));
+      afterByRecordId.delete(record.id);
     };
     const stackPositions = new Map(editable.map((record, index) => [record.id, index]));
     const regionsByPosition = new Map();
@@ -511,9 +523,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       (regionsByPosition.get(index) || []).forEach((region) => objectLayer.appendChild(region));
       appendRecord(record);
     });
-    unanchoredDerived.forEach((node) => objectLayer.appendChild(node));
+    unanchored.forEach((node) => objectLayer.appendChild(node));
     [...construction, ...notches, ...dimensions].forEach(appendRecord);
-    derivedByAnchorId.forEach((nodes) => {
+    beforeByRecordId.forEach((nodes) => {
+      nodes.forEach((node) => objectLayer.appendChild(node));
+    });
+    afterByRecordId.forEach((nodes) => {
       nodes.forEach((node) => objectLayer.appendChild(node));
     });
   }
@@ -652,10 +667,36 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function isRecordInteractive(record) {
+    const hasVisiblePresentation = [...derivedPresentationProviders].some((provider) => (
+      provider.isInteractive?.(record) === true
+    ));
     return stackSystem.isRecordEnabled(record)
       && objectVisibilitySystem?.isRecordShown(record) !== false
-      && record?.group?.style?.display !== 'none'
-      && record?.group?.hidden !== true;
+      && (hasVisiblePresentation || (
+        record?.group?.style?.display !== 'none'
+        && record?.group?.hidden !== true
+      ));
+  }
+
+  function recordInteractionTargets(record) {
+    const sourceTargets = record?.group?.style?.display !== 'none' && record?.group?.hidden !== true
+      ? [...(record?.group?.querySelectorAll?.('.selectable-entity') || [])]
+      : [];
+    return [
+      ...sourceTargets,
+      ...[...derivedPresentationProviders].flatMap((provider) => (
+        [...(provider.targetsForRecord?.(record) || [])]
+      )),
+    ];
+  }
+
+  function interactiveHandlesForRecord(record) {
+    return [
+      ...(record?.handles || []),
+      ...[...derivedPresentationProviders].flatMap((provider) => (
+        [...(provider.handlesForRecord?.(record) || [])]
+      )),
+    ];
   }
 
   function syncGeometryPresentation(record) {
@@ -1480,18 +1521,29 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function updateObjectComposite(recordId, composite) {
-    const record = records.find((candidate) => candidate.id === recordId && candidate.recordType === 'geometry');
-    if (!record) return null;
-    requestHistoryCheckpoint('object-composite-update');
-    record.entity = cloneEntity(solver.updateEntity({
-      ...record.entity,
-      composite: cloneEntity(composite),
-    }));
-    updateGeometryNode(record);
-    updateRecordHandles(record);
-    syncGeometryPresentation(record);
-    notifyObjectChange({ history: 'commit' });
-    return cloneEntity(record.entity);
+    const result = updateObjectComposites([{ recordId, composite }]);
+    return result.success ? cloneEntity(result.entities[0]) : null;
+  }
+
+  function updateObjectComposites(updates = [], { history = 'commit' } = {}) {
+    const requested = (updates || []).map(({ recordId, composite }) => ({
+      record: records.find((candidate) => candidate.id === recordId && candidate.recordType === 'geometry'),
+      composite,
+    })).filter(({ record }) => record);
+    if (!requested.length) return { success: false, error: 'No editable geometry was found.', entities: [] };
+    if (history !== 'none') requestHistoryCheckpoint('object-composite-update');
+    const changed = requested.map(({ record, composite }) => {
+      record.entity = cloneEntity(solver.updateEntity({
+        ...record.entity,
+        composite: cloneEntity(composite),
+      }));
+      updateGeometryNode(record);
+      updateRecordHandles(record);
+      syncGeometryPresentation(record);
+      return cloneEntity(record.entity);
+    });
+    notifyObjectChange({ history });
+    return { success: true, error: null, entities: changed };
   }
 
   function addImage(inputEntity) {
@@ -1741,6 +1793,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getSubtractBoundaryFeatureFromWorld: subtractSystem.featureFromWorld,
     getSubtractBoundaryInwardTarget: subtractSystem.inwardTargetForFeature,
     getResolvedBoundaries: currentResolvedBoundaries,
+    derivedBoundaryProviders: derivedBoundaryFeatureProviders,
   });
 
   const notchSystem = createNotchSystem({
@@ -1778,7 +1831,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     syncGeometryStacking,
     getScale: () => camera.scale,
     getDrawingSnapshot: () => drawingSnapshot(),
-    resolvePresentationHost: (ownerRecordId) => {
+    evaluateLength: (expression) => solver.evaluateDrawingLengthExpression(expression),
+    resolvePresentationHost: (ownerRecordId, entity) => {
+      for (const provider of derivedPresentationProviders) {
+        const host = provider.resolveHost?.(ownerRecordId, entity);
+        if (host) return host;
+      }
       const record = records.find((candidate) => candidate.id === ownerRecordId);
       return record?.group ? {
         container: record.group,
@@ -2329,7 +2387,19 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   function setSelectedGeometryAppearance(patch = {}) {
     const tableUpdate = tableTools.setSelectedAppearance(selectedIds, patch);
     if (tableUpdate.handled) return { success: tableUpdate.success, error: tableUpdate.error || null };
+    for (const provider of selectionPropertyProviders) {
+      if (typeof provider.setSelectedAppearance !== 'function') continue;
+      const outcome = provider.setSelectedAppearance(patch);
+      if (outcome !== undefined) return outcome;
+    }
     return geometryAppearanceSystem.setSelectedAppearance(patch);
+  }
+
+  function setRecordGeometryAppearance(recordIds = [], patch = {}) {
+    return geometryAppearanceSystem.setSelectedAppearance(patch, {
+      recordIds,
+      includeConstruction: true,
+    });
   }
 
   function setSelectedTextProperties(patch = {}) {
@@ -2666,6 +2736,16 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return drawing;
   }
 
+  function solveDrawing(options = {}) {
+    flushScheduledSolve();
+    const result = solver.solve(options);
+    const changedEntityIds = result?.changedEntityIds || [];
+    if (changedEntityIds.length) {
+      applySolverSnapshot(solver.getGeometrySnapshot(changedEntityIds), { incremental: true });
+    }
+    return result;
+  }
+
   function isWholeObjectHandle(record, handleIndex) {
     if (record.isWholeObjectHandle) return record.isWholeObjectHandle(handleIndex);
     if (record.recordType !== 'geometry') return false;
@@ -2714,11 +2794,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     shapeDrag = {
       mode: 'records',
       moved: false,
+      solverActive: false,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
       startWorld: screenToWorld(event.clientX, event.clientY),
       items: dragRecordsForSelection().map((item) => ({ record: item, startEntity: cloneEntity(item.entity) })),
     };
-    solver.beginDrag(shapeDrag.items.flatMap(({ record: item }) => ['geometry', 'text', 'control', 'table'].includes(item.recordType) ? solver.variableIdsForEntity(item.id) : []));
-    record.group.setPointerCapture(event.pointerId);
+    shapeDrag.variableIds = shapeDrag.items.flatMap(({ record: item }) => (
+      ['geometry', 'text', 'control', 'table'].includes(item.recordType)
+        ? solver.variableIdsForEntity(item.id)
+        : []
+    ));
   }
 
   function startHandleDrag(event, record, handleIndex) {
@@ -2802,6 +2889,52 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       refreshArcCircleMetadata(entity);
     }
     return entity;
+  }
+
+  function setPointFeaturePosition(reference = {}, world, { history = 'commit' } = {}) {
+    if (!Array.isArray(world) || world.length < 2 || !world.slice(0, 2).every(Number.isFinite)) {
+      return { success: false, error: 'A finite target point is required.' };
+    }
+    const record = records.find((candidate) => candidate.id === reference.recordId && candidate.recordType === 'geometry');
+    if (!record) return { success: false, error: 'The target geometry no longer exists.' };
+    if (history !== 'none') requestHistoryCheckpoint('set-point-feature-position');
+    const startEntity = cloneEntity(record.entity);
+    let nextEntity;
+    let lockedVariableIds;
+    if (reference.pointRole === 'center' && record.entity.type === 'arc') {
+      const center = record.entity.center || circleFromThreePoints(record.entity.start, record.entity.arcPoint, record.entity.end)?.center;
+      if (!center) return { success: false, error: 'The arc center could not be resolved.' };
+      const delta = [world[0] - center[0], world[1] - center[1]];
+      nextEntity = cloneEntity(record.entity);
+      nextEntity.start = addPoints(nextEntity.start, delta);
+      nextEntity.arcPoint = addPoints(nextEntity.arcPoint, delta);
+      nextEntity.end = addPoints(nextEntity.end, delta);
+      nextEntity.center = [...world];
+      lockedVariableIds = solver.variableIdsForEntity(record.id);
+    } else {
+      nextEntity = moveGeometryHandle(
+        record,
+        Number(reference.index) || 0,
+        [...world],
+        [...world],
+        startEntity,
+        cloneEntity(startEntity),
+      );
+      const feature = {
+        kind: 'point',
+        recordId: record.id,
+        index: Number(reference.index) || 0,
+        ...(reference.pointRole ? { pointRole: reference.pointRole } : {}),
+      };
+      lockedVariableIds = solver.dragVariableIdsForFeature?.(feature) || solver.variableIdsForFeature(feature);
+    }
+    const outcome = solver.updateEntities([nextEntity], { lockedVariableIds });
+    if (outcome?.then) return { success: false, error: 'The point update did not complete synchronously.' };
+    applySolverSnapshot(outcome?.snapshot, { incremental: outcome?.snapshotMode === 'delta' });
+    notifyObjectChange({ history });
+    const status = outcome?.result?.status;
+    const success = !['invalid', 'conflict', 'failed', 'timeout'].includes(status);
+    return { success, error: success ? null : outcome?.result?.message || 'The target point could not be moved.' };
   }
 
   function recordById(recordId, { includeFillets = false } = {}) {
@@ -3130,21 +3263,28 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     shapeDrag = {
       mode: 'records',
       moved: false,
+      solverActive: false,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
       startWorld: screenToWorld(event.clientX, event.clientY),
       items: dragRecordsForSelection().map((item) => ({ record: item, startEntity: cloneEntity(item.entity) })),
     };
-    solver.beginDrag(shapeDrag.items.flatMap(({ record: item }) => ['geometry', 'text', 'table'].includes(item.recordType) ? solver.variableIdsForEntity(item.id) : []));
+    shapeDrag.variableIds = shapeDrag.items.flatMap(({ record: item }) => (
+      ['geometry', 'text', 'table'].includes(item.recordType)
+        ? solver.variableIdsForEntity(item.id)
+        : []
+    ));
     return true;
   }
 
-  function startRegionDrag(event, parentIds) {
+  function startRegionDrag(event, parentIds, { preservePropertyFeature = false } = {}) {
     if (isToolDragBlocked() || event.button !== 0) return false;
     event.preventDefault();
     event.stopPropagation();
-    seamLineSystem.clearPropertyFeature();
+    if (!preservePropertyFeature) seamLineSystem.clearPropertyFeature();
     if (!parentIds.every((id) => selectedIds.has(id))) selectRecords(parentIds);
     if (!beginRecordsDrag(event)) return false;
-    event.currentTarget.setPointerCapture(event.pointerId);
     return true;
   }
 
@@ -3159,7 +3299,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       syncState();
     }
     if (!beginRecordsDrag(event)) return false;
-    record.group.setPointerCapture(event.pointerId);
     return true;
   }
 
@@ -3179,20 +3318,29 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     shapeDrag = {
       mode: 'segment',
       moved: false,
+      solverActive: false,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
       record,
       segmentIndex,
       startWorld: screenToWorld(event.clientX, event.clientY),
       startEntity: cloneEntity(record.entity),
+      variableIds: solver.variableIdsForFeature({ kind: 'segment', recordId: record.id, index: segmentIndex }),
     };
-    solver.beginDrag(solver.variableIdsForFeature({ kind: 'segment', recordId: record.id, index: segmentIndex }));
-    record.group.setPointerCapture(event.pointerId);
     return true;
   }
 
   function moveShapeDrag(event) {
+    if (!shapeDrag.moved) {
+      if (!canvasPointerDragReady(shapeDrag, event)) return;
+      shapeDrag.moved = true;
+      solver.beginDrag(shapeDrag.variableIds || []);
+      shapeDrag.solverActive = true;
+      canvas.setPointerCapture(shapeDrag.pointerId);
+    }
     const world = screenToWorld(event.clientX, event.clientY);
     const delta = subtractPoints(world, shapeDrag.startWorld);
-    if (pointLength(delta) > 0.001) shapeDrag.moved = true;
     const solveEntries = [];
     if (shapeDrag.mode === 'segment') {
       const entity = cloneEntity(shapeDrag.startEntity);
@@ -3382,7 +3530,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     seamLineSystem.clearPropertyFeature();
     records.forEach((record) => {
       if (!isRecordInteractive(record)) return;
-      const targets = [...record.group.querySelectorAll('.selectable-entity')];
+      const targets = recordInteractionTargets(record);
       if (windowSelect.bottomUp) {
         if (targets.some((target) => intersects(target.getBoundingClientRect(), windowSelect.rect))) selectedIds.add(record.id);
         return;
@@ -3404,13 +3552,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   function updateHover(event) {
     if (panStart || windowSelect || handleDrag || dimensionLineDrag || shapeDrag || imageTools.isDragging()) return;
     const previousHoveredId = hoveredId;
-    const previouslyHoveredHandle = records.some((record) => record.handles.some((handle) => handle.classList.contains('hovered')));
+    const previouslyHoveredHandle = records.some((record) => interactiveHandlesForRecord(record)
+      .some((handle) => handle.classList.contains('hovered')));
     hoveredId = document.elementsFromPoint(event.clientX, event.clientY)
       .map((element) => element.closest?.('.canvas-record') || element.closest?.('.canvas-handle-group'))
       .find(Boolean)?.dataset.recordId || null;
     records.forEach((record) => {
       const isVisible = hoveredId === record.id || selectedIds.has(record.id);
-      record.handles.forEach((handle) => {
+      interactiveHandlesForRecord(record).forEach((handle) => {
         handle.classList.remove('hovered');
         if (!isVisible) return;
         const rect = handle.getBoundingClientRect();
@@ -3419,7 +3568,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         if (Math.hypot(dx, dy) <= 8) handle.classList.add('hovered');
       });
     });
-    const hasHoveredHandle = records.some((record) => record.handles.some((handle) => handle.classList.contains('hovered')));
+    const hasHoveredHandle = records.some((record) => interactiveHandlesForRecord(record)
+      .some((handle) => handle.classList.contains('hovered')));
     if (previousHoveredId !== hoveredId || previouslyHoveredHandle !== hasHoveredHandle || hasHoveredHandle) syncState();
   }
 
@@ -3542,8 +3692,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       suppressRecordClick = shapeDrag.moved;
       if (shapeDrag.moved) suppressNextCanvasClick = true;
       notifyAfterGeometryDrag = shapeDrag.moved;
+      geometryDragEnded = shapeDrag.solverActive;
       shapeDrag = null;
-      geometryDragEnded = true;
       syncState();
     }
     if (handleDrag) {
@@ -3652,6 +3802,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     addObjects,
     upsertAuxiliaryGeometry,
     updateObjectComposite,
+    updateObjectComposites,
     addImage,
     addText,
     addTable,
@@ -3674,6 +3825,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     addDimension,
     clearDrawing,
     getDrawingData: drawingSnapshot,
+    solveDrawing,
     loadDrawingData,
     insertDrawingData,
     pasteDrawingData,
@@ -3687,10 +3839,15 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getObjectLayer() {
       return objectLayer;
     },
+    getHandleLayer() {
+      return handleLayer;
+    },
     getObjectPaintOrder() {
+      const { anchorRecordIds } = currentDerivedPaintPlan();
       const construction = records.filter((record) => (
         ['geometry', 'image', 'fillet'].includes(record.recordType)
         && record.entity.construction
+        && !anchorRecordIds.has(record.id)
       ));
       const notches = records.filter((record) => record.recordType === 'notch');
       const dimensions = records.filter((record) => record.recordType === 'dimension');
@@ -3700,6 +3857,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     syncGeometryStacking,
     getSeamLinePresentationNodes(sourceIds) {
       return seamLineSystem.presentationNodesForSourceIds(sourceIds);
+    },
+    getDerivedPresentationNodes(sourceIds) {
+      return [...derivedPresentationProviders].flatMap((provider) => (
+        [...(provider.nodesForSourceIds?.(sourceIds) || [])]
+      ));
     },
     getNearestSnapPoint: nearestSnapPoint,
     getNearestObjectPoint: nearestObjectPoint,
@@ -3720,6 +3882,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     getSelectedRecordIds() {
       return [...selectedIds];
+    },
+    getSelectedSegments() {
+      return [...selectedSegments.entries()].flatMap(([recordId, indices]) => (
+        [...indices].map((index) => ({ recordId, index }))
+      ));
+    },
+    startRecordSetDrag(event, recordIds = [], options = {}) {
+      return startRegionDrag(event, recordIds, options);
+    },
+    startRecordSegmentDrag(event, recordId, segmentIndex) {
+      const record = records.find((candidate) => candidate.id === recordId);
+      return record ? startSegmentDrag(event, record, segmentIndex) : false;
     },
     getClassState: classSystem.getState,
     getActiveClassId: classSystem.activeClassId,
@@ -3857,11 +4031,23 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getSelectionProperties: selectionProperties,
     clearSelection,
     selectRecords,
+    selectRecord(recordId, options = {}) {
+      if (options.additive) return toggleSelection(recordId, options);
+      selectOnly(recordId, options);
+      return selectedIds.has(recordId);
+    },
     deleteRecords,
     requestHistoryCheckpoint,
     registerDrawingExtension,
     setSelectedGeometryAppearance,
+    setRecordGeometryAppearance,
+    getResolvedGeometryAppearance(recordId) {
+      const record = records.find((candidate) => candidate.id === recordId);
+      return record ? cloneEntity(geometryAppearanceSystem.appearance(record.entity)) : null;
+    },
+    setPointFeaturePosition,
     setSelectedSeamLine: seamLineSystem.setSelectedSeamLine,
+    setBoundaryPropertyFeatureFromEvent: seamLineSystem.setPropertyFeatureFromEvent,
     getSelectedSubtractParent: subtractSystem.selectedParentOwner,
     getSubtractOwnerFromEvent: subtractSystem.ownerFromEvent,
     addSubtractRelation: subtractSystem.addSubtractRelation,
@@ -3934,6 +4120,37 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       derivedDimensionFeatureProviders.add(provider);
       refreshLinkedDimensions();
       return () => derivedDimensionFeatureProviders.delete(provider);
+    },
+    registerDerivedBoundaryFeatureProvider(provider) {
+      if (!provider || typeof provider !== 'object') return () => {};
+      derivedBoundaryFeatureProviders.add(provider);
+      notchSystem.refresh();
+      seamLineSystem.refresh();
+      syncState();
+      return () => {
+        derivedBoundaryFeatureProviders.delete(provider);
+        notchSystem.refresh();
+        seamLineSystem.refresh();
+        syncState();
+      };
+    },
+    registerDerivedPresentationProvider(provider) {
+      if (!provider || typeof provider !== 'object') return () => {};
+      derivedPresentationProviders.add(provider);
+      seamLineSystem.refresh();
+      syncState();
+      return () => {
+        derivedPresentationProviders.delete(provider);
+        seamLineSystem.refresh();
+        syncState();
+      };
+    },
+    notifyDerivedFeatureChange() {
+      notchSystem.refresh();
+      seamLineSystem.refresh();
+      refreshLinkedDimensions();
+      constraintOverlaySystem?.render?.();
+      syncGeometryStacking();
     },
     registerSubtractOperandProvider(provider) {
       if (!provider || typeof provider.owners !== 'function') return () => {};

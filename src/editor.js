@@ -11,6 +11,7 @@ export {
 } from './modules/SymmetricTool.js';
 export { ARRAY_TOOL_ICONS, arrayToolTypes, createArrayTools } from './modules/ArrayTools.js';
 export { createNotchTools } from './modules/NotchSystem.js';
+export { createSwellTools, SWELL_ICON } from './modules/SwellTools.js';
 export { createDrawingHint } from './modules/CanvasViewport.js';
 export { createSmartDimensionTools } from './modules/DimensionSystem.js';
 export { createConstraintHandlers } from './modules/ConstraintSystem.js';
@@ -102,6 +103,7 @@ export * as images from './modules/ImageSystem.js';
 export * as imageStrokes from './modules/ImageStrokeSystem.js';
 export * as imageTrace from './modules/ImageTrace.js';
 export * as notches from './modules/NotchSystem.js';
+export * as swell from './modules/SwellTools.js';
 export * as objectVisibility from './modules/ObjectVisibility.js';
 export * as parametersPanel from './modules/ParametersPanel.js';
 export * as parameterTableIO from './modules/ParameterTableIO.js';

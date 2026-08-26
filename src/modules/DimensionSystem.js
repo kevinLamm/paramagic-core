@@ -1459,12 +1459,14 @@ export function upgradeLegacyParallelEdgeDimensions(snapshot = {}) {
     if (!reference || !measured) return annotation;
     const geometry = supportingLineDimensionGeometry(reference, measured);
     const orientation = Math.sign(geometry.signedDistance) || 1;
-    migrations.set(annotation.dimensionId, { lineToLine, orientation });
+    const direction = unitSmart(subtractSmart(geometry.measuredPoint, geometry.projected));
+    migrations.set(annotation.dimensionId, { lineToLine, orientation, direction });
     return {
       ...annotation,
       measurementKind: 'parallel-edge-distance',
       subtype: 'aligned',
       orientation,
+      direction,
       start: geometry.projected,
       end: geometry.measuredPoint,
       measureStart: geometry.projected,
@@ -1491,6 +1493,7 @@ export function upgradeLegacyParallelEdgeDimensions(snapshot = {}) {
         type: 'Line Line Distance',
         subtype: 'aligned',
         orientation: migration.orientation,
+        direction: migration.direction,
         featureRefs: [migration.lineToLine.reference, migration.lineToLine.measured],
       };
     }),
@@ -1505,6 +1508,7 @@ function parallelEndpointDimension(first, second, pointer, mode, drawingUnit) {
     measurementKind: 'parallel-edge-distance',
     subtype: 'aligned',
     orientation: Math.sign(geometry.signedDistance) || 1,
+    direction: unitSmart(subtractSmart(geometry.measuredPoint, geometry.projected)),
     start: geometry.projected,
     end: geometry.measuredPoint,
     measureStart: geometry.projected,
@@ -1565,9 +1569,16 @@ function distanceOrientation(subtype, start, end) {
   return null;
 }
 
+function distanceDirection(subtype, start, end) {
+  if (subtype === 'horizontal') return [distanceOrientation(subtype, start, end), 0];
+  if (subtype === 'vertical') return [0, distanceOrientation(subtype, start, end)];
+  return unitSmart(subtractSmart(end, start));
+}
+
 function distanceDimensionSmart(start, end, pointer, mode, sourceStart = start, sourceEnd = end, anchors = null, drawingUnit = 'in') {
   const subtype = distanceSubtype(start, end, pointer);
   const orientation = distanceOrientation(subtype, sourceStart, sourceEnd);
+  const direction = distanceDirection(subtype, sourceStart, sourceEnd);
   const measured = subtype === 'horizontal'
     ? Math.abs(sourceEnd[0] - sourceStart[0])
     : subtype === 'vertical'
@@ -1577,6 +1588,7 @@ function distanceDimensionSmart(start, end, pointer, mode, sourceStart = start, 
     type: 'dimension-line',
     dimensionMode: mode,
     subtype,
+    direction,
     start,
     end,
     measureStart: sourceStart,
@@ -1627,6 +1639,7 @@ export function linkedPositionDimension(selections, pointer, drawingUnit = 'in')
     dimensionMode: 'driving',
     subtype,
     orientation,
+    direction: distanceDirection(subtype, first.point, second.point),
     start: [...first.point],
     end: [...second.point],
     measureStart: [...first.point],
@@ -1702,6 +1715,7 @@ function angleBetweenSegments(first, second, pointer, mode) {
     firstRaySign,
     secondRaySign,
     angleOrientation: Math.sign(signedAngle) || 1,
+    direction: unitSmart(subtractSmart(pointer, vertex), unitSmart(addSmart(firstVector, secondVector))),
     useRenderedMeasurement: mode === 'driven',
     anchors: {
       firstSegment: segmentEndpointAnchors(first),
@@ -1717,6 +1731,7 @@ function radiusDimension(feature, pointer, mode, drawingUnit) {
     type: 'radius-dimension',
     subtype,
     dimensionMode: mode,
+    direction: unitSmart(subtractSmart(pointer, feature.center)),
     center: feature.center,
     radius: feature.radius,
     elbow: pointer,

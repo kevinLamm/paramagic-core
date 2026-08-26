@@ -7,6 +7,23 @@ import {
 } from './DxfExportGeometry.js';
 import { normalizeDrawingData, resolveDrawingScene } from './DrawingIO.js';
 
+export const DXF_EXPORT_SOLVE_TOLERANCE = 1e-8;
+
+export function prepareDxfExportGeometry(solveDrawing) {
+  if (typeof solveDrawing !== 'function') {
+    throw new TypeError('DXF export requires a drawing solve callback.');
+  }
+  const result = solveDrawing({
+    fullSolve: true,
+    solveMode: 'final',
+    tolerance: DXF_EXPORT_SOLVE_TOLERANCE,
+  });
+  if (!['converged', 'unchanged'].includes(result?.status)) {
+    throw new Error(result?.message || 'The drawing could not be solved accurately enough for DXF export.');
+  }
+  return result;
+}
+
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const finitePoint = (value) => Array.isArray(value) && value.length >= 2
   && value.slice(0, 2).every(Number.isFinite);

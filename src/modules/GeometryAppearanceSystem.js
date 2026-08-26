@@ -155,25 +155,28 @@ export function createGeometryAppearanceSystem({
     return null;
   }
 
-  function selectedGeometryRecords() {
+  function selectedGeometryRecords(selection = selectedIds, { includeConstruction = false } = {}) {
     return records.filter((record) => (
-      selectedIds.has(record.id)
+      selection.has(record.id)
       && ['geometry', 'fillet'].includes(record.recordType)
-      && !record.entity.construction
+      && (includeConstruction || !record.entity.construction)
     ));
   }
 
-  function selectedTextRecords() {
-    return records.filter((record) => selectedIds.has(record.id) && record.recordType === 'text');
+  function selectedTextRecords(selection = selectedIds) {
+    return records.filter((record) => selection.has(record.id) && record.recordType === 'text');
   }
 
-  function strokeTargetRecords() {
+  function strokeTargetRecords(selection = selectedIds, { includeConstruction = false, useFeatureTarget = true } = {}) {
     const target = featureTarget();
-    if (target?.recordId) {
+    if (useFeatureTarget && target?.recordId) {
       const record = records.find((candidate) => candidate.id === target.recordId);
-      if (record && ['geometry', 'fillet'].includes(record.recordType) && !record.entity.construction) return [record];
+      if (record && ['geometry', 'fillet'].includes(record.recordType) && (includeConstruction || !record.entity.construction)) return [record];
     }
-    return [...selectedGeometryRecords(), ...selectedTextRecords()];
+    return [
+      ...selectedGeometryRecords(selection, { includeConstruction }),
+      ...selectedTextRecords(selection),
+    ];
   }
 
   function selectionProperties() {
@@ -302,16 +305,23 @@ export function createGeometryAppearanceSystem({
     };
   }
 
-  function setSelectedAppearance(patch = {}) {
-    const selectedGeometry = selectedGeometryRecords();
-    const selectedTexts = selectedTextRecords();
+  function setSelectedAppearance(patch = {}, {
+    recordIds = null,
+    includeConstruction = false,
+  } = {}) {
+    const appearanceSelection = recordIds ? new Set(recordIds) : selectedIds;
+    const selectedGeometry = selectedGeometryRecords(appearanceSelection, { includeConstruction });
+    const selectedTexts = selectedTextRecords(appearanceSelection);
     const selectedAppearanceRecords = [...selectedGeometry, ...selectedTexts];
     const selectedImages = records.filter((record) => (
-      selectedIds.has(record.id)
+      appearanceSelection.has(record.id)
       && record.recordType === 'image'
-      && !record.entity.construction
+      && (includeConstruction || !record.entity.construction)
     ));
-    const strokeTargets = new Set(strokeTargetRecords().map((record) => record.id));
+    const strokeTargets = new Set(strokeTargetRecords(appearanceSelection, {
+      includeConstruction,
+      useFeatureTarget: !recordIds,
+    }).map((record) => record.id));
     if (!selectedAppearanceRecords.length && !selectedImages.length) return { success: false, error: 'No editable object selected.' };
     const fillExpression = patch.fillExpression ?? patch.fillColor;
     const resolvedFill = fillExpression !== undefined
@@ -322,7 +332,7 @@ export function createGeometryAppearanceSystem({
       )
       : null;
     if (resolvedFill?.fillType === 'image') {
-      const eligibility = closedImageFillSelection(records, selectedIds, getClosedCycles());
+      const eligibility = closedImageFillSelection(records, appearanceSelection, getClosedCycles());
       if (!eligibility.canEditImageFill) return { success: false, error: 'Image fills can only be applied to complete closed objects.' };
     }
     const requestedStrokeColor = patch.strokeColor === undefined ? null : String(patch.strokeColor).trim();
