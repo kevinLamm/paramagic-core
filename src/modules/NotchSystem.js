@@ -24,6 +24,17 @@ export const vNotchHalfWidth = 3.175;
 export const uNotchHalfWidth = 1.5875;
 export const isNotchEntity = (entity) => entity?.type === 'notch' && entity.host?.recordId;
 
+export function prepareNotchValueOnlyPresentationClone(clone) {
+  clone?.querySelectorAll?.('.notch-dot, .notch-hit').forEach((node) => node.remove());
+  clone?.querySelectorAll?.('.notch-line').forEach((node) => {
+    node.setAttribute('stroke', '#000000');
+    node.setAttribute('stroke-width', '1.5');
+    node.setAttribute('vector-effect', 'non-scaling-stroke');
+    node.setAttribute('pointer-events', 'none');
+  });
+  return clone;
+}
+
 const notchTypeValues = new Set(NOTCH_TYPE_OPTIONS.map(({ value }) => value));
 
 export function normalizeNotchType(value, fallback = LEGACY_NOTCH_TYPE) {
@@ -1269,7 +1280,14 @@ export function createNotchSystem({
       'data-entity-type': 'notch',
       'aria-label': 'Notch',
     });
-    const line = addSvg(group, 'path', { class: 'notch-line selectable-entity', fill: 'none' });
+    const line = addSvg(group, 'path', {
+      class: 'notch-line selectable-entity',
+      fill: 'none',
+      stroke: '#000000',
+      'stroke-width': '1.5',
+      'vector-effect': 'non-scaling-stroke',
+      'pointer-events': 'none',
+    });
     const hitNode = addSvg(group, 'path', { class: 'notch-hit selectable-entity hit-target', fill: 'none' });
     const dot = addSvg(group, 'circle', {
       r: notchDotRadiusForScale(getScale()),

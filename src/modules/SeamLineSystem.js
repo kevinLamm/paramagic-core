@@ -1204,6 +1204,10 @@ function presentationNode(entity) {
   if (!node) return null;
   node.setAttribute('class', 'seam-line-path derived-seam-line');
   node.setAttribute('fill', 'none');
+  node.setAttribute('stroke', '#636363');
+  node.setAttribute('stroke-width', '1.5');
+  node.setAttribute('stroke-dasharray', '7 5');
+  node.setAttribute('vector-effect', 'non-scaling-stroke');
   node.setAttribute('pointer-events', 'none');
   return node;
 }

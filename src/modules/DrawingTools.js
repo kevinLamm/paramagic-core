@@ -336,7 +336,7 @@ export function createDrawingTools({
       const completedTool = activeTool;
       const record = canvas.addText({ x: rawPoint[0], y: rawPoint[1] });
       completeActiveTool(completedTool);
-      canvas.beginTextEdit(record, { selectAll: true });
+      canvas.beginTextEdit(record, { selectAll: true, placementPointerEvent: event });
       return true;
     }
 

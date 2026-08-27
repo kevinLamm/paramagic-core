@@ -34,6 +34,8 @@ const initialTextDefaults = {
   },
 };
 
+const DEFAULT_TEXT_CLASS_OVERRIDES = Object.freeze(['fillOpacity', 'strokeOpacity']);
+
 let lastTextDefaults = clone(initialTextDefaults);
 
 function textId() {
@@ -72,6 +74,7 @@ export function normalizeTextEntity(input = {}) {
       : { textHeight: input.textHeight, fontSize },
   );
   return {
+    ...clone(input),
     id: input.id || textId(),
     type: 'text',
     stackId: String(input.stackId || 'stack-default'),
@@ -94,7 +97,125 @@ export function normalizeTextEntity(input = {}) {
 }
 
 export function createTextEntity(position = {}) {
-  return normalizeTextEntity(position);
+  const entity = normalizeTextEntity(position);
+  const requestedOverrides = Array.isArray(entity.classPropertyOverrides)
+    ? entity.classPropertyOverrides
+    : [];
+  entity.classPropertyOverrides = [...new Set([
+    ...requestedOverrides,
+    ...DEFAULT_TEXT_CLASS_OVERRIDES,
+  ])];
+  return entity;
+}
+
+export function bindTextRecordInteractions(record, {
+  canInteract = () => true,
+  isEditing = () => false,
+  beginEdit = () => {},
+  onClearPropertyFeature = () => {},
+  onSelect = () => {},
+  onToggleSelection = () => {},
+  onStartDrag = () => false,
+  consumeSuppressedClick = () => false,
+} = {}) {
+  const target = record?.foreignObject;
+  if (!target?.addEventListener) return () => {};
+
+  const editAtPointer = (event) => {
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    consumeSuppressedClick();
+    onSelect(record);
+    beginEdit(record, {
+      caretPoint: { clientX: event.clientX, clientY: event.clientY },
+      interactionEvent: event,
+    });
+  };
+
+  const handlePointerDown = (event) => {
+    if (!canInteract(event, record)) return;
+    event.stopPropagation?.();
+    if (isEditing(record)) return;
+    if (!(event.ctrlKey || event.metaKey)) onClearPropertyFeature();
+    if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
+
+    if (event.detail > 1) return;
+    onStartDrag(event, record);
+  };
+
+  const handleClick = (event) => {
+    event.stopPropagation?.();
+    if (event.detail >= 2) {
+      consumeSuppressedClick();
+      return;
+    }
+    if (consumeSuppressedClick() || !canInteract(event, record)) return;
+    if (event.ctrlKey || event.metaKey) onToggleSelection(record);
+    else onSelect(record);
+  };
+
+  const handleDoubleClick = (event) => editAtPointer(event);
+  target.addEventListener('pointerdown', handlePointerDown);
+  target.addEventListener('click', handleClick);
+  target.addEventListener('dblclick', handleDoubleClick);
+  return () => {
+    target.removeEventListener?.('pointerdown', handlePointerDown);
+    target.removeEventListener?.('click', handleClick);
+    target.removeEventListener?.('dblclick', handleDoubleClick);
+  };
+}
+
+export function deferTextEditUntilPlacementClick({
+  pointerEvent,
+  eventTarget,
+  onReady,
+  schedule = (callback) => setTimeout(callback, 0),
+} = {}) {
+  if (pointerEvent?.type !== 'pointerdown' || !eventTarget?.addEventListener) {
+    onReady?.();
+    return () => {};
+  }
+
+  const pointerId = Number.isFinite(Number(pointerEvent.pointerId)) ? Number(pointerEvent.pointerId) : null;
+  const placementX = Number(pointerEvent.clientX);
+  const placementY = Number(pointerEvent.clientY);
+  let cancelled = false;
+  let listenersActive = true;
+
+  const removeListeners = () => {
+    if (!listenersActive) return;
+    listenersActive = false;
+    eventTarget.removeEventListener?.('click', handleClick, true);
+    eventTarget.removeEventListener?.('pointercancel', handleCancel, true);
+  };
+  const ready = () => {
+    removeListeners();
+    schedule(() => {
+      if (!cancelled) onReady?.();
+    });
+  };
+  const handleClick = (event) => {
+    if (event?.button !== undefined && event.button !== 0) return;
+    if (
+      Number.isFinite(placementX)
+      && Number.isFinite(placementY)
+      && Number.isFinite(Number(event?.clientX))
+      && Number.isFinite(Number(event?.clientY))
+      && Math.hypot(Number(event.clientX) - placementX, Number(event.clientY) - placementY) > 8
+    ) return;
+    ready();
+  };
+  const handleCancel = (event) => {
+    if (pointerId !== null && Number(event?.pointerId) !== pointerId) return;
+    ready();
+  };
+
+  eventTarget.addEventListener('click', handleClick, true);
+  eventTarget.addEventListener('pointercancel', handleCancel, true);
+  return () => {
+    cancelled = true;
+    removeListeners();
+  };
 }
 
 export function resolveTextFields(
@@ -157,6 +278,99 @@ export function drawingTextSvgLayout(entity = {}) {
   };
 }
 
+function finiteNumber(value, fallback = 0) {
+  const number = Number.parseFloat(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+export function drawingTextPresentationModel(foreignObject, editor, getStyle = null) {
+  const computed = typeof getStyle === 'function' ? getStyle(editor) : null;
+  const styleValue = (property, fallback = '') => (
+    computed?.getPropertyValue?.(property)
+    || editor?.style?.getPropertyValue?.(property)
+    || editor?.style?.[property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())]
+    || fallback
+  );
+  const x = finiteNumber(foreignObject?.getAttribute?.('x'));
+  const y = finiteNumber(foreignObject?.getAttribute?.('y'));
+  const width = Math.max(0, finiteNumber(foreignObject?.getAttribute?.('width')));
+  const height = Math.max(0, finiteNumber(foreignObject?.getAttribute?.('height')));
+  const fontSize = Math.max(0.001, finiteNumber(styleValue('font-size'), DEFAULT_TEXT_FONT_SIZE));
+  const borderWidth = Math.max(0, finiteNumber(styleValue('border-width')));
+  const inset = TEXT_EDITOR_PADDING + borderWidth;
+  const textAlign = normalizeTextAlign(styleValue('text-align', 'left'));
+  const contentX = textAlign === 'center'
+    ? x + width / 2
+    : textAlign === 'right' ? x + width - inset : x + inset;
+  const lineHeight = Math.max(fontSize, finiteNumber(styleValue('line-height'), fontSize * TEXT_LINE_HEIGHT));
+  return {
+    x,
+    y,
+    width,
+    height,
+    contentX,
+    contentY: y + inset,
+    lineHeight,
+    lines: String(editor?.value ?? editor?.textContent ?? '').split(/\r\n?|\n/),
+    fill: styleValue('color', '#202020'),
+    fontFamily: styleValue('font-family', 'Arial'),
+    fontSize,
+    textAnchor: textAlign === 'center' ? 'middle' : textAlign === 'right' ? 'end' : 'start',
+    background: styleValue('background-color', 'transparent'),
+    borderColor: styleValue('border-color', 'transparent'),
+    borderWidth,
+  };
+}
+
+export function replaceDrawingTextForeignObjects(source, clone) {
+  if (!source?.querySelectorAll || !clone?.querySelectorAll) return clone;
+  const sourceBoxes = [...source.querySelectorAll('.text-foreign-object')];
+  const cloneBoxes = [...clone.querySelectorAll('.text-foreign-object')];
+  cloneBoxes.forEach((cloneBox, index) => {
+    const sourceBox = sourceBoxes[index] || cloneBox;
+    const editor = sourceBox.querySelector?.('.drawing-text-editor')
+      || cloneBox.querySelector?.('.drawing-text-editor');
+    const documentRef = cloneBox.ownerDocument || clone.ownerDocument;
+    if (!editor || !documentRef?.createElementNS) {
+      cloneBox.remove?.();
+      return;
+    }
+    const model = drawingTextPresentationModel(
+      sourceBox,
+      editor,
+      (node) => node.ownerDocument?.defaultView?.getComputedStyle?.(node),
+    );
+    const presentation = documentRef.createElementNS('http://www.w3.org/2000/svg', 'g');
+    presentation.setAttribute('class', 'drawing-text-presentation');
+    const frame = documentRef.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    frame.setAttribute('x', model.x);
+    frame.setAttribute('y', model.y);
+    frame.setAttribute('width', model.width);
+    frame.setAttribute('height', model.height);
+    frame.setAttribute('fill', model.background);
+    frame.setAttribute('stroke', model.borderColor);
+    frame.setAttribute('stroke-width', model.borderWidth);
+    presentation.appendChild(frame);
+    const text = documentRef.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('fill', model.fill);
+    text.setAttribute('font-family', model.fontFamily);
+    text.setAttribute('font-size', model.fontSize);
+    text.setAttribute('text-anchor', model.textAnchor);
+    text.setAttribute('dominant-baseline', 'text-before-edge');
+    text.setAttribute('xml:space', 'preserve');
+    model.lines.forEach((line, lineIndex) => {
+      const span = documentRef.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+      span.setAttribute('x', model.contentX);
+      span.setAttribute('y', model.contentY + lineIndex * model.lineHeight);
+      span.textContent = line;
+      text.appendChild(span);
+    });
+    presentation.appendChild(text);
+    cloneBox.replaceWith(presentation);
+  });
+  return clone;
+}
+
 export function rememberTextDefaults(entity) {
   const normalized = normalizeTextEntity(entity);
   lastTextDefaults = {
@@ -181,12 +395,18 @@ function rgba(hex, opacity) {
 
 export function createTextSystem({
   objectLayer,
+  interactionSurface = null,
   getScale,
   getAppearance,
   getParameters,
   formatParameter,
   evaluateExpression = null,
-  bindRecordEvents,
+  canInteract,
+  onClearPropertyFeature,
+  onSelect,
+  onToggleSelection,
+  onStartDrag,
+  consumeSuppressedClick,
   updateRecordHandles,
   syncEntity = () => {},
   resolveTextProperties = (entity) => entity,
@@ -200,6 +420,7 @@ export function createTextSystem({
   const measureContext = measureCanvas.getContext('2d');
   let editingRecord = null;
   let editStartText = '';
+  let cancelPendingPlacementEdit = null;
 
   const presentationEntity = (record) => ({
     ...record.entity,
@@ -270,6 +491,10 @@ export function createTextSystem({
     onChange({ history: 'commit' });
   }
 
+  interactionSurface?.addEventListener?.('pointerdown', (event) => {
+    if (!event.target.closest?.('.drawing-text-editor.editing')) finishEdit();
+  });
+
   function caretIndexFromPoint(record, clientX, clientY) {
     const entity = presentationEntity(record);
     const lines = entity.multiline ? String(record.editor.value || '').split('\n') : [singleLineText(record.editor.value || '')];
@@ -294,7 +519,7 @@ export function createTextSystem({
     return lines.slice(0, lineIndex).reduce((total, value) => total + value.length + 1, 0) + column;
   }
 
-  function beginEdit(record, { selectAll = false, caretPoint = null } = {}) {
+  function activateEdit(record, { selectAll = false, caretPoint = null } = {}) {
     if (!record || record === editingRecord) return;
     if (editingRecord) finishEdit(editingRecord);
     requestHistoryCheckpoint('edit-text');
@@ -304,15 +529,52 @@ export function createTextSystem({
     record.editor.tabIndex = 0;
     record.editor.classList.add('editing');
     updateRecord(record);
-    requestAnimationFrame(() => {
-      if (editingRecord !== record) return;
-      record.editor.focus({ preventScroll: true });
-      if (caretPoint) {
-        const caretIndex = caretIndexFromPoint(record, caretPoint.clientX, caretPoint.clientY);
-        record.editor.setSelectionRange(caretIndex, caretIndex);
+    record.editor.focus({ preventScroll: true });
+    if (caretPoint) {
+      const caretIndex = caretIndexFromPoint(record, caretPoint.clientX, caretPoint.clientY);
+      record.editor.setSelectionRange(caretIndex, caretIndex);
+      return;
+    }
+    record.editor.setSelectionRange(selectAll ? 0 : record.editor.value.length, record.editor.value.length);
+  }
+
+  function beginEdit(record, {
+    selectAll = false,
+    caretPoint = null,
+    placementPointerEvent = null,
+    interactionEvent = null,
+  } = {}) {
+    cancelPendingPlacementEdit?.();
+    cancelPendingPlacementEdit = null;
+
+    const ownerDocument = record?.editor?.ownerDocument || document;
+    const view = ownerDocument.defaultView;
+    const schedule = typeof view?.requestAnimationFrame === 'function'
+      ? (callback) => view.requestAnimationFrame(callback)
+      : (callback) => setTimeout(callback, 0);
+    if (placementPointerEvent?.type !== 'pointerdown') {
+      if (!interactionEvent?.type) {
+        activateEdit(record, { selectAll, caretPoint });
         return;
       }
-      record.editor.setSelectionRange(selectAll ? 0 : record.editor.value.length, record.editor.value.length);
+      let cancelled = false;
+      cancelPendingPlacementEdit = () => { cancelled = true; };
+      schedule(() => {
+        if (cancelled) return;
+        cancelPendingPlacementEdit = null;
+        activateEdit(record, { selectAll, caretPoint });
+      });
+      return;
+    }
+
+    cancelPendingPlacementEdit = deferTextEditUntilPlacementClick({
+      pointerEvent: placementPointerEvent,
+      eventTarget: ownerDocument,
+      schedule,
+      onReady: () => {
+        cancelPendingPlacementEdit = null;
+        activateEdit(record, { selectAll, caretPoint });
+      },
     });
   }
 
@@ -355,11 +617,15 @@ export function createTextSystem({
       handles: [],
     };
 
-    bindRecordEvents(record);
-    editor.addEventListener('dblclick', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      beginEdit(record, { caretPoint: { clientX: event.clientX, clientY: event.clientY } });
+    bindTextRecordInteractions(record, {
+      canInteract,
+      isEditing: (candidate) => candidate === editingRecord,
+      beginEdit,
+      onClearPropertyFeature,
+      onSelect,
+      onToggleSelection,
+      onStartDrag,
+      consumeSuppressedClick,
     });
     editor.addEventListener('input', () => {
       if (record !== editingRecord) return;
@@ -419,6 +685,8 @@ export function createTextSystem({
     beginEdit,
     finishEdit,
     finishEditing() {
+      cancelPendingPlacementEdit?.();
+      cancelPendingPlacementEdit = null;
       finishEdit();
     },
     updateRecord,

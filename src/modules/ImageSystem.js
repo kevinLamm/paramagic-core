@@ -219,14 +219,13 @@ export async function prepareImageFillContentUrl(reference) {
     if (!response.ok) throw new Error(`Catalog image could not be loaded: ${normalizedReference}`);
     const sourceBlob = await response.blob();
     const runtimeBlob = await reduceCatalogImageBlob(sourceBlob);
-    const isObjectUrl = runtimeBlob !== sourceBlob;
-    const contentUrl = isObjectUrl ? globalThis.URL.createObjectURL(runtimeBlob) : sourceUrl;
+    const contentUrl = globalThis.URL.createObjectURL(runtimeBlob);
     runtimeCatalogImageUrls.set(normalizedReference, {
       contentUrl,
       byteSize: runtimeBlob.size,
-      isObjectUrl,
+      isObjectUrl: true,
     });
-    if (isObjectUrl) runtimeCatalogReferencesByUrl.set(contentUrl, normalizedReference);
+    runtimeCatalogReferencesByUrl.set(contentUrl, normalizedReference);
     return contentUrl;
   })();
   pendingRuntimeCatalogImages.set(normalizedReference, preparation);
@@ -2629,7 +2628,7 @@ async function sha256(bytes) {
 }
 
 async function defaultFetchAsset(reference) {
-  const contentUrl = staticImageFillContentUrl(reference);
+  const contentUrl = imageFillContentUrl(reference);
   if (!contentUrl) throw new Error(`Image fill could not be exported: ${reference}`);
   const response = await fetch(contentUrl);
   if (!response.ok) throw new Error(`Image fill could not be exported: ${reference}`);
@@ -2639,7 +2638,16 @@ async function defaultFetchAsset(reference) {
   };
 }
 
-const SVG_IMAGE_ELEMENT_PATTERN = /<image\b[^<>]*\/>/g;
+async function defaultFetchSvgImage(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`SVG image could not be exported: ${url}`);
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    mimeType: response.headers.get('content-type') || '',
+  };
+}
+
+const SVG_IMAGE_ELEMENT_PATTERN = /<image\b[^<>]*(?:\/>|>\s*<\/image>)/gi;
 const SVG_XLINK_NAMESPACE_PATTERN = /\s+xmlns:[A-Za-z_][\w.-]*="http:\/\/www\.w3\.org\/1999\/xlink"/g;
 const SVG_PREFIXED_HREF_PATTERN = /\s+[A-Za-z_][\w.-]*:href="[^"]*"/g;
 
@@ -2648,14 +2656,47 @@ function svgAttributeValue(markup, name) {
   return match?.[1] ?? null;
 }
 
+function decodeSvgAttributeValue(value) {
+  const entities = {
+    '&amp;': '&',
+    '&apos;': "'",
+    '&gt;': '>',
+    '&lt;': '<',
+    '&quot;': '"',
+  };
+  return String(value || '').replace(/&(amp|apos|gt|lt|quot);/g, (entity) => entities[entity]);
+}
+
+function svgImageMimeType(value, url) {
+  const requested = String(value || '').split(';', 1)[0].trim().toLowerCase();
+  if (/^image\/[\w.+-]+$/.test(requested)) return requested === 'image/jpg' ? 'image/jpeg' : requested;
+  const path = (() => {
+    try { return new URL(url, globalThis.location?.href || 'http://localhost/').pathname; }
+    catch { return String(url || '').split(/[?#]/, 1)[0]; }
+  })().toLowerCase();
+  if (path.endsWith('.svg')) return 'image/svg+xml';
+  if (path.endsWith('.png')) return 'image/png';
+  if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg';
+  if (path.endsWith('.gif')) return 'image/gif';
+  if (path.endsWith('.webp')) return 'image/webp';
+  if (path.endsWith('.avif')) return 'image/avif';
+  return 'application/octet-stream';
+}
+
 function removeSvgAttribute(markup, name) {
   return markup.replace(new RegExp(`\\s+${name}="[^"]*"`, 'g'), '');
 }
 
 function normalizeSvgImageElement(markup) {
-  return String(markup || '')
+  const source = String(markup || '');
+  const prefixedHref = source.match(/\s+[A-Za-z_][\w.-]*:href="([^"]*)"/)?.[1] || '';
+  let normalized = source
     .replace(SVG_XLINK_NAMESPACE_PATTERN, '')
     .replace(SVG_PREFIXED_HREF_PATTERN, '');
+  if (!svgAttributeValue(normalized, 'href') && prefixedHref) {
+    normalized = normalized.replace(/^<image\b/i, `<image href="${prefixedHref}"`);
+  }
+  return normalized;
 }
 
 function shareableSvgImage(markup) {
@@ -2678,7 +2719,7 @@ function shareableSvgImage(markup) {
 function sharedSvgImageUse(image, id) {
   let remainingAttributes = image.normalized
     .replace(/^<image\b/, '')
-    .replace(/\/>$/, '');
+    .replace(/(?:\/>|>\s*<\/image>)$/i, '');
   ['x', 'y', 'width', 'height', 'preserveAspectRatio', 'href'].forEach((name) => {
     remainingAttributes = removeSvgAttribute(remainingAttributes, name);
   });
@@ -2731,26 +2772,28 @@ export function compactSvgImageAssets(svgInput) {
 
 export async function embedSvgImageAssets(svgInput, {
   fetchAsset = defaultFetchAsset,
+  fetchSvgImage = defaultFetchSvgImage,
 } = {}) {
   const svg = compactSvgImageAssets(svgInput);
   const hrefPattern = /(\s)href="([^"]+)"/g;
-  const referencesByUrl = new Map();
-  for (const match of svg.matchAll(hrefPattern)) {
-    const reference = imageFillReferenceFromContentUrl(match[2]);
-    if (!reference) continue;
-    referencesByUrl.set(match[2], reference);
+  const imageSources = new Map();
+  for (const match of svg.matchAll(SVG_IMAGE_ELEMENT_PATTERN)) {
+    const encodedUrl = svgAttributeValue(match[0], 'href');
+    if (!encodedUrl || encodedUrl.startsWith('#') || /^data:/i.test(encodedUrl)) continue;
+    const url = decodeSvgAttributeValue(encodedUrl);
+    imageSources.set(encodedUrl, {
+      url,
+      reference: imageFillReferenceFromContentUrl(url),
+    });
   }
-  if (!referencesByUrl.size) return svg;
+  if (!imageSources.size) return svg;
 
   const dataUrls = new Map(await Promise.all(
-    [...referencesByUrl].map(async ([url, reference]) => {
-      const asset = await fetchAsset(reference);
+    [...imageSources].map(async ([encodedUrl, { url, reference }]) => {
+      const asset = reference ? await fetchAsset(reference) : await fetchSvgImage(url);
       const bytes = asset.bytes instanceof Uint8Array ? asset.bytes : new Uint8Array(asset.bytes);
-      const requestedMimeType = String(asset.mimeType || '').split(';', 1)[0].trim();
-      const mimeType = /^[\w.+-]+\/[\w.+-]+$/.test(requestedMimeType)
-        ? requestedMimeType
-        : 'application/octet-stream';
-      return [url, `data:${mimeType};base64,${bytesToBase64(bytes)}`];
+      const mimeType = svgImageMimeType(asset.mimeType, url);
+      return [encodedUrl, `data:${mimeType};base64,${bytesToBase64(bytes)}`];
     }),
   ));
 

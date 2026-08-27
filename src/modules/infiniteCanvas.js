@@ -335,12 +335,22 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   const textTools = createTextSystem({
     objectLayer,
+    interactionSurface: canvas,
     getScale: () => camera.scale,
     getAppearance: geometryAppearanceSystem.appearance,
     getParameters: () => [...solver.documentVariables?.() || [], ...solver.parameters()],
     formatParameter: (entry) => formatUnitlessValue(entry.value, solver.drawingUnit || 'in'),
     evaluateExpression: evaluateFieldExpression,
-    bindRecordEvents,
+    canInteract: () => !(drawingMode || smartDimensionDelegate || featureCommandDelegate),
+    onClearPropertyFeature: () => seamLineSystem.clearPropertyFeature(),
+    onSelect: (record) => selectOnly(record.id),
+    onToggleSelection: (record) => toggleSelection(record.id),
+    onStartDrag: (event, record) => startObjectDrag(event, record, { preserveClickSequence: true }),
+    consumeSuppressedClick: () => {
+      const suppressed = suppressRecordClick;
+      suppressRecordClick = false;
+      return suppressed;
+    },
     updateRecordHandles,
     syncEntity: (entity) => solver.updateEntity(cloneEntity(entity)),
     resolveTextProperties: classSystem.resolveEntityProperties,
@@ -1314,23 +1324,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         return;
       }
       if (event.target.dataset?.segmentIndex !== undefined && startSegmentDrag(event, record)) return;
-      if (record.recordType === 'text') {
-        if (textTools.isEditing(record)) return;
-        const pointerTime = Number(event.timeStamp) || Date.now();
-        const previousPointer = record.lastTextPointerDown;
-        const isSecondPress = previousPointer
-          && pointerTime - previousPointer.time <= 500
-          && Math.hypot(event.clientX - previousPointer.x, event.clientY - previousPointer.y) <= 8;
-        record.lastTextPointerDown = { time: pointerTime, x: event.clientX, y: event.clientY };
-        if (isSecondPress || event.detail > 1) {
-          event.preventDefault();
-          selectOnly(record.id);
-          textTools.beginEdit(record, { caretPoint: { clientX: event.clientX, clientY: event.clientY } });
-          return;
-        }
-        startObjectDrag(event, record);
-        return;
-      }
       if (record.recordType === 'table') {
         startObjectDrag(event, record);
         return;
@@ -1349,12 +1342,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         suppressRecordClick = false;
         selectOnly(record.id);
         openDimensionEditPanel(record);
-        return;
-      }
-      if (record.recordType === 'text' && event.detail >= 2) {
-        suppressRecordClick = false;
-        selectOnly(record.id);
-        textTools.beginEdit(record, { caretPoint: { clientX: event.clientX, clientY: event.clientY } });
         return;
       }
       if (record.recordType === 'table') {
@@ -3586,7 +3573,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }, { passive: false });
 
   canvas.addEventListener('pointerdown', (event) => {
-    if (!event.target.closest?.('.drawing-text-editor.editing')) textTools.finishEditing();
     if (event.target.closest?.('.dimension-edit-panel, [data-canvas-ui]')) return;
     if (event.target.closest?.('.canvas-overlay-button')) return;
     if (drawingMode && drawingDelegate?.pointerDown?.(event)) {

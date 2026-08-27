@@ -524,7 +524,7 @@ function dxfTextStyles(entities = []) {
       .filter(({ type }) => type === 'text')
       .map((entity) => String(entity.fontName || 'Arial')),
   )];
-  const usedNames = new Set();
+  const usedNames = new Set(['STANDARD']);
   return fonts.map((fontName, index) => {
     const base = String(fontName || 'Arial')
       .toUpperCase()
@@ -609,9 +609,37 @@ export function serializeDxf(snapshot) {
     : exportUnitName === 'ft'
       ? "<>'"
       : `<> ${exportUnitName}`;
+  let nextDxfHandleValue = 1;
+  const nextDxfHandle = () => {
+    const handle = nextDxfHandleValue.toString(16).toUpperCase();
+    nextDxfHandleValue += 1;
+    return handle;
+  };
+  const handseedPlaceholder = '__PARAMAGIC_HANDSEED__';
+  const tableNames = ['VPORT', 'LTYPE', 'LAYER', 'STYLE', 'VIEW', 'UCS', 'APPID', 'DIMSTYLE', 'BLOCK_RECORD'];
+  const tableHandles = new Map(tableNames.map((name) => [name, nextDxfHandle()]));
+  const modelSpaceBlockName = '*Model_Space';
+  const paperSpaceBlockName = '*Paper_Space';
+  const blockRecordHandles = new Map(
+    [modelSpaceBlockName, paperSpaceBlockName, ...nativeDimensionPlans.map(({ blockName }) => blockName)]
+      .map((name) => [name, nextDxfHandle()]),
+  );
+  const modelSpaceHandle = blockRecordHandles.get(modelSpaceBlockName);
+  const paperSpaceHandle = blockRecordHandles.get(paperSpaceBlockName);
+  const namedObjectDictionaryHandle = nextDxfHandle();
+  const groupDictionaryHandle = nextDxfHandle();
+  const layoutDictionaryHandle = nextDxfHandle();
+  const mlineStyleDictionaryHandle = nextDxfHandle();
+  const standardMlineStyleHandle = nextDxfHandle();
+  const plotSettingsDictionaryHandle = nextDxfHandle();
+  const plotStyleDictionaryHandle = nextDxfHandle();
+  const normalPlotStyleHandle = nextDxfHandle();
+  const modelLayoutHandle = nextDxfHandle();
+  const paperLayoutHandle = nextDxfHandle();
   const lines = [
     '0', 'SECTION', '2', 'HEADER',
     '9', '$ACADVER', '1', 'AC1015',
+    '9', '$HANDSEED', '5', handseedPlaceholder,
     '9', '$INSUNITS', '70', String(exportUnit.code),
     '9', '$MEASUREMENT', '70', String(metricMeasurement),
     '9', '$LUNITS', '70', '2',
@@ -625,10 +653,24 @@ export function serializeDxf(snapshot) {
   };
   const x = (value) => dxfNumber(Number(value) * scale);
   const y = (value) => dxfNumber(-Number(value) * scale);
-  const pushLine = (entity, layer = '0') => {
-    push(0, 'LINE', 8, layer, 10, x(entity.start[0]), 20, y(entity.start[1]), 11, x(entity.end[0]), 21, y(entity.end[1]));
+  const pushEntityHeader = (type, layer, ownerHandle, subclass) => {
+    const isModelSpaceEntity = !ownerHandle || ownerHandle === modelSpaceHandle;
+    push(
+      0, type,
+      5, nextDxfHandle(),
+      330, ownerHandle || modelSpaceHandle,
+      100, 'AcDbEntity',
+      8, layer,
+      ...(isModelSpaceEntity ? [410, 'Model'] : []),
+      370, -1,
+      100, subclass,
+    );
   };
-  const pushArc = (entity, layer = '0') => {
+  const pushLine = (entity, layer = '0', ownerHandle = modelSpaceHandle) => {
+    pushEntityHeader('LINE', layer, ownerHandle, 'AcDbLine');
+    push(10, x(entity.start[0]), 20, y(entity.start[1]), 11, x(entity.end[0]), 21, y(entity.end[1]));
+  };
+  const pushArc = (entity, layer = '0', ownerHandle = modelSpaceHandle) => {
     const circle = arcCircle(entity);
     if (!circle) return;
     const angle = (point) => ((Math.atan2(-(point[1] - circle.center[1]), point[0] - circle.center[0]) * 180 / Math.PI) + 360) % 360;
@@ -637,12 +679,14 @@ export function serializeDxf(snapshot) {
     const midAngle = angle(entity.arcPoint);
     const containsMid = ((midAngle - startAngle + 360) % 360) <= ((endAngle - startAngle + 360) % 360);
     if (!containsMid) [startAngle, endAngle] = [endAngle, startAngle];
-    push(0, 'ARC', 8, layer, 10, x(circle.center[0]), 20, y(circle.center[1]), 40, x(circle.radius), 50, startAngle, 51, endAngle);
+    pushEntityHeader('ARC', layer, ownerHandle, 'AcDbCircle');
+    push(10, x(circle.center[0]), 20, y(circle.center[1]), 40, x(circle.radius), 100, 'AcDbArc', 50, startAngle, 51, endAngle);
   };
-  const pushBoundary = (entity, layer = '0') => {
+  const pushBoundary = (entity, layer = '0', ownerHandle = modelSpaceHandle) => {
     const vertices = dxfBoundaryVertices(entity, ([pointX, pointY]) => [x(pointX), y(pointY)]);
     if (vertices.length < 2) return;
-    push(0, 'LWPOLYLINE', 8, layer, 90, vertices.length, 70, entity.closed === true ? 1 : 0);
+    pushEntityHeader('LWPOLYLINE', layer, ownerHandle, 'AcDbPolyline');
+    push(90, vertices.length, 70, entity.closed === true ? 1 : 0);
     vertices.forEach((vertex) => {
       push(10, vertex.point[0], 20, vertex.point[1], 42, vertex.bulge);
     });
@@ -655,29 +699,32 @@ export function serializeDxf(snapshot) {
   const textStyle = (entity) => textStyleByFont.get(String(entity.fontName || 'Arial'))
     || textStyles[0]?.name
     || 'STANDARD';
-  const pushText = (entity) => {
+  const pushText = (entity, ownerHandle = modelSpaceHandle) => {
     const anchorX = x(entity.x);
     const anchorY = y(entity.y);
     const height = x(textHeightInMillimetres(entity));
     const alignment = entity.textAlign === 'center' ? 1 : entity.textAlign === 'right' ? 2 : 0;
     const value = dxfSingleLineContent(resolvedText(entity));
+    pushEntityHeader('TEXT', textLayer, ownerHandle, 'AcDbText');
     push(
-      0, 'TEXT', 8, textLayer, 7, textStyle(entity),
+      7, textStyle(entity),
       10, anchorX, 20, anchorY,
       40, height, 1, value,
-      72, alignment, 73, 3,
+      72, alignment,
       11, anchorX, 21, anchorY,
+      100, 'AcDbText', 73, 3,
     );
   };
-  const pushMtext = (entity) => {
+  const pushMtext = (entity, ownerHandle = modelSpaceHandle) => {
     const value = resolvedText(entity);
     const lines = String(value).split(/\r\n?|\n/);
     const height = x(textHeightInMillimetres(entity));
     const longestLineLength = Math.max(1, ...lines.map((line) => line.length));
     const referenceWidth = Math.max(height, longestLineLength * height * 0.65);
     const attachment = entity.textAlign === 'center' ? 2 : entity.textAlign === 'right' ? 3 : 1;
+    pushEntityHeader('MTEXT', textLayer, ownerHandle, 'AcDbMText');
     push(
-      0, 'MTEXT', 8, textLayer, 7, textStyle(entity),
+      7, textStyle(entity),
       10, x(entity.x), 20, y(entity.y),
       40, height, 41, referenceWidth,
       71, attachment, 72, 1,
@@ -685,41 +732,46 @@ export function serializeDxf(snapshot) {
       44, 1.25,
     );
   };
-  const pushSolid = (points, layer = dimensionLayer) => {
+  const pushSolid = (points, layer = dimensionLayer, ownerHandle = modelSpaceHandle) => {
     if (!Array.isArray(points) || points.length < 3) return;
     const [first, second, third] = points;
+    pushEntityHeader('SOLID', layer, ownerHandle, 'AcDbTrace');
     push(
-      0, 'SOLID', 8, layer,
       10, x(first[0]), 20, y(first[1]),
       11, x(second[0]), 21, y(second[1]),
       12, x(third[0]), 22, y(third[1]),
       13, x(third[0]), 23, y(third[1]),
     );
   };
-  const pushDimensionText = (picture) => {
+  const pushDimensionText = (picture, ownerHandle = modelSpaceHandle) => {
     const point = picture.textPoint;
     if (!point || !picture.text) return;
     const alignment = picture.textAlign === 'right' ? 2 : picture.textAlign === 'left' ? 0 : 1;
+    pushEntityHeader('TEXT', dimensionLayer, ownerHandle, 'AcDbText');
     push(
-      0, 'TEXT', 8, dimensionLayer,
       10, x(point[0]), 20, y(point[1]),
       40, x(3.5), 1, dxfSingleLineContent(picture.text),
       50, dxfNumber(-Number(picture.textAngle || 0)),
-      72, alignment, 73, 2,
+      72, alignment,
       11, x(point[0]), 21, y(point[1]),
+      100, 'AcDbText', 73, 2,
     );
   };
-  const pushDimensionPicture = (picture) => {
-    picture.lines?.forEach((line) => pushLine(line, dimensionLayer));
-    if (picture.arc) pushArc(picture.arc, dimensionLayer);
-    picture.arrows?.forEach((points) => pushSolid(points, dimensionLayer));
-    pushDimensionText(picture);
+  const pushDimensionPicture = (picture, ownerHandle = modelSpaceHandle) => {
+    picture.lines?.forEach((line) => pushLine(line, dimensionLayer, ownerHandle));
+    if (picture.arc) pushArc(picture.arc, dimensionLayer, ownerHandle);
+    picture.arrows?.forEach((points) => pushSolid(points, dimensionLayer, ownerHandle));
+    pushDimensionText(picture, ownerHandle);
   };
   const pushNativeDimension = (plan) => {
     push(
       0, 'DIMENSION',
+      5, nextDxfHandle(),
+      330, modelSpaceHandle,
       100, 'AcDbEntity',
       8, dimensionLayer,
+      410, 'Model',
+      370, -1,
       100, 'AcDbDimension',
       2, plan.blockName,
       10, x(plan.definitionPoint[0]), 20, y(plan.definitionPoint[1]), 30, 0,
@@ -754,61 +806,114 @@ export function serializeDxf(snapshot) {
       );
     }
   };
-
-  push(0, 'SECTION', 2, 'TABLES', 0, 'TABLE', 2, 'LTYPE', 70, hasDashedLayers ? 2 : 1);
-  push(0, 'LTYPE', 2, 'CONTINUOUS', 70, 0, 3, 'Solid line', 72, 65, 73, 0, 40, 0);
-  if (hasDashedLayers) {
-    push(
-      0, 'LTYPE', 2, 'DASHED', 70, 0, 3, 'Dashed line', 72, 65, 73, 2,
-      40, x(18), 49, x(12), 74, 0, 49, -x(6), 74, 0,
-    );
-  }
-  push(0, 'ENDTAB');
-  if (textStyles.length) {
-    push(0, 'TABLE', 2, 'STYLE', 70, textStyles.length);
-    textStyles.forEach((style) => push(
-      0, 'STYLE', 2, style.name, 70, 0,
-      40, 0, 41, 1, 50, 0, 71, 0, 42, x(2.5),
-      3, style.file, 4, '',
+  const symbolRecord = (subclass, values, handle = nextDxfHandle()) => ({ handle, subclass, values });
+  const pushSymbolTable = (name, records, tableSubclass = null) => {
+    const tableHandle = tableHandles.get(name);
+    push(0, 'TABLE', 2, name, 5, tableHandle, 330, 0, 100, 'AcDbSymbolTable', 70, records.length);
+    if (tableSubclass) push(100, tableSubclass);
+    records.forEach((record) => push(
+      0, name,
+      name === 'DIMSTYLE' ? 105 : 5, record.handle,
+      330, tableHandle,
+      100, 'AcDbSymbolTableRecord',
+      100, record.subclass,
+      ...record.values,
     ));
     push(0, 'ENDTAB');
-  }
-  push(0, 'TABLE', 2, 'LAYER', 70, layerNames.length);
-  layerNames.forEach((layer) => push(
-    0, 'LAYER', 2, layer, 70, 0,
+  };
+  const dimensionStyleValues = (name, postfix = '') => [
+    2, name, 70, 0,
+    3, postfix, 4, '<>%%d',
+    40, 1, 41, x(2.5), 42, x(1.25), 44, x(1.25),
+    140, x(3.5), 144, 1, 147, x(0.625),
+    77, 1, 78, 0, 79, 0, 179, 3, 271, 3, 275, 0, 277, 2,
+  ];
+  const viewportRecords = [symbolRecord('AcDbViewportTableRecord', [
+    2, '*ACTIVE', 70, 0,
+    10, 0, 20, 0, 11, 1, 21, 1,
+    12, 0, 22, 0, 13, 0, 23, 0,
+    14, 0.5, 24, 0.5, 15, 0.5, 25, 0.5,
+    16, 0, 26, 0, 36, 1, 17, 0, 27, 0, 37, 0,
+    40, 1000, 41, 1, 42, 50, 43, 0, 44, 0, 50, 0, 51, 0,
+    71, 0, 72, 1000, 73, 1, 74, 3, 75, 0, 76, 0, 77, 0, 78, 0,
+  ])];
+  const linetypeRecords = [
+    symbolRecord('AcDbLinetypeTableRecord', [2, 'BYBLOCK', 70, 0, 3, '', 72, 65, 73, 0, 40, 0]),
+    symbolRecord('AcDbLinetypeTableRecord', [2, 'BYLAYER', 70, 0, 3, '', 72, 65, 73, 0, 40, 0]),
+    symbolRecord('AcDbLinetypeTableRecord', [2, 'CONTINUOUS', 70, 0, 3, 'Solid line', 72, 65, 73, 0, 40, 0]),
+    ...(hasDashedLayers ? [symbolRecord('AcDbLinetypeTableRecord', [
+      2, 'DASHED', 70, 0, 3, 'Dashed line', 72, 65, 73, 2,
+      40, x(18), 49, x(12), 74, 0, 49, -x(6), 74, 0,
+    ])] : []),
+  ];
+  const layerRecords = layerNames.map((layer) => symbolRecord('AcDbLayerTableRecord', [
+    2, layer, 70, 0,
     62, layer === constructionLayer ? 1 : layer === dimensionLayer ? 5 : 7,
     6, [seamLayer, constructionLayer].includes(layer) ? 'DASHED' : 'CONTINUOUS',
-  ));
-  push(0, 'ENDTAB');
-  if (nativeDimensionPlans.length) {
-    push(
-      0, 'TABLE', 2, 'DIMSTYLE', 70, 1,
-      0, 'DIMSTYLE', 2, DXF_DIMENSION_STYLE, 70, 0,
-      3, dimensionPostfix, 4, '<>%%d',
-      40, 1, 41, x(2.5), 42, x(1.25), 44, x(1.25),
-      140, x(3.5), 144, 1, 147, x(0.625),
-      77, 1, 78, 0, 79, 0, 179, 3, 271, 3, 275, 0, 277, 2,
-      0, 'ENDTAB',
-      0, 'TABLE', 2, 'BLOCK_RECORD', 70, nativeDimensionPlans.length,
+    370, -3,
+    390, normalPlotStyleHandle,
+  ]));
+  const styleRecords = [
+    symbolRecord('AcDbTextStyleTableRecord', [
+      2, 'STANDARD', 70, 0, 40, 0, 41, 1, 50, 0, 71, 0, 42, x(2.5), 3, 'txt', 4, '',
+    ]),
+    ...textStyles.map((style) => symbolRecord('AcDbTextStyleTableRecord', [
+      2, style.name, 70, 0,
+      40, 0, 41, 1, 50, 0, 71, 0, 42, x(2.5),
+      3, style.file, 4, '',
+    ])),
+  ];
+  const dimensionStyleRecords = [
+    symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues('STANDARD')),
+    ...(nativeDimensionPlans.length ? [
+      symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues(DXF_DIMENSION_STYLE, dimensionPostfix)),
+    ] : []),
+  ];
+  const blockRecords = [...blockRecordHandles].map(([name, handle]) => {
+    const layoutHandle = name === modelSpaceBlockName
+      ? modelLayoutHandle
+      : name === paperSpaceBlockName ? paperLayoutHandle : null;
+    return symbolRecord(
+      'AcDbBlockTableRecord',
+      [2, name, ...(layoutHandle ? [340, layoutHandle] : [])],
+      handle,
     );
-    nativeDimensionPlans.forEach((plan) => push(
-      0, 'BLOCK_RECORD', 2, plan.blockName, 70, 0,
-    ));
-    push(0, 'ENDTAB');
-  }
+  });
+
+  push(0, 'SECTION', 2, 'TABLES');
+  pushSymbolTable('VPORT', viewportRecords);
+  pushSymbolTable('LTYPE', linetypeRecords);
+  pushSymbolTable('LAYER', layerRecords);
+  pushSymbolTable('STYLE', styleRecords);
+  pushSymbolTable('VIEW', []);
+  pushSymbolTable('UCS', []);
+  pushSymbolTable('APPID', [symbolRecord('AcDbRegAppTableRecord', [2, 'ACAD', 70, 0])]);
+  pushSymbolTable('DIMSTYLE', dimensionStyleRecords, 'AcDbDimStyleTable');
+  pushSymbolTable('BLOCK_RECORD', blockRecords);
   push(0, 'ENDSEC');
-  if (nativeDimensionPlans.length) {
-    push(0, 'SECTION', 2, 'BLOCKS');
-    nativeDimensionPlans.forEach((plan) => {
-      push(
-        0, 'BLOCK', 8, dimensionLayer, 2, plan.blockName, 70, 1,
-        10, 0, 20, 0, 30, 0, 3, plan.blockName, 1, '',
-      );
-      pushDimensionPicture(plan.picture);
-      push(0, 'ENDBLK', 8, dimensionLayer);
-    });
-    push(0, 'ENDSEC');
-  }
+  const pushBlock = (name, layer, flags, body = null) => {
+    const ownerHandle = blockRecordHandles.get(name);
+    push(
+      0, 'BLOCK', 5, nextDxfHandle(), 330, ownerHandle,
+      100, 'AcDbEntity', 8, layer, 100, 'AcDbBlockBegin',
+      2, name, 70, flags, 10, 0, 20, 0, 30, 0, 3, name, 1, '',
+    );
+    body?.(ownerHandle);
+    push(
+      0, 'ENDBLK', 5, nextDxfHandle(), 330, ownerHandle,
+      100, 'AcDbEntity', 8, layer, 100, 'AcDbBlockEnd',
+    );
+  };
+  push(0, 'SECTION', 2, 'BLOCKS');
+  pushBlock(modelSpaceBlockName, '0', 0);
+  pushBlock(paperSpaceBlockName, '0', 0);
+  nativeDimensionPlans.forEach((plan) => pushBlock(
+    plan.blockName,
+    dimensionLayer,
+    1,
+    (ownerHandle) => pushDimensionPicture(plan.picture, ownerHandle),
+  ));
+  push(0, 'ENDSEC');
   push(0, 'SECTION', 2, 'ENTITIES');
 
   geometry.forEach((entity) => {
@@ -816,7 +921,10 @@ export function serializeDxf(snapshot) {
       ? constructionLayer
       : isSeamLine(entity) ? seamLayer : '0';
     if (entity.type === 'line') pushLine(entity, layer);
-    if (entity.type === 'circle') push(0, 'CIRCLE', 8, layer, 10, x(entity.center[0]), 20, y(entity.center[1]), 40, x(entity.radius));
+    if (entity.type === 'circle') {
+      pushEntityHeader('CIRCLE', layer, modelSpaceHandle, 'AcDbCircle');
+      push(10, x(entity.center[0]), 20, y(entity.center[1]), 40, x(entity.radius));
+    }
     if (entity.type === 'arc') pushArc(entity, layer);
     if (entity.type === DXF_BOUNDARY_ENTITY_TYPE) pushBoundary(entity, layer);
     if (entity.type === 'text') {
@@ -824,7 +932,8 @@ export function serializeDxf(snapshot) {
       else pushMtext(entity);
     }
     if (['polyline', 'polygon', 'curve'].includes(entity.type)) {
-      push(0, 'LWPOLYLINE', 8, layer, 90, entity.points.length, 70, entity.type === 'polygon' ? 1 : 0);
+      pushEntityHeader('LWPOLYLINE', layer, modelSpaceHandle, 'AcDbPolyline');
+      push(90, entity.points.length, 70, entity.type === 'polygon' ? 1 : 0);
       entity.points.forEach((point) => push(10, x(point[0]), 20, y(point[1])));
     }
     if (entity.type === 'notch') {
@@ -839,7 +948,88 @@ export function serializeDxf(snapshot) {
     if (plan.kind === 'dimension') pushNativeDimension(plan);
     else pushDimensionPicture(plan.picture);
   });
+  push(0, 'ENDSEC');
+
+  const pushDictionary = (handle, ownerHandle, entries = []) => {
+    push(0, 'DICTIONARY', 5, handle, 330, ownerHandle, 100, 'AcDbDictionary', 281, 1);
+    entries.forEach(([name, entryHandle]) => push(3, name, 350, entryHandle));
+  };
+  const pushLayout = (handle, name, tabOrder, blockRecordHandle, model = false) => {
+    push(
+      0, 'LAYOUT',
+      5, handle,
+      330, layoutDictionaryHandle,
+      100, 'AcDbPlotSettings',
+      1, '',
+      2, model ? 'none_device' : 'None',
+      4, '',
+      6, '',
+      40, 0, 41, 0, 42, 0, 43, 0,
+      44, 0, 45, 0, 46, 0, 47, 0, 48, 0, 49, 0,
+      140, 0, 141, 0, 142, 1, 143, 1,
+      70, model ? 11952 : 688,
+      72, 0, 73, model ? 1 : 0, 74, model ? 0 : 5,
+      7, '', 75, model ? 0 : 16,
+      147, 1, 148, 0, 149, 0,
+      100, 'AcDbLayout',
+      1, name,
+      70, 1,
+      71, tabOrder,
+      10, 0, 20, 0,
+      11, 12, 21, 9,
+      12, 0, 22, 0, 32, 0,
+      14, 0, 24, 0, 34, 0,
+      15, 0, 25, 0, 35, 0,
+      146, 0,
+      13, 0, 23, 0, 33, 0,
+      16, 1, 26, 0, 36, 0,
+      17, 0, 27, 1, 37, 0,
+      76, 0,
+      330, blockRecordHandle,
+    );
+  };
+
+  push(0, 'SECTION', 2, 'OBJECTS');
+  pushDictionary(namedObjectDictionaryHandle, 0, [
+    ['ACAD_GROUP', groupDictionaryHandle],
+    ['ACAD_LAYOUT', layoutDictionaryHandle],
+    ['ACAD_MLINESTYLE', mlineStyleDictionaryHandle],
+    ['ACAD_PLOTSETTINGS', plotSettingsDictionaryHandle],
+    ['ACAD_PLOTSTYLENAME', plotStyleDictionaryHandle],
+  ]);
+  pushDictionary(groupDictionaryHandle, namedObjectDictionaryHandle);
+  pushDictionary(layoutDictionaryHandle, namedObjectDictionaryHandle, [
+    ['Layout1', paperLayoutHandle],
+    ['Model', modelLayoutHandle],
+  ]);
+  pushDictionary(mlineStyleDictionaryHandle, namedObjectDictionaryHandle, [
+    ['Standard', standardMlineStyleHandle],
+  ]);
+  push(
+    0, 'MLINESTYLE',
+    5, standardMlineStyleHandle,
+    330, mlineStyleDictionaryHandle,
+    100, 'AcDbMlineStyle',
+    2, 'STANDARD', 70, 0, 3, '', 62, 256, 51, 90, 52, 90, 71, 2,
+    49, 0.5, 62, 256, 6, 'BYLAYER',
+    49, -0.5, 62, 256, 6, 'BYLAYER',
+  );
+  pushDictionary(plotSettingsDictionaryHandle, namedObjectDictionaryHandle);
+  push(
+    0, 'ACDBDICTIONARYWDFLT',
+    5, plotStyleDictionaryHandle,
+    330, namedObjectDictionaryHandle,
+    100, 'AcDbDictionary',
+    281, 1,
+    3, 'Normal', 350, normalPlotStyleHandle,
+    100, 'AcDbDictionaryWithDefault',
+    340, normalPlotStyleHandle,
+  );
+  push(0, 'ACDBPLACEHOLDER', 5, normalPlotStyleHandle, 330, plotStyleDictionaryHandle);
+  pushLayout(modelLayoutHandle, 'Model', 0, modelSpaceHandle, true);
+  pushLayout(paperLayoutHandle, 'Layout1', 1, paperSpaceHandle);
   push(0, 'ENDSEC', 0, 'EOF');
+  lines[lines.indexOf(handseedPlaceholder)] = nextDxfHandleValue.toString(16).toUpperCase();
   return lines.join('\n');
 }
 

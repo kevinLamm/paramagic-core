@@ -1,3 +1,6 @@
+import { replaceDrawingTextForeignObjects } from './TextTools.js';
+import { prepareNotchValueOnlyPresentationClone } from './NotchSystem.js';
+
 export const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 
 const TRANSIENT_CLASSES = [
@@ -65,6 +68,8 @@ export function isCanvasPresentationSourceNode(node, stackId = null) {
 
 export function sanitizeCanvasPresentationClone(source) {
   const cloneNode = source.cloneNode(true);
+  replaceDrawingTextForeignObjects(source, cloneNode);
+  prepareNotchValueOnlyPresentationClone(cloneNode);
   cloneNode.querySelectorAll?.(EDITING_UI_SELECTOR).forEach((node) => node.remove());
   cloneNode.querySelectorAll?.('.array-item-content, .linked-copy-content, .symmetric-mirror-copy').forEach((node) => {
     if (node.querySelector?.('.construction')) node.remove();
@@ -148,11 +153,53 @@ export function fitCanvasPresentationSvg(svg, { width, height } = {}) {
   return viewport;
 }
 
-function clonePresentationDefinitions(objectLayer, svg) {
+function svgElementTree(root) {
+  return root ? [root, ...(root.querySelectorAll?.('*') || [])] : [];
+}
+
+function svgReferenceIds(root) {
+  const ids = new Set();
+  svgElementTree(root).forEach((node) => {
+    [...(node.attributes || [])].forEach((attribute) => {
+      const name = String(attribute.localName || attribute.name || '').toLowerCase();
+      const value = String(attribute.value || '').trim();
+      for (const match of value.matchAll(/url\(\s*['"]?#([^\s)'"]+)['"]?\s*\)/gi)) ids.add(match[1]);
+      if ((name === 'href' || name.endsWith(':href')) && value.startsWith('#')) ids.add(value.slice(1));
+    });
+  });
+  return ids;
+}
+
+export function canvasPresentationDefinitionRoots(objectLayer, content) {
   const ownerSvg = objectLayer?.ownerSVGElement;
-  [...(ownerSvg?.children || [])]
-    .filter((node) => String(node.tagName || '').toLowerCase() === 'defs')
-    .forEach((node) => svg.appendChild(node.cloneNode(true)));
+  const definitions = [...(ownerSvg?.children || [])]
+    .filter((node) => String(node.tagName || '').toLowerCase() === 'defs');
+  const roots = definitions.flatMap((node) => [...(node.children || [])]);
+  const rootById = new Map();
+  roots.forEach((root) => {
+    svgElementTree(root).forEach((node) => {
+      const id = node.getAttribute?.('id');
+      if (id && !rootById.has(id)) rootById.set(id, root);
+    });
+  });
+
+  const pendingIds = [...svgReferenceIds(content)];
+  const selectedRoots = new Set();
+  for (let index = 0; index < pendingIds.length; index += 1) {
+    const root = rootById.get(pendingIds[index]);
+    if (!root || selectedRoots.has(root)) continue;
+    selectedRoots.add(root);
+    svgReferenceIds(root).forEach((id) => pendingIds.push(id));
+  }
+  return roots.filter((root) => selectedRoots.has(root));
+}
+
+function clonePresentationDefinitions(objectLayer, content, svg, documentRef) {
+  const roots = canvasPresentationDefinitionRoots(objectLayer, content);
+  if (!roots.length) return;
+  const definitions = createSvg(documentRef, 'defs');
+  roots.forEach((node) => definitions.appendChild(node.cloneNode(true)));
+  svg.appendChild(definitions);
 }
 
 export function createCanvasPresentationSvg({
@@ -171,13 +218,6 @@ export function createCanvasPresentationSvg({
     preserveAspectRatio: 'xMidYMid meet',
     'data-canvas-presentation': 'true',
   });
-  clonePresentationDefinitions(objectLayer, svg);
-  if (background !== null && background !== 'none' && background !== 'transparent') {
-    svg.appendChild(createSvg(documentRef, 'rect', {
-      fill: background,
-      'data-canvas-presentation-background': 'true',
-    }));
-  }
   const content = createSvg(documentRef, 'g', {
     'data-canvas-presentation-content': 'true',
     'aria-hidden': 'true',
@@ -185,6 +225,13 @@ export function createCanvasPresentationSvg({
   [...objectLayer.children]
     .filter((node) => isCanvasPresentationSourceNode(node, stackId))
     .forEach((node) => content.appendChild(sanitizeCanvasPresentationClone(node)));
+  clonePresentationDefinitions(objectLayer, content, svg, documentRef);
+  if (background !== null && background !== 'none' && background !== 'transparent') {
+    svg.appendChild(createSvg(documentRef, 'rect', {
+      fill: background,
+      'data-canvas-presentation-background': 'true',
+    }));
+  }
   svg.appendChild(content);
   return svg;
 }

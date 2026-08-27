@@ -6,6 +6,7 @@ import {
   transformDxfBoundary,
 } from './DxfExportGeometry.js';
 import { normalizeDrawingData, resolveDrawingScene } from './DrawingIO.js';
+import { isSymmetricCenterline } from './SymmetricTool.js';
 
 export const DXF_EXPORT_SOLVE_TOLERANCE = 1e-8;
 
@@ -204,9 +205,15 @@ function resolvedSnapshot(snapshotInput, {
     evaluateLength,
     evaluateExpression,
   });
+  const exportScene = {
+    ...scene,
+    entities: scene.entities.filter((entity) => (
+      entity.construction !== true && !isSymmetricCenterline(entity)
+    )),
+  };
   return {
     ...drawing,
-    entities: resolvedSceneDxfGeometry(scene, { curveTolerance }),
+    entities: resolvedSceneDxfGeometry(exportScene, { curveTolerance }),
     dimensionAnnotations: scene.dimensionAnnotations,
   };
 }

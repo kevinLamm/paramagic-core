@@ -4,12 +4,11 @@ import {
 } from './CanvasPresentation.js';
 import { embedSvgImageAssets } from './ImageSystem.js';
 
-export const MAXIMUM_PNG_EXPORT_BYTES = 1024 * 1024;
 export const PNG_EXPORT_PADDING_PIXELS = 20;
 export const PNG_EXPORT_FORMATS = Object.freeze([
-  Object.freeze({ ratio: '1:1', width: 1024, height: 1024, unitWidth: 1, unitHeight: 1 }),
-  Object.freeze({ ratio: '16:9', width: 1360, height: 765, unitWidth: 16, unitHeight: 9 }),
-  Object.freeze({ ratio: '9:16', width: 765, height: 1360, unitWidth: 9, unitHeight: 16 }),
+  Object.freeze({ ratio: '1:1', width: 2048, height: 2048, unitWidth: 1, unitHeight: 1 }),
+  Object.freeze({ ratio: '16:9', width: 2720, height: 1530, unitWidth: 16, unitHeight: 9 }),
+  Object.freeze({ ratio: '9:16', width: 1530, height: 2720, unitWidth: 9, unitHeight: 16 }),
 ]);
 
 const PNG_PRESENTATION_STYLE_PROPERTIES = Object.freeze([
@@ -76,6 +75,24 @@ const PNG_COMPUTED_STYLE_SELECTOR = [
   ...PNG_DERIVED_DRAWABLE_SELECTOR,
 ].join(',');
 
+const PNG_RASTER_SOURCE_ELEMENT_PATTERN = /<(?:image|feImage)\b[^<>]*(?:\/>|>\s*<\/(?:image|feImage)>)/gi;
+const PNG_HREF_ATTRIBUTE_PATTERN = /\s+(?:[A-Za-z_][\w.-]*:)?href="([^"]*)"/g;
+
+export function assertPngRasterSourcesEmbedded(markup) {
+  const serialized = String(markup ?? '');
+  if (/<foreignObject\b/i.test(serialized)) {
+    throw new Error('PNG export cannot rasterize HTML controls; drawing text must use native SVG text.');
+  }
+  for (const element of serialized.matchAll(PNG_RASTER_SOURCE_ELEMENT_PATTERN)) {
+    for (const href of element[0].matchAll(PNG_HREF_ATTRIBUTE_PATTERN)) {
+      const source = String(href[1] || '').trim();
+      if (!source || source.startsWith('#') || /^data:image\//i.test(source)) continue;
+      throw new Error(`PNG export could not embed an image source: ${source}`);
+    }
+  }
+  return serialized;
+}
+
 function positiveBounds(bounds) {
   const x = Number(bounds?.x);
   const y = Number(bounds?.y);
@@ -118,6 +135,16 @@ export function inlinePngPresentationStyles(svg, getStyle = (node) => (
     });
   });
   return svg;
+}
+
+export async function preparePngRasterMarkup(svg, {
+  embedImageAssets = embedSvgImageAssets,
+  inlinePresentationStyles = inlinePngPresentationStyles,
+  serializePresentationElement = serializeCanvasPresentationElement,
+} = {}) {
+  inlinePresentationStyles(svg);
+  const markup = await embedImageAssets(serializePresentationElement(svg));
+  return assertPngRasterSourcesEmbedded(markup);
 }
 
 export function pngExportFormatForBounds(bounds) {
@@ -216,6 +243,13 @@ function applyPngViewport(svg, bounds, width, height, paddingPixels) {
   return viewport;
 }
 
+function waitForPngPresentationLayout(documentRef) {
+  const requestFrame = documentRef?.defaultView?.requestAnimationFrame?.bind(documentRef.defaultView)
+    || globalThis.requestAnimationFrame?.bind(globalThis);
+  if (typeof requestFrame !== 'function') return Promise.resolve();
+  return new Promise((resolve) => requestFrame(() => resolve()));
+}
+
 async function svgMarkupImage(markup, {
   ImageImpl = globalThis.Image,
   URLImpl = globalThis.URL,
@@ -239,25 +273,32 @@ async function svgMarkupImage(markup, {
   }
 }
 
-async function rasterizePresentationSvg(svg, width, height, {
+export async function rasterizePresentationSvg(svg, width, height, {
   createCanvas = () => globalThis.document?.createElement('canvas'),
   embedImageAssets = embedSvgImageAssets,
   inlinePresentationStyles = inlinePngPresentationStyles,
+  prepareRasterMarkup = preparePngRasterMarkup,
   serializePresentationElement = serializeCanvasPresentationElement,
   loadSvgImage = svgMarkupImage,
 } = {}) {
-  inlinePresentationStyles(svg);
-  const markup = await embedImageAssets(serializePresentationElement(svg));
+  const markup = await prepareRasterMarkup(svg, {
+    embedImageAssets,
+    inlinePresentationStyles,
+    serializePresentationElement,
+  });
   const loaded = await loadSvgImage(markup);
   const canvas = createCanvas();
-  const context = canvas?.getContext?.('2d');
-  if (!canvas || !context) {
+  if (!canvas) {
     loaded.release?.();
     throw new Error('This browser cannot rasterize PNG exports.');
   }
   try {
     canvas.width = width;
     canvas.height = height;
+    const context = canvas.getContext?.('2d');
+    if (!context) {
+      throw new Error('This browser cannot rasterize PNG exports.');
+    }
     context.fillStyle = '#ffffff';
     context.fillRect(0, 0, width, height);
     context.drawImage(loaded.image, 0, 0, width, height);
@@ -267,25 +308,19 @@ async function rasterizePresentationSvg(svg, width, height, {
   }
 }
 
-export async function encodePngWithinLimit(format, render, maximumBytes = MAXIMUM_PNG_EXPORT_BYTES) {
+export async function encodePngAtCaptureSize(format, render) {
   if (!format || typeof render !== 'function') throw new Error('PNG export format and renderer are required.');
-  const byteLimit = Math.max(1, Math.floor(Number(maximumBytes) || 0));
-  let multiplier = Math.floor(Math.min(format.width / format.unitWidth, format.height / format.unitHeight));
-  while (multiplier >= 1) {
-    const width = format.unitWidth * multiplier;
-    const height = format.unitHeight * multiplier;
-    const blob = await render(width, height);
-    if (!(blob instanceof Blob)) throw new Error('PNG export did not produce image data.');
-    if (blob.size <= byteLimit) return { blob, width, height, ratio: format.ratio };
-    const scale = Math.min(0.9, Math.sqrt(byteLimit / Math.max(1, blob.size)) * 0.95);
-    multiplier = Math.min(multiplier - 1, Math.floor(multiplier * scale));
-  }
-  throw new Error(`The PNG export could not be reduced to ${byteLimit} bytes.`);
+  const width = Math.max(1, Math.floor(Number(format.width) || 0));
+  const height = Math.max(1, Math.floor(Number(format.height) || 0));
+  const blob = await render(width, height);
+  if (!(blob instanceof Blob)) throw new Error('PNG export did not produce image data.');
+  return { blob, width, height, ratio: format.ratio };
 }
 
 export async function createCanvasPresentationPng(objectLayer, options = {}, {
   createPresentationSvg = createCanvasPresentationSvg,
   rasterizePresentation = rasterizePresentationSvg,
+  waitForPresentationLayout = waitForPngPresentationLayout,
 } = {}) {
   const documentRef = options.documentRef || globalThis.document;
   if (!objectLayer || !documentRef?.body) throw new Error('The canvas presentation is unavailable for PNG export.');
@@ -293,25 +328,32 @@ export async function createCanvasPresentationPng(objectLayer, options = {}, {
   host.style.position = 'fixed';
   host.style.left = '-100000px';
   host.style.top = '0';
-  host.style.visibility = 'hidden';
+  host.style.opacity = '0';
   host.style.pointerEvents = 'none';
   documentRef.body.appendChild(host);
   try {
-    const svg = createPresentationSvg({
-      objectLayer,
-      stackId: options.stackId || null,
-      width: 1024,
-      height: 1024,
-      background: '#ffffff',
-      documentRef,
-    });
-    if (!svg) throw new Error('The canvas presentation is unavailable for PNG export.');
-    host.replaceChildren(svg);
-    const content = svg.querySelector('[data-canvas-presentation-content]');
-    if (!content) throw new Error('The canvas presentation is unavailable for PNG export.');
-    const initialBounds = measuredContentBounds(content);
+    const mountedPresentation = () => {
+      const svg = createPresentationSvg({
+        objectLayer,
+        stackId: options.stackId || null,
+        width: 1024,
+        height: 1024,
+        background: '#ffffff',
+        documentRef,
+      });
+      if (!svg) throw new Error('The canvas presentation is unavailable for PNG export.');
+      host.replaceChildren(svg);
+      const content = svg.querySelector('[data-canvas-presentation-content]');
+      if (!content) throw new Error('The canvas presentation is unavailable for PNG export.');
+      return { svg, content };
+    };
+    const initialPresentation = mountedPresentation();
+    await waitForPresentationLayout(documentRef);
+    const initialBounds = measuredContentBounds(initialPresentation.content);
     const format = pngExportFormatForBounds(initialBounds);
-    return encodePngWithinLimit(format, async (width, height) => {
+    return await encodePngAtCaptureSize(format, async (width, height) => {
+      const { svg, content } = mountedPresentation();
+      await waitForPresentationLayout(documentRef);
       let bounds = measuredContentBounds(content);
       applyPngViewport(svg, bounds, width, height, options.paddingPixels ?? PNG_EXPORT_PADDING_PIXELS);
       if (content.querySelector('.dimension-text')) {
@@ -319,7 +361,7 @@ export async function createCanvasPresentationPng(objectLayer, options = {}, {
         applyPngViewport(svg, bounds, width, height, options.paddingPixels ?? PNG_EXPORT_PADDING_PIXELS);
       }
       return rasterizePresentation(svg, width, height);
-    }, options.maximumBytes ?? MAXIMUM_PNG_EXPORT_BYTES);
+    });
   } finally {
     host.remove();
   }
