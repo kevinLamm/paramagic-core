@@ -48,7 +48,7 @@ export async function exportTextFileWithPicker({
   download,
   extension,
   mimeType,
-  pickerId,
+  pickerKey,
   showSaveFilePicker = globalThis.showSaveFilePicker?.bind(globalThis),
   suggestedName,
 } = {}) {
@@ -67,7 +67,7 @@ export async function exportTextFileWithPicker({
   let handle;
   try {
     handle = await showSaveFilePicker({
-      id: pickerId || `paramagic-export-${suffix.slice(1)}`,
+      id: pickerKey || `paramagic-export-${suffix.slice(1)}`,
       suggestedName: fileName,
       types: [{
         description: description || `${suffix.slice(1).toUpperCase()} File`,
@@ -91,6 +91,106 @@ export async function exportTextFileWithPicker({
     throw error;
   }
   return { status: 'saved', method: 'file-system', name: handle.name || fileName, handle };
+}
+
+function normalizeSaveFormat(format) {
+  const extension = String(format?.extension || '').trim();
+  return {
+    key: String(format?.key || '').trim().toLowerCase(),
+    description: String(format?.description || '').trim(),
+    extension: extension.startsWith('.') ? extension.toLowerCase() : `.${extension.toLowerCase()}`,
+    mimeType: String(format?.mimeType || 'application/octet-stream').trim(),
+  };
+}
+
+function normalizedSaveFormats(formats = []) {
+  const normalized = formats.map(normalizeSaveFormat)
+    .filter(({ key, extension }) => key && extension !== '.');
+  if (!normalized.length) throw new Error('At least one Save As format is required.');
+  return normalized;
+}
+
+export function saveFormatForFileName(fileName, formats, defaultFormat) {
+  const normalized = normalizedSaveFormats(formats);
+  const lowerName = String(fileName || '').trim().toLowerCase();
+  return normalized.find(({ extension }) => lowerName.endsWith(extension))
+    || normalized.find(({ key }) => key === String(defaultFormat || '').toLowerCase())
+    || normalized[0];
+}
+
+function saveAsFileName(baseName, format, formats) {
+  const extensions = formats.map(({ extension }) => extension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const withoutKnownExtension = String(baseName || '').trim()
+    .replace(new RegExp(`(?:${extensions.join('|')})$`, 'i'), '')
+    .trim();
+  return `${withoutKnownExtension || 'Untitled Drawing'}${format.extension}`;
+}
+
+export async function saveFileAsWithPicker({
+  formats,
+  defaultFormat,
+  suggestedBaseName = 'Untitled Drawing',
+  pickerKey = 'paramagic-save-as',
+  showSaveFilePicker = globalThis.showSaveFilePicker?.bind(globalThis),
+  chooseFallbackTarget,
+  createContent,
+  download,
+} = {}) {
+  if (typeof createContent !== 'function' || typeof download !== 'function') {
+    throw new Error('Save As content and download callbacks are required.');
+  }
+  const normalized = normalizedSaveFormats(formats);
+  const initialFormat = saveFormatForFileName('', normalized, defaultFormat);
+  const suggestedName = saveAsFileName(suggestedBaseName, initialFormat, normalized);
+
+  const downloadFallback = async (target = null) => {
+    const chosen = target || (typeof chooseFallbackTarget === 'function'
+      ? await chooseFallbackTarget({
+        suggestedBaseName,
+        defaultFormat: initialFormat.key,
+        formats: normalized.map((format) => ({ ...format })),
+      })
+      : { name: suggestedBaseName, format: initialFormat.key });
+    if (!chosen) return { status: 'cancelled' };
+    const format = normalized.find(({ key }) => key === String(chosen.format || '').toLowerCase()) || initialFormat;
+    const name = saveAsFileName(chosen.name || suggestedBaseName, format, normalized);
+    const content = await createContent(format.key, name);
+    download(content, name, format.mimeType);
+    return { status: 'saved', method: 'download', name, handle: null, format: format.key };
+  };
+
+  if (typeof showSaveFilePicker !== 'function') return downloadFallback();
+
+  let handle;
+  try {
+    handle = await showSaveFilePicker({
+      id: pickerKey,
+      suggestedName,
+      excludeAcceptAllOption: true,
+      types: normalized.map((format) => ({
+        description: format.description || `${format.key.toUpperCase()} File`,
+        accept: { [format.mimeType]: [format.extension] },
+      })),
+    });
+  } catch (error) {
+    if (isFileSystemAccessCancellation(error)) return { status: 'cancelled' };
+    if (isFileSystemAccessBlocked(error)) return downloadFallback();
+    throw error;
+  }
+
+  const format = saveFormatForFileName(handle?.name, normalized, initialFormat.id);
+  const name = handle?.name || saveAsFileName(suggestedBaseName, format, normalized);
+  const content = await createContent(format.key, name);
+  try {
+    await writeTextToFileHandle(handle, content);
+  } catch (error) {
+    if (isFileSystemAccessBlocked(error)) {
+      download(content, name, format.mimeType);
+      return { status: 'saved', method: 'download', name, handle: null, format: format.key };
+    }
+    throw error;
+  }
+  return { status: 'saved', method: 'file-system', name, handle, format: format.key };
 }
 
 export function createDrawingFileController({

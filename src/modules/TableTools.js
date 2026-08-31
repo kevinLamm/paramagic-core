@@ -1,5 +1,10 @@
-import { normalizeTextVerticalAlign, resolveTextFields } from './TextTools.js';
+import {
+  deferTextEditUntilPlacementClick,
+  normalizeTextVerticalAlign,
+  resolveTextFields,
+} from './TextTools.js';
 import { PARAMAGIC_CLIPBOARD_FORMAT, PARAMAGIC_CLIPBOARD_VERSION } from './DrawingClipboard.js';
+import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const XHTML_NS = 'http://www.w3.org/1999/xhtml';
@@ -34,20 +39,19 @@ const DEFAULT_APPEARANCE = Object.freeze({
 // solver's rect adapter is a four-point polygon. Keep table feature indices
 // aligned with those four solver points.
 const TABLE_CORNER_SOLVER_INDICES = [0, 1, 2, 3];
-
-let tableSerial = 0;
+const TABLE_TOOLBAR_WIDTH = 200;
 
 const TABLE_TOOL_ICONS = {
   'Insert Row Below': '<rect x="4" y="5" width="16" height="10"/><path d="M4 10h16M12 17v5M9 20h6"/>',
+  'Delete Selected Rows': '<rect x="4" y="5" width="16" height="10"/><path d="M4 10h16M8 20h8"/>',
   'Insert Column After': '<rect x="4" y="5" width="10" height="14"/><path d="M9 5v14M17 12h5M20 9v6"/>',
+  'Delete Selected Columns': '<rect x="4" y="5" width="10" height="14"/><path d="M9 5v14M16 12h6"/>',
   Merge: '<path d="M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5zM14 14h5v5h-5z"/><path d="M10 12h4M12 10v4"/>',
   Unmerge: '<path d="M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5zM14 14h5v5h-5z"/><path d="M10 12h4M12 10v4M12 12l4 4"/>',
 };
 
 function tableId() {
-  if (globalThis.crypto?.randomUUID) return `table-${globalThis.crypto.randomUUID()}`;
-  tableSerial += 1;
-  return `table-${Date.now().toString(36)}-${tableSerial}`;
+  return createUuid();
 }
 
 function finite(value, fallback) {
@@ -99,7 +103,7 @@ export function normalizeTableEntity(input = {}) {
   return {
     id: input.id || tableId(),
     type: 'table',
-    stackId: String(input.stackId || 'stack-default'),
+    stackId: input.stackId ? String(input.stackId) : null,
     x: finite(input.x, 0),
     y: finite(input.y, 0),
     columns,
@@ -242,6 +246,23 @@ export function deleteTableRows(entity, rowIndices = []) {
   return normalizeTableEntity(unmerged);
 }
 
+export function deleteTableColumns(entity, columnIndices = []) {
+  const table = normalizeTableEntity(entity);
+  const columnsToDelete = [...new Set(columnIndices.map(Number))]
+    .filter((columnIndex) => Number.isInteger(columnIndex)
+      && columnIndex >= 0
+      && columnIndex < table.columns.length)
+    .sort((a, b) => a - b);
+  if (!columnsToDelete.length || columnsToDelete.length >= table.columns.length) return table;
+  const unmerged = unmergeTableCells(table, table.cells.flatMap((row, rowIndex) => (
+    row.map((_, columnIndex) => ({ row: rowIndex, column: columnIndex }))
+  )));
+  const deleted = new Set(columnsToDelete);
+  unmerged.columns = unmerged.columns.filter((_, columnIndex) => !deleted.has(columnIndex));
+  unmerged.cells = unmerged.cells.map((row) => row.filter((_, columnIndex) => !deleted.has(columnIndex)));
+  return normalizeTableEntity(unmerged);
+}
+
 export function mergeTableCells(entity, cells = []) {
   const table = normalizeTableEntity(entity);
   const points = cells
@@ -318,6 +339,10 @@ function bindHoverState(node) {
   return node;
 }
 
+export function deferTableEditUntilPlacementClick(options = {}) {
+  return deferTextEditUntilPlacementClick(options);
+}
+
 export function tableCellTextSvgLayout(rect = {}, cell = {}) {
   const textAlign = ['left', 'center', 'right'].includes(cell.textAlign) ? cell.textAlign : 'left';
   const textVerticalAlign = normalizeTextVerticalAlign(cell.textVerticalAlign);
@@ -334,6 +359,243 @@ export function tableCellTextSvgLayout(rect = {}, cell = {}) {
     textAnchor: textAlign === 'center' ? 'middle' : textAlign === 'right' ? 'end' : 'start',
     dominantBaseline: textVerticalAlign === 'middle' ? 'middle' : textVerticalAlign === 'bottom' ? 'alphabetic' : 'hanging',
   };
+}
+
+function tableStyleValue(editor, computed, property, fallback = '') {
+  return computed?.getPropertyValue?.(property)
+    || editor?.style?.getPropertyValue?.(property)
+    || editor?.style?.[property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase())]
+    || fallback;
+}
+
+function tableCssNumber(value, fallback = 0) {
+  const number = Number.parseFloat(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+export function tableCellPresentationModel(foreignObject, editor, getStyle = null) {
+  const computed = typeof getStyle === 'function' ? getStyle(editor) : null;
+  const styleValue = (property, fallback = '') => tableStyleValue(editor, computed, property, fallback);
+  const x = finite(foreignObject?.getAttribute?.('x'), 0);
+  const y = finite(foreignObject?.getAttribute?.('y'), 0);
+  const width = Math.max(1, finite(foreignObject?.getAttribute?.('width'), 1));
+  const height = Math.max(1, finite(foreignObject?.getAttribute?.('height'), 1));
+  const fontSize = Math.max(1, tableCssNumber(styleValue('font-size'), DEFAULT_CELL.fontSize));
+  const lineHeight = Math.max(fontSize, tableCssNumber(styleValue('line-height'), fontSize * 1.15));
+  const paddingLeft = Math.max(0, tableCssNumber(styleValue('padding-left'), 3));
+  const paddingRight = Math.max(0, tableCssNumber(styleValue('padding-right'), 3));
+  const paddingTop = Math.max(0, tableCssNumber(styleValue('padding-top'), 2));
+  const textAlign = ['left', 'center', 'right'].includes(styleValue('text-align'))
+    ? styleValue('text-align')
+    : 'left';
+  return {
+    x,
+    y,
+    width,
+    height,
+    contentX: textAlign === 'center'
+      ? width / 2
+      : textAlign === 'right' ? width - paddingRight : paddingLeft,
+    contentY: paddingTop,
+    lineHeight,
+    lines: String(editor?.value ?? editor?.textContent ?? '').split(/\r\n?|\n/),
+    fill: styleValue('color', DEFAULT_CELL.fontColor),
+    fontFamily: styleValue('font-family', DEFAULT_CELL.fontName),
+    fontSize,
+    fontStyle: styleValue('font-style', 'normal'),
+    fontWeight: styleValue('font-weight', '400'),
+    textAnchor: textAlign === 'center' ? 'middle' : textAlign === 'right' ? 'end' : 'start',
+  };
+}
+
+export function replaceTableCellForeignObjects(source, clone) {
+  if (!source?.querySelectorAll || !clone?.querySelectorAll) return clone;
+  clone.classList?.remove?.('table-overall-selected');
+  clone.querySelectorAll?.([
+    '.table-column-selector',
+    '.table-row-selector',
+    '.table-drag-border-visual',
+  ].join(',')).forEach((node) => node.remove());
+  const sourceBoxes = [...source.querySelectorAll('.table-cell-editor-host')];
+  const cloneBoxes = [...clone.querySelectorAll('.table-cell-editor-host')];
+  cloneBoxes.forEach((cloneBox, index) => {
+    const sourceBox = sourceBoxes[index] || cloneBox;
+    const editor = sourceBox.querySelector?.('.table-cell-editor')
+      || cloneBox.querySelector?.('.table-cell-editor');
+    const documentRef = cloneBox.ownerDocument || clone.ownerDocument;
+    if (!editor || !documentRef?.createElementNS) {
+      cloneBox.remove?.();
+      return;
+    }
+    const model = tableCellPresentationModel(
+      sourceBox,
+      editor,
+      (node) => node.ownerDocument?.defaultView?.getComputedStyle?.(node),
+    );
+    const presentation = documentRef.createElementNS(SVG_NS, 'svg');
+    presentation.setAttribute('class', 'table-cell-text-presentation');
+    presentation.setAttribute('x', model.x);
+    presentation.setAttribute('y', model.y);
+    presentation.setAttribute('width', model.width);
+    presentation.setAttribute('height', model.height);
+    presentation.setAttribute('overflow', 'hidden');
+    const text = documentRef.createElementNS(SVG_NS, 'text');
+    text.setAttribute('fill', model.fill);
+    text.setAttribute('font-family', model.fontFamily);
+    text.setAttribute('font-size', model.fontSize);
+    text.setAttribute('font-style', model.fontStyle);
+    text.setAttribute('font-weight', model.fontWeight);
+    text.setAttribute('text-anchor', model.textAnchor);
+    text.setAttribute('dominant-baseline', 'text-before-edge');
+    text.setAttribute('xml:space', 'preserve');
+    model.lines.forEach((line, lineIndex) => {
+      const span = documentRef.createElementNS(SVG_NS, 'tspan');
+      span.setAttribute('x', model.contentX);
+      span.setAttribute('y', model.contentY + lineIndex * model.lineHeight);
+      span.textContent = line;
+      text.appendChild(span);
+    });
+    presentation.appendChild(text);
+    cloneBox.replaceWith(presentation);
+  });
+  return clone;
+}
+
+function mergeTableLineIntervals(intervals) {
+  const merged = [];
+  [...intervals]
+    .sort((first, second) => first.start - second.start || first.end - second.end)
+    .forEach((interval) => {
+      const previous = merged.at(-1);
+      if (previous && interval.start <= previous.end + 1e-9) {
+        previous.end = Math.max(previous.end, interval.end);
+      } else {
+        merged.push({ ...interval });
+      }
+    });
+  return merged;
+}
+
+export function tableDxfEntities(input = {}) {
+  const table = normalizeTableEntity(input);
+  const horizontal = new Map();
+  const vertical = new Map();
+  const textEntities = [];
+  const addInterval = (collection, coordinate, start, end) => {
+    const key = Number(coordinate).toFixed(9);
+    if (!collection.has(key)) collection.set(key, { coordinate: Number(coordinate), intervals: [] });
+    collection.get(key).intervals.push({ start: Math.min(start, end), end: Math.max(start, end) });
+  };
+  tableCellRects(table).forEach((rect) => {
+    const cell = rect.cell;
+    if (cell.strokeOpacity > 0 && cell.strokeThickness > 0) {
+      addInterval(horizontal, rect.y, rect.x, rect.x + rect.width);
+      addInterval(horizontal, rect.y + rect.height, rect.x, rect.x + rect.width);
+      addInterval(vertical, rect.x, rect.y, rect.y + rect.height);
+      addInterval(vertical, rect.x + rect.width, rect.y, rect.y + rect.height);
+    }
+    if (!String(cell.text ?? '')) return;
+    const value = cell.multiline
+      ? String(cell.text)
+      : String(cell.text).replace(/\s*\r?\n+\s*/g, ' ');
+    const lines = value.split(/\r\n?|\n/);
+    const textHeight = cell.fontSize * 25.4 / 96;
+    const contentHeight = Math.max(textHeight, lines.length * textHeight * 1.25);
+    const layout = tableCellTextSvgLayout(rect, cell);
+    const textY = cell.textVerticalAlign === 'middle'
+      ? rect.y + (rect.height - contentHeight) / 2
+      : cell.textVerticalAlign === 'bottom'
+        ? rect.y + rect.height - 3 - contentHeight
+        : rect.y + 4;
+    textEntities.push({
+      id: deriveUuidForKey('table-cell-text', table.id, rect.row, rect.column),
+      type: 'text',
+      stackId: table.stackId,
+      x: layout.x,
+      y: textY,
+      text: value,
+      fontName: cell.fontName,
+      fontSize: cell.fontSize,
+      textHeight,
+      fontColor: cell.fontColor,
+      multiline: cell.multiline,
+      textAlign: cell.textAlign,
+      textVerticalAlign: 'top',
+    });
+  });
+  const lineEntities = [];
+  horizontal.forEach(({ coordinate, intervals }) => {
+    mergeTableLineIntervals(intervals).forEach(({ start, end }, index) => lineEntities.push({
+      id: deriveUuidForKey('table-horizontal', table.id, coordinate, index),
+      type: 'line',
+      stackId: table.stackId,
+      start: [start, coordinate],
+      end: [end, coordinate],
+    }));
+  });
+  vertical.forEach(({ coordinate, intervals }) => {
+    mergeTableLineIntervals(intervals).forEach(({ start, end }, index) => lineEntities.push({
+      id: deriveUuidForKey('table-vertical', table.id, coordinate, index),
+      type: 'line',
+      stackId: table.stackId,
+      start: [coordinate, start],
+      end: [coordinate, end],
+    }));
+  });
+  return [...lineEntities, ...textEntities];
+}
+
+export function tableCellNavigationTarget(entity, row, column, key, { shiftKey = false } = {}) {
+  const rects = tableCellRects(entity).sort((first, second) => (
+    first.row - second.row || first.column - second.column
+  ));
+  const current = rects.find((rect) => (
+    row >= rect.row
+    && row < rect.row + rect.rowSpan
+    && column >= rect.column
+    && column < rect.column + rect.colSpan
+  ));
+  if (!current) return null;
+  if (key === 'Tab') {
+    const index = rects.indexOf(current) + (shiftKey ? -1 : 1);
+    const target = rects[index];
+    return target ? { row: target.row, column: target.column } : null;
+  }
+  let candidates = [];
+  if (key === 'ArrowLeft') {
+    candidates = rects.filter((rect) => (
+      current.row >= rect.row
+      && current.row < rect.row + rect.rowSpan
+      && rect.column + rect.colSpan <= current.column
+    )).sort((first, second) => (
+      (second.column + second.colSpan) - (first.column + first.colSpan)
+    ));
+  }
+  if (key === 'ArrowRight') {
+    candidates = rects.filter((rect) => (
+      current.row >= rect.row
+      && current.row < rect.row + rect.rowSpan
+      && rect.column >= current.column + current.colSpan
+    )).sort((first, second) => first.column - second.column);
+  }
+  if (key === 'ArrowUp') {
+    candidates = rects.filter((rect) => (
+      current.column >= rect.column
+      && current.column < rect.column + rect.colSpan
+      && rect.row + rect.rowSpan <= current.row
+    )).sort((first, second) => (
+      (second.row + second.rowSpan) - (first.row + first.rowSpan)
+    ));
+  }
+  if (key === 'ArrowDown') {
+    candidates = rects.filter((rect) => (
+      current.column >= rect.column
+      && current.column < rect.column + rect.colSpan
+      && rect.row >= current.row + current.rowSpan
+    )).sort((first, second) => first.row - second.row);
+  }
+  const target = candidates[0];
+  return target ? { row: target.row, column: target.column } : null;
 }
 
 function selectedCellList(record) {
@@ -440,10 +702,18 @@ export function createTableSystem({
   let resizeDrag = null;
   let cellSelectionDrag = null;
   let editingCell = null;
+  let pendingPlacementEdit = null;
+  let pendingPlacementRecord = null;
   let previewNode = null;
 
-  function resolveCellText(cell) {
-    return resolveTextFields(cell?.text ?? '', getParameters(), formatParameter, evaluateExpression);
+  function resolveCellText(recordOrEntity, cell) {
+    const entity = recordOrEntity?.entity || recordOrEntity;
+    return resolveTextFields(
+      cell?.text ?? '',
+      getParameters(entity),
+      formatParameter,
+      (expression) => evaluateExpression?.(expression, entity),
+    );
   }
 
   function displayedCellText(record, row, column, cell) {
@@ -451,7 +721,7 @@ export function createTableSystem({
       && editingCell.row === row
       && editingCell.column === column
       ? String(cell?.text ?? '')
-      : resolveCellText(cell);
+      : resolveCellText(record, cell);
   }
 
   function clearPreview() {
@@ -492,7 +762,7 @@ export function createTableSystem({
         'text-anchor': textLayout.textAnchor,
         'dominant-baseline': textLayout.dominantBaseline,
       });
-      text.textContent = resolveCellText(cell);
+      text.textContent = resolveCellText(table, cell);
       previewNode.appendChild(text);
     });
     previewNode.appendChild(svg('rect', {
@@ -532,6 +802,19 @@ export function createTableSystem({
     record.entity = deleteTableRows(record.entity, rows);
     const nextRow = Math.min(rows[0], record.entity.rows.length - 1);
     setSelection(record, { rows: [nextRow], anchorCell: null });
+    updateRecord(record);
+    if (notify) onChange(record, { history: 'commit' });
+    return true;
+  }
+
+  function deleteSelectedColumns(record, { checkpoint = true, notify = true } = {}) {
+    const columns = [...(record?.tableSelection?.columns || [])].sort((a, b) => a - b);
+    if (!record || !columns.length || columns.length >= record.entity.columns.length) return false;
+    if (checkpoint) requestHistoryCheckpoint('table-delete-column');
+    record.entity = deleteTableColumns(record.entity, columns);
+    const nextColumn = Math.min(columns[0], record.entity.columns.length - 1);
+    setSelection(record, { columns: [nextColumn], anchorCell: null });
+    updateRecord(record);
     if (notify) onChange(record, { history: 'commit' });
     return true;
   }
@@ -618,10 +901,15 @@ export function createTableSystem({
     cellSelectionDrag = null;
   }
 
-  function editCell(record, row, column, event) {
+  function editCell(record, row, column, event, { refresh = true } = {}) {
     selectCell(record, row, column, event);
-    editingCell = { record, row, column };
-    updateRecord(record);
+    editingCell = {
+      record,
+      row,
+      column,
+      startText: String(record.entity.cells?.[row]?.[column]?.text ?? ''),
+    };
+    if (refresh) updateRecord(record);
     const editor = record.editors.get(cellKey(row, column));
     if (!editor) return;
     editor.readOnly = false;
@@ -660,8 +948,9 @@ export function createTableSystem({
 
   function beginCellPasteEdit(record, row, column, editor) {
     if (editor.classList.contains('editing')) return;
-    editingCell = { record, row, column };
-    editor.value = String(record.entity.cells?.[row]?.[column]?.text ?? '');
+    const startText = String(record.entity.cells?.[row]?.[column]?.text ?? '');
+    editingCell = { record, row, column, startText };
+    editor.value = startText;
     editor.readOnly = false;
     editor.classList.add('editing');
     editor.focus();
@@ -748,6 +1037,48 @@ export function createTableSystem({
     return { cells: selectedCellList(record), rows: selection.rows, columns: selection.columns };
   }
 
+  function finishCellEdit(record, row, column, editor, { refresh = true } = {}) {
+    const active = editingCell?.record === record
+      && editingCell.row === row
+      && editingCell.column === column
+      ? editingCell
+      : null;
+    if (!active) return false;
+    commitCell(record, row, column, editor, { notify: false });
+    const changed = active.startText !== editor.value;
+    editingCell = null;
+    editor.readOnly = true;
+    editor.classList.remove('editing');
+    if (changed) {
+      requestHistoryCheckpoint('table-cell-edit');
+      onChange(record, { history: 'coalesce' });
+    }
+    if (refresh) updateRecord(record);
+    return changed;
+  }
+
+  function navigateFromCell(record, row, column, editor, event) {
+    const target = tableCellNavigationTarget(record.entity, row, column, event.key, {
+      shiftKey: event.shiftKey,
+    });
+    if (!target) return false;
+    event.preventDefault();
+    if (!editor.readOnly) finishCellEdit(record, row, column, editor, { refresh: false });
+    editingCell = null;
+    selectCell(record, target.row, target.column, {});
+    const ownerDocument = record.group?.ownerDocument || document;
+    const view = ownerDocument.defaultView;
+    const schedule = typeof view?.requestAnimationFrame === 'function'
+      ? (callback) => view.requestAnimationFrame(callback)
+      : (callback) => setTimeout(callback, 0);
+    schedule(() => {
+      if (!records.has(record) || !record.group?.isConnected) return;
+      if (!record.tableSelection?.cells?.has(cellKey(target.row, target.column))) return;
+      editCell(record, target.row, target.column, {}, { refresh: false });
+    });
+    return true;
+  }
+
   function actionButton(record, label, iconName, handler, enabled) {
     const button = html('button', { type: 'button', class: 'image-toolbar-button canvas-overlay-button', title: label, 'aria-label': label });
     button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${iconFor(iconName || label)}</svg>`;
@@ -771,6 +1102,9 @@ export function createTableSystem({
         setSelection(record, { rows: [rows.size ? Math.max(...rows) + 1 : record.entity.rows.length - 1] });
         onChange(record, { history: 'commit' });
       }, rows.size > 0),
+      actionButton(record, 'Delete Selected Rows', 'Delete Selected Rows', () => {
+        deleteSelectedRows(record);
+      }, rows.size > 0 && rows.size < record.entity.rows.length),
       actionButton(record, 'Insert Column After', 'Insert Column After', () => {
         requestHistoryCheckpoint('table-insert-column');
         record.entity = insertTableColumn(record.entity, columns.size ? Math.max(...columns) : cells.at(-1)?.column ?? record.entity.columns.length - 1);
@@ -778,6 +1112,9 @@ export function createTableSystem({
         setSelection(record, { columns: [columns.size ? Math.max(...columns) + 1 : record.entity.columns.length - 1] });
         onChange(record, { history: 'commit' });
       }, columns.size > 0),
+      actionButton(record, 'Delete Selected Columns', 'Delete Selected Columns', () => {
+        deleteSelectedColumns(record);
+      }, columns.size > 0 && columns.size < record.entity.columns.length),
       actionButton(record, 'Merge', 'Merge', () => {
         requestHistoryCheckpoint('table-merge');
         record.entity = mergeTableCells(record.entity, cells);
@@ -863,7 +1200,12 @@ export function createTableSystem({
 
   function createRecord(input) {
     const entity = normalizeTableEntity(input);
-    const group = svg('g', { class: 'canvas-record table-record', 'data-record-id': entity.id, 'data-entity-type': 'table' });
+    const group = svg('g', {
+      class: 'canvas-record table-record',
+      'data-record-id': entity.id,
+      'data-entity-type': 'table',
+      'data-stack-id': entity.stackId,
+    });
     const content = svg('g', { class: 'table-content' });
     const hitTarget = svg('rect', { class: 'table-hit-target selectable-entity hit-target', 'data-record-id': entity.id });
     const dragBorder = bindHoverState(svg('rect', { class: 'table-drag-border selectable-entity hit-target', 'data-record-id': entity.id }));
@@ -928,6 +1270,11 @@ export function createTableSystem({
         onChange(record, { history: 'coalesce' });
       },
       dispose() {
+        if (pendingPlacementRecord === record) {
+          pendingPlacementEdit?.();
+          pendingPlacementEdit = null;
+          pendingPlacementRecord = null;
+        }
         record.editors.clear();
         if (editingCell?.record === record) editingCell = null;
       },
@@ -942,12 +1289,33 @@ export function createTableSystem({
   function updateRecord(record) {
     if (!record?.entity || !record.content) record.content = record?.group?.querySelector('.table-content');
     if (!record?.content) return;
+    const activeEditor = record.content.ownerDocument?.activeElement;
+    const activeCellKey = [...record.editors.entries()]
+      .find(([, editor]) => editor === activeEditor)?.[0] || null;
+    const restoreActiveEditor = Boolean(
+      activeCellKey
+      && editingCell?.record === record
+      && activeCellKey === cellKey(editingCell.row, editingCell.column),
+    );
+    const activeSelection = restoreActiveEditor
+      ? {
+        start: Number(activeEditor.selectionStart) || 0,
+        end: Number(activeEditor.selectionEnd) || 0,
+        direction: activeEditor.selectionDirection || 'none',
+      }
+      : null;
     const table = normalizeTableEntity(record.entity);
     record.entity = table;
+    record.group.setAttribute('data-stack-id', table.stackId);
     const { width, height } = tableDimensions(table);
     record.group.setAttribute('data-table-width', width);
     record.group.setAttribute('data-table-height', height);
-    record.content.replaceChildren();
+    record.restoringEditorFocus = restoreActiveEditor;
+    try {
+      record.content.replaceChildren();
+    } finally {
+      record.restoringEditorFocus = false;
+    }
     record.editors.clear();
     tableCellRects(table).forEach((rect) => {
       const cellGroup = svg('g', { class: 'table-cell', 'data-table-cell': cellKey(rect.row, rect.column) });
@@ -1034,26 +1402,25 @@ export function createTableSystem({
       // focus from the textarea after the first character.
       editor.addEventListener('input', () => commitCell(record, rect.row, rect.column, editor, { notify: false }));
       editor.addEventListener('blur', () => {
-        const changed = commitCell(record, rect.row, rect.column, editor, { notify: false });
-        if (changed) {
-          requestHistoryCheckpoint('table-cell-edit');
-          onChange(record, { history: 'coalesce' });
-        }
-        if (editingCell?.record === record
-          && editingCell.row === rect.row
-          && editingCell.column === rect.column) editingCell = null;
-        editor.readOnly = true;
-        editor.classList.remove('editing');
-        updateRecord(record);
+        if (record.restoringEditorFocus) return;
+        finishCellEdit(record, rect.row, rect.column, editor);
       });
       editor.addEventListener('keydown', (event) => {
         // Cell editing owns the keyboard while the editor has focus. Without
         // this guard, the canvas shortcut handler can consume letters such as
         // C or B and end the edit immediately after the first keystroke.
         event.stopPropagation();
+        const navigationKey = event.key === 'Tab'
+          || ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key);
+        if (navigationKey && navigateFromCell(record, rect.row, rect.column, editor, event)) return;
         if (editor.readOnly && event.key.length === 1 && !event.ctrlKey && !event.metaKey) {
           event.preventDefault();
-          editingCell = { record, row: rect.row, column: rect.column };
+          editingCell = {
+            record,
+            row: rect.row,
+            column: rect.column,
+            startText: String(cell.text ?? ''),
+          };
           editor.value = cell.text;
           editor.readOnly = false;
           editor.classList.add('editing');
@@ -1074,6 +1441,15 @@ export function createTableSystem({
       record.content.appendChild(cellGroup);
       record.editors.set(cellKey(rect.row, rect.column), editor);
     });
+    if (restoreActiveEditor) {
+      const editor = record.editors.get(activeCellKey);
+      if (editor) {
+        editor.focus({ preventScroll: true });
+        const end = Math.min(editor.value.length, activeSelection.end);
+        const start = Math.min(end, activeSelection.start);
+        editor.setSelectionRange(start, end, activeSelection.direction);
+      }
+    }
     table.columns.forEach((column, columnIndex) => {
       const x = table.x + table.columns.slice(0, columnIndex).reduce((total, item) => total + item.width, 0);
       const selectorSelected = record.group.classList.contains('selected') && record.tableSelection?.columns?.has(columnIndex);
@@ -1156,11 +1532,11 @@ export function createTableSystem({
     const scale = Math.max(0.0001, getScale());
     record.toolbar.setAttribute('x', table.x);
     record.toolbar.setAttribute('y', (table.y - 48 / scale));
-    record.toolbar.setAttribute('width', 190 / scale);
+    record.toolbar.setAttribute('width', TABLE_TOOLBAR_WIDTH / scale);
     record.toolbar.setAttribute('height', 42 / scale);
     record.toolbarContent.style.transform = `scale(${1 / scale})`;
     record.toolbarContent.style.transformOrigin = '0 0';
-    record.toolbarContent.style.width = '190px';
+    record.toolbarContent.style.width = `${TABLE_TOOLBAR_WIDTH}px`;
     record.toolbarContent.style.height = '34px';
     record.toolbar.style.display = record.group.classList.contains('selected') ? '' : 'none';
     renderToolbar(record, width);
@@ -1184,11 +1560,37 @@ export function createTableSystem({
     return { handled: true, success: true };
   }
 
-  function beginEdit(record) {
+  function beginEdit(record, { placementPointerEvent = null } = {}) {
     if (!record) return false;
+    pendingPlacementEdit?.();
+    pendingPlacementEdit = null;
+    pendingPlacementRecord = null;
     const first = { row: 0, column: 0 };
     setSelection(record, { cells: [first] });
-    editCell(record, first.row, first.column, {});
+    const activate = () => {
+      if (!records.has(record) || !record.group?.isConnected) return;
+      editCell(record, first.row, first.column, {});
+    };
+    if (placementPointerEvent?.type !== 'pointerdown') {
+      activate();
+      return true;
+    }
+    const ownerDocument = record.group?.ownerDocument || document;
+    const view = ownerDocument.defaultView;
+    const schedule = typeof view?.requestAnimationFrame === 'function'
+      ? (callback) => view.requestAnimationFrame(callback)
+      : (callback) => setTimeout(callback, 0);
+    pendingPlacementRecord = record;
+    pendingPlacementEdit = deferTableEditUntilPlacementClick({
+      pointerEvent: placementPointerEvent,
+      eventTarget: ownerDocument,
+      schedule,
+      onReady: () => {
+        pendingPlacementEdit = null;
+        pendingPlacementRecord = null;
+        activate();
+      },
+    });
     return true;
   }
 
@@ -1228,7 +1630,6 @@ export function createTableSystem({
       canEditStroke: true,
       canEditConstruction: false,
       canEditText: true,
-      canEditScaleWithZoom: false,
       canEditImageFillSettings: false,
       fillColor: valueSet(cells.map((cell) => cell.fillColor)) || appearance[0].fillColor,
       fillExpression: valueSet(cells.map((cell) => cell.fillColor)) || appearance[0].fillColor,
@@ -1244,7 +1645,6 @@ export function createTableSystem({
       textAlign: valueSet(cells.map((cell) => cell.textAlign)),
       textVerticalAlign: valueSet(cells.map((cell) => cell.textVerticalAlign)),
       multiline: valueSet(cells.map((cell) => cell.multiline)),
-      scaleWithZoom: true,
       mixedFill: new Set(cells.map((cell) => cell.fillColor)).size > 1,
       mixedFillOpacity: new Set(cells.map((cell) => cell.fillOpacity)).size > 1,
       mixedStroke: new Set(cells.map((cell) => cell.strokeThickness)).size > 1,
@@ -1266,6 +1666,7 @@ export function createTableSystem({
     setSelectedAppearance,
     setSelectedTextProperties,
     deleteSelectedRows,
+    deleteSelectedColumns,
     selectionProperties,
     featureFromEvent,
     copySelectedCells,

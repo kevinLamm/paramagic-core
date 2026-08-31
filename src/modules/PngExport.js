@@ -1,10 +1,17 @@
 import {
   createCanvasPresentationSvg,
   serializeCanvasPresentationElement,
+  valueOnlyDimensionText,
 } from './CanvasPresentation.js';
+import {
+  applyValueOnlyExportDimensionAppearance,
+  setDimensionPresentationText,
+  updateDimensionPresentationScale,
+} from './DimensionSystem.js';
 import { embedSvgImageAssets } from './ImageSystem.js';
 
-export const PNG_EXPORT_PADDING_PIXELS = 20;
+export const PNG_EXPORT_PADDING_PIXELS = 50;
+export const PNG_EXPORT_CAPTURE_DENSITY = 2;
 export const PNG_EXPORT_FORMATS = Object.freeze([
   Object.freeze({ ratio: '1:1', width: 2048, height: 2048, unitWidth: 1, unitHeight: 1 }),
   Object.freeze({ ratio: '16:9', width: 2720, height: 1530, unitWidth: 16, unitHeight: 9 }),
@@ -137,6 +144,21 @@ export function inlinePngPresentationStyles(svg, getStyle = (node) => (
   return svg;
 }
 
+export function applyPngValueOnlyDimensionText(root, resolveValueOnlyDimensionText = null) {
+  const groups = [...(root?.querySelectorAll?.('.dimension-record') || [])];
+  groups.forEach((group) => {
+    const textNode = group.querySelector?.('.dimension-text');
+    if (!textNode) return;
+    const dimensionId = group.getAttribute?.('data-dimension-id') || '';
+    const resolved = dimensionId && typeof resolveValueOnlyDimensionText === 'function'
+      ? resolveValueOnlyDimensionText(dimensionId)
+      : '';
+    const valueText = resolved || valueOnlyDimensionText(textNode.textContent);
+    setDimensionPresentationText(group, valueText);
+  });
+  return root;
+}
+
 export async function preparePngRasterMarkup(svg, {
   embedImageAssets = embedSvgImageAssets,
   inlinePresentationStyles = inlinePngPresentationStyles,
@@ -233,13 +255,36 @@ function applyPngViewport(svg, bounds, width, height, paddingPixels) {
     background.setAttribute('fill', '#ffffff');
   }
   const content = svg.querySelector('[data-canvas-presentation-content]');
+  const presentationScale = viewport.scale / PNG_EXPORT_CAPTURE_DENSITY;
+  updateDimensionPresentationScale(content, presentationScale);
   content?.querySelectorAll('.dimension-text').forEach((text) => {
-    const fontSize = 14 / viewport.scale;
+    const fontSize = (14 * PNG_EXPORT_CAPTURE_DENSITY) / viewport.scale;
     text.setAttribute('font-size', fontSize);
     text.setAttribute('stroke-width', 0);
     text.style.fontSize = `${fontSize}px`;
     text.style.strokeWidth = '0px';
   });
+  return viewport;
+}
+
+function fitPngPresentation(svg, width, height, paddingPixels) {
+  const content = svg.querySelector('[data-canvas-presentation-content]');
+  let bounds = measuredContentBounds(content);
+  let previousScale = 0;
+  for (let pass = 0; pass < 12; pass += 1) {
+    const viewport = applyPngViewport(svg, bounds, width, height, paddingPixels);
+    const nextBounds = measuredContentBounds(content);
+    const nextViewport = fittedPngExportViewport(nextBounds, width, height, paddingPixels);
+    const scaleChange = Math.abs(nextViewport.scale - viewport.scale)
+      / Math.max(nextViewport.scale, viewport.scale, 0.0001);
+    bounds = nextBounds;
+    previousScale = viewport.scale;
+    if (scaleChange < 1e-7) return applyPngViewport(svg, bounds, width, height, paddingPixels);
+  }
+  const viewport = applyPngViewport(svg, bounds, width, height, paddingPixels);
+  if (Math.abs(viewport.scale - previousScale) > 1e-7) {
+    return applyPngViewport(svg, measuredContentBounds(content), width, height, paddingPixels);
+  }
   return viewport;
 }
 
@@ -339,9 +384,12 @@ export async function createCanvasPresentationPng(objectLayer, options = {}, {
         width: 1024,
         height: 1024,
         background: '#ffffff',
+        resolveValueOnlyDimensionText: options.resolveValueOnlyDimensionText,
         documentRef,
       });
       if (!svg) throw new Error('The canvas presentation is unavailable for PNG export.');
+      applyPngValueOnlyDimensionText(svg, options.resolveValueOnlyDimensionText);
+      applyValueOnlyExportDimensionAppearance(svg);
       host.replaceChildren(svg);
       const content = svg.querySelector('[data-canvas-presentation-content]');
       if (!content) throw new Error('The canvas presentation is unavailable for PNG export.');
@@ -354,12 +402,7 @@ export async function createCanvasPresentationPng(objectLayer, options = {}, {
     return await encodePngAtCaptureSize(format, async (width, height) => {
       const { svg, content } = mountedPresentation();
       await waitForPresentationLayout(documentRef);
-      let bounds = measuredContentBounds(content);
-      applyPngViewport(svg, bounds, width, height, options.paddingPixels ?? PNG_EXPORT_PADDING_PIXELS);
-      if (content.querySelector('.dimension-text')) {
-        bounds = measuredContentBounds(content);
-        applyPngViewport(svg, bounds, width, height, options.paddingPixels ?? PNG_EXPORT_PADDING_PIXELS);
-      }
+      fitPngPresentation(svg, width, height, options.paddingPixels ?? PNG_EXPORT_PADDING_PIXELS);
       return rasterizePresentation(svg, width, height);
     });
   } finally {

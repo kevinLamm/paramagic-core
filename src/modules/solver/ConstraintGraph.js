@@ -49,8 +49,11 @@ export class ScopedSketchModel {
   constructor(model, scope, variablesById = null) {
     this.source = model;
     this.scope = scope;
-    this.entities = model.entities;
-    this.derivedEntities = model.derivedEntities;
+    this.entities = new Map([...scope.entityIds]
+      .map((id) => [id, model.entities.get(id)])
+      .filter(([, binding]) => binding));
+    this.derivedEntities = new Map([...model.derivedEntities]
+      .filter(([id]) => scope.entityIds.has(id)));
     this.constraints = new Map([...scope.constraintIds]
       .map((id) => [id, model.constraints.get(id)])
       .filter(([, constraint]) => constraint));
@@ -78,6 +81,10 @@ export class ScopedSketchModel {
 
   entity(id) {
     return this.source.entity(id);
+  }
+
+  updateEntity(entity) {
+    return this.source.updateEntity(entity);
   }
 
   derivedEntity(id) {
@@ -110,8 +117,13 @@ export class ScopedSketchModel {
 }
 
 export class ConstraintGraph {
-  constructor(model) {
+  constructor(model, {
+    includeEntity = () => true,
+    includeConstraint = () => true,
+  } = {}) {
     this.model = model;
+    this.includeEntity = includeEntity;
+    this.includeConstraint = includeConstraint;
     this.variableConstraints = new Map();
     this.constraintVariables = new Map();
     this.intrinsicEntityByNode = new Map();
@@ -183,17 +195,23 @@ export class ConstraintGraph {
     this.sourcesForDerivedEntity.clear();
     this.derivedEntitiesForSource.clear();
 
-    const variables = this.model.allVariables();
+    const variables = this.model.allVariables().filter((variable) => this.includeEntity(variable.ownerId));
     this.variablesById = new Map(variables.map((variable) => [variable.id, variable]));
     variables.forEach((variable) => this.variableConstraints.set(variable.id, new Set()));
-    for (const [entityId, entity] of this.model.derivedEntities) this.indexDerivedEntity(entityId, entity);
+    for (const [entityId, entity] of this.model.derivedEntities) {
+      if (this.includeEntity(entityId)) this.indexDerivedEntity(entityId, entity);
+    }
     for (const [constraintId, constraint] of this.model.constraints) {
+      if (!this.includeConstraint(constraint)) continue;
       this.indexConstraintRecords(constraintId, constraint);
       if (constraint.enabled === false) continue;
       const constraintNode = nodeKey('constraint', constraintId);
-      constraintVariableIds(this.model, constraint).forEach((variableId) => this.connect(constraintNode, variableId));
+      constraintVariableIds(this.model, constraint).forEach((variableId) => {
+        if (this.variablesById.has(variableId)) this.connect(constraintNode, variableId);
+      });
     }
     for (const [entityId, binding] of this.model.entities) {
+      if (!this.includeEntity(entityId)) continue;
       if (!binding.intrinsicResiduals().length) continue;
       const intrinsicNode = nodeKey('intrinsic', entityId);
       this.intrinsicEntityByNode.set(intrinsicNode, entityId);
@@ -227,13 +245,13 @@ export class ConstraintGraph {
       const stableAnchor = [...variableIds].sort()[0] || `empty-${this.components.size}`;
       const componentId = `component:${stableAnchor}`;
       const entityIds = new Set([...variableIds]
-        .map((id) => this.variablesById.get(id)?.owner)
+        .map((id) => this.variablesById.get(id)?.ownerId)
         .filter(Boolean));
       const dimensionIds = new Set([...constraintIds]
         .map((id) => this.model.constraints.get(id)?.dimensionRef)
         .filter(Boolean));
       const component = {
-        id: componentId,
+        componentKey: componentId,
         variableIds,
         constraintIds,
         intrinsicEntityIds,
@@ -258,13 +276,13 @@ export class ConstraintGraph {
     const stableAnchor = [...variableIds].sort()[0] || `empty-${this.components.size}`;
     const componentId = `component:${stableAnchor}`;
     const entityIds = new Set([...variableIds]
-      .map((id) => this.variablesById.get(id)?.owner)
+      .map((id) => this.variablesById.get(id)?.ownerId)
       .filter(Boolean));
     const dimensionIds = new Set([...constraintIds]
       .map((id) => this.model.constraints.get(id)?.dimensionRef)
       .filter(Boolean));
     const component = {
-      id: componentId,
+      componentKey: componentId,
       variableIds,
       constraintIds,
       intrinsicEntityIds,
@@ -331,6 +349,7 @@ export class ConstraintGraph {
   }
 
   addEntity(entityId) {
+    if (!this.includeEntity(entityId)) return false;
     const binding = this.model.binding(entityId);
     if (!binding) return false;
     const variables = binding.allVariables();
@@ -349,12 +368,14 @@ export class ConstraintGraph {
 
   addConstraint(constraintId) {
     const constraint = this.model.constraints.get(constraintId);
-    if (!constraint) return false;
+    if (!constraint || !this.includeConstraint(constraint)) return false;
     this.indexConstraintRecords(constraintId, constraint);
     if (constraint.enabled === false) return false;
     const constraintNode = nodeKey('constraint', constraintId);
     const variableIds = constraintVariableIds(this.model, constraint);
-    variableIds.forEach((variableId) => this.connect(constraintNode, variableId));
+    variableIds.forEach((variableId) => {
+      if (this.variablesById.has(variableId)) this.connect(constraintNode, variableId);
+    });
     this.rebuildComponentsForVariables(variableIds);
     return true;
   }
@@ -363,7 +384,7 @@ export class ConstraintGraph {
     const binding = this.model.binding(entityId);
     if (binding) return new Set(binding.allVariables().map((variable) => variable.id));
     return new Set([...this.variablesById]
-      .filter(([, variable]) => variable.owner === entityId)
+      .filter(([, variable]) => variable.ownerId === entityId)
       .map(([id]) => id));
   }
 
@@ -406,11 +427,18 @@ export class ConstraintGraph {
         this.componentForConstraint.delete(constraintId);
         return;
       }
+      if (!this.includeConstraint(constraint)) {
+        this.unindexConstraintRecords(constraintId);
+        this.componentForConstraint.delete(constraintId);
+        return;
+      }
       this.indexConstraintRecords(constraintId, constraint);
       if (constraint.enabled === false) return;
       constraintVariableIds(this.model, constraint).forEach((variableId) => {
-        this.connect(constraintNode, variableId);
-        affectedVariableIds.add(variableId);
+        if (this.variablesById.has(variableId)) {
+          this.connect(constraintNode, variableId);
+          affectedVariableIds.add(variableId);
+        }
       });
     });
     this.rebuildComponentsForVariables(affectedVariableIds);
@@ -464,7 +492,7 @@ export class ConstraintGraph {
     this.intrinsicEntityByNode.delete(intrinsicNode);
 
     const binding = this.model.binding(entityId);
-    if (!binding) {
+    if (!binding || !this.includeEntity(entityId)) {
       this.rebuildComponentsForVariables(affectedVariableIds);
       return affectedVariableIds;
     }
@@ -478,11 +506,13 @@ export class ConstraintGraph {
       if (!constraintNode.startsWith('constraint:')) return;
       const constraintId = constraintNode.slice('constraint:'.length);
       const constraint = this.model.constraints.get(constraintId);
-      if (!constraint || constraint.enabled === false) return;
+      if (!constraint || constraint.enabled === false || !this.includeConstraint(constraint)) return;
       this.indexConstraintRecords(constraintId, constraint);
       constraintVariableIds(this.model, constraint).forEach((variableId) => {
-        this.connect(constraintNode, variableId);
-        affectedVariableIds.add(variableId);
+        if (this.variablesById.has(variableId)) {
+          this.connect(constraintNode, variableId);
+          affectedVariableIds.add(variableId);
+        }
       });
     });
     if (binding.intrinsicResiduals().length) {
@@ -494,6 +524,7 @@ export class ConstraintGraph {
   }
 
   updateDerivedEntity(entityId) {
+    if (!this.includeEntity(entityId)) return new Set();
     this.indexDerivedEntity(entityId, this.model.derivedEntities.get(entityId));
     return this.refreshConstraints(this.constraintIdsForRecord(entityId));
   }
@@ -576,7 +607,7 @@ export class ConstraintGraph {
     if (!componentIds.size) return null;
 
     const scope = {
-      componentIds,
+      componentKeys: componentIds,
       variableIds: new Set(),
       constraintIds: new Set(),
       intrinsicEntityIds: new Set(),
@@ -607,14 +638,14 @@ export class ConstraintGraph {
         try {
           residualCount = registry.evaluate(this.scopedModel({
             ...component,
-            componentIds: new Set([component.id]),
+            componentKeys: new Set([component.componentKey]),
           }), dimensions).values.length;
         } catch {
           residualCount = null;
         }
       }
       return {
-        id: component.id,
+        componentKey: component.componentKey,
         variableCount: component.variableIds.size,
         constraintCount: component.constraintIds.size,
         intrinsicEntityCount: component.intrinsicEntityIds.size,

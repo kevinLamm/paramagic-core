@@ -5,6 +5,7 @@ import {
   materializeArraySubtractOwners,
 } from './ArrayTools.js';
 import { arcSweepFromAngles } from './ArcGeometry.js';
+import { deriveUuidForKey } from './IdentitySystem.js';
 
 const EPSILON = 1e-9;
 const MIN_TOPOLOGY_TOLERANCE = 1e-6;
@@ -32,10 +33,44 @@ export function isSubtractableEntity(entity) {
     && ['circle', 'rect', 'polygon'].includes(entity.type);
 }
 
+export function migrateSubtractReferences(value) {
+  if (Array.isArray(value)) return value.map(migrateSubtractReferences);
+  if (!value || typeof value !== 'object') return value;
+  const result = Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    migrateSubtractReferences(item),
+  ]));
+  if (Array.isArray(result.subtractFrom)) {
+    result.subtractFrom = result.subtractFrom.map((target) => {
+      if (typeof target !== 'string' || !target.startsWith('cycle:')) return target;
+      return {
+        kind: 'boundary-cycle',
+        memberRecordIds: target.slice('cycle:'.length).split('|').filter(Boolean),
+      };
+    });
+  }
+  return result;
+}
+
+export function subtractParentTargets(entity) {
+  return (Array.isArray(entity?.subtractFrom) ? entity.subtractFrom : []).map((target) => {
+    if (typeof target === 'string') return target.trim();
+    if (target?.kind !== 'boundary-cycle') return null;
+    const memberRecordIds = [...new Set((target.memberRecordIds || []).filter(Boolean).map(String))].sort();
+    return memberRecordIds.length ? { kind: 'boundary-cycle', memberRecordIds } : null;
+  }).filter(Boolean);
+}
+
+function subtractTargetId(target) {
+  if (typeof target === 'string') return target;
+  const memberRecordIds = target?.memberRecordIds || [];
+  return memberRecordIds.length
+    ? deriveUuidForKey('boundary-cycle', ...memberRecordIds)
+    : null;
+}
+
 export function subtractParentIds(entity) {
-  return [...new Set((Array.isArray(entity?.subtractFrom) ? entity.subtractFrom : [])
-    .map((value) => String(value || '').trim())
-    .filter(Boolean))];
+  return [...new Set(subtractParentTargets(entity).map(subtractTargetId).filter(Boolean))];
 }
 
 export function isSubtractCutterEntity(entity) {
@@ -979,7 +1014,7 @@ function subtractEnabled(entity, evaluateExpression) {
   if (typeof evaluateExpression !== 'function') return entity.subtract === true;
   const result = evaluateSubtractExpression(
     String(entity.subtractExpression ?? (entity.subtract ? 'TRUE' : 'FALSE')),
-    evaluateExpression,
+    (expression) => evaluateExpression?.(expression, entity),
   );
   return result.error ? entity.subtract === true : result.value;
 }
@@ -1062,8 +1097,8 @@ function arraySubtractorOwners(drawing, owners, {
       ? centerPointForDefinition(definition, rawById)
       : null;
     const evaluated = evaluateArrayDefinition(definition, {
-      evaluateNumeric,
-      evaluateLength,
+      evaluateNumeric: (expression) => evaluateNumeric(expression, definition),
+      evaluateLength: (expression) => evaluateLength(expression, definition),
       sourceBounds,
       centerPoint,
     });
@@ -1094,10 +1129,10 @@ export function subtractDrawingResults(drawing = {}, options = {}) {
     const boundary = subtractBoundaryPath(plan.features, plan.tolerance);
     if (plan.materialEmpty || !boundary.closed || !boundary.d) return;
     results.push({
-      id: `subtract-result:${owner.id}`,
+      id: deriveUuidForKey('subtract-result', owner.id),
       ownerId: owner.id,
       recordIds: [...owner.recordIds],
-      stackId: owner.appearanceEntity?.stackId || 'stack-default',
+      stackId: owner.appearanceEntity?.stackId || null,
       appearance: clone(owner.appearanceEntity?.appearance || {}),
       d: boundary.d,
       points: resultPoints(plan.features),
@@ -1105,6 +1140,22 @@ export function subtractDrawingResults(drawing = {}, options = {}) {
     });
   });
   return { owners: [...owners, ...cutters.filter((owner) => owner.kind === 'array-derived')], results, suppressedRecordIds };
+}
+
+/**
+ * Materialize the live-canvas Subtract presentation for a standalone export.
+ *
+ * The app stylesheet hides the original boundary fill and selectable source
+ * geometry once a subtract result owns the presentation. Standalone SVGs do
+ * not include that stylesheet, and linked copies clone those hidden nodes, so
+ * they must be removed from the export clone instead of relying on CSS.
+ */
+export function prepareSubtractPresentationClone(root) {
+  root?.querySelectorAll?.([
+    '.subtract-source-record .resolved-boundary-visual',
+    '.entity-record.subtract-source-record .selectable-entity:not(.subtract-result-boundary)',
+  ].join(','))?.forEach?.((node) => node.remove?.());
+  return root;
 }
 
 // --- Subtract Tool ---
@@ -1465,7 +1516,7 @@ export function createSubtractSystem({
       const parents = subtractParentIds(stateRecord.entity);
       const result = evaluateSubtractExpression(
         expressionFor(stateRecord.entity),
-        (expression) => solver.evaluateParameterExpression(expression),
+        (expression) => solver.evaluateParameterExpression(expression, { stackId: stateRecord.entity.stackId }),
       );
       owner.recordIds.forEach((id) => {
         const record = records.find((candidate) => candidate.id === id);
@@ -1756,7 +1807,7 @@ export function createSubtractSystem({
   }
 
   function updateOwnerParents(owner, parentIds) {
-    const normalized = [...new Set(parentIds.map((value) => String(value || '').trim()).filter(Boolean))];
+    const normalized = parentIds.map((value) => clone(value));
     owner.recordIds.forEach((recordId) => {
       const record = records.find((candidate) => candidate.id === recordId && candidate.recordType === 'geometry');
       if (!record) return;
@@ -1790,12 +1841,15 @@ export function createSubtractSystem({
       showStatusMessage(error);
       return { success: false, error };
     }
-    const parents = subtractParentIds(cutter.entity);
-    if (parents.includes(parent.id)) {
+    const parents = subtractParentTargets(cutter.entity);
+    if (parents.map(subtractTargetId).includes(parent.id)) {
       return { success: true, changed: false, parentId: parent.id, cutterId: cutter.id };
     }
     requestHistoryCheckpoint('subtract-parent-add');
-    updateOwnerParents(cutter, [...parents, parent.id]);
+    const parentTarget = parent.kind === 'cycle'
+      ? { kind: 'boundary-cycle', memberRecordIds: [...parent.recordIds].sort() }
+      : parent.id;
+    updateOwnerParents(cutter, [...parents, parentTarget]);
     refreshPresentation();
     syncState();
     notifyObjectChange({ history: 'commit' });
@@ -1809,7 +1863,10 @@ export function createSubtractSystem({
 
   return {
     expressionFor,
-    evaluateExpression: (expression) => evaluateSubtractExpression(expression, (value) => solver.evaluateParameterExpression(value)),
+    evaluateExpression: (expression, entity = null) => evaluateSubtractExpression(
+      expression,
+      (value) => solver.evaluateParameterExpression(value, { stackId: entity?.stackId }),
+    ),
     ownerForRecord,
     owners,
     targetOwners,

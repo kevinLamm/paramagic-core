@@ -1,6 +1,7 @@
-export const BROWSER_AUTOSAVE_FILE_ID = 'active-drawing';
+export const BROWSER_AUTOSAVE_SLOT_KEY = 'active-drawing';
 export const BROWSER_AUTOSAVE_DATABASE = 'paramagic-browser-files';
-export const BROWSER_AUTOSAVE_STORE = 'files';
+export const BROWSER_AUTOSAVE_STORE = 'file-slots';
+const LEGACY_BROWSER_AUTOSAVE_STORE = 'files';
 
 function requestResult(request) {
   return new Promise((resolve, reject) => {
@@ -12,10 +13,10 @@ function requestResult(request) {
 function openBrowserFileDatabase(indexedDb, databaseName) {
   if (!indexedDb?.open) return Promise.reject(new Error('Browser autosave is unavailable.'));
   return new Promise((resolve, reject) => {
-    const request = indexedDb.open(databaseName, 1);
+    const request = indexedDb.open(databaseName, 2);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(BROWSER_AUTOSAVE_STORE)) {
-        request.result.createObjectStore(BROWSER_AUTOSAVE_STORE, { keyPath: 'id' });
+        request.result.createObjectStore(BROWSER_AUTOSAVE_STORE, { keyPath: 'slotKey' });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -25,7 +26,7 @@ function openBrowserFileDatabase(indexedDb, databaseName) {
 
 export function normalizeBrowserAutosaveFile(file = {}) {
   return {
-    id: BROWSER_AUTOSAVE_FILE_ID,
+    slotKey: BROWSER_AUTOSAVE_SLOT_KEY,
     name: String(file.name || 'Untitled Drawing'),
     content: String(file.content || ''),
     mimeType: String(file.mimeType || 'application/vnd.paramagic+json'),
@@ -48,7 +49,11 @@ export function createIndexedDbBrowserFileStore({
     async load() {
       const db = await database();
       const transaction = db.transaction(BROWSER_AUTOSAVE_STORE, 'readonly');
-      return requestResult(transaction.objectStore(BROWSER_AUTOSAVE_STORE).get(BROWSER_AUTOSAVE_FILE_ID));
+      const current = await requestResult(transaction.objectStore(BROWSER_AUTOSAVE_STORE).get(BROWSER_AUTOSAVE_SLOT_KEY));
+      if (current || !db.objectStoreNames.contains(LEGACY_BROWSER_AUTOSAVE_STORE)) return current;
+      const legacyTransaction = db.transaction(LEGACY_BROWSER_AUTOSAVE_STORE, 'readonly');
+      const legacy = await requestResult(legacyTransaction.objectStore(LEGACY_BROWSER_AUTOSAVE_STORE).get(BROWSER_AUTOSAVE_SLOT_KEY));
+      return legacy ? normalizeBrowserAutosaveFile(legacy) : null;
     },
     async save(file) {
       const db = await database();

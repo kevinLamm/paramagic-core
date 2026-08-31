@@ -34,3 +34,17 @@ export function splitDerivedPresentationNodes(nodes = []) {
   });
   return { before, after };
 }
+
+export function directClosedRegionNodesForSourceIds(objectLayer, sourceIds = []) {
+  const selected = new Set(sourceIds);
+  const regions = objectLayer?.querySelectorAll?.(
+    ':scope > .closed-constrained-region[data-parent-ids]',
+  ) || [];
+  return [...regions].filter((region) => {
+    const parentIds = String(region.dataset?.parentIds || '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean);
+    return parentIds.length > 0 && parentIds.every((id) => selected.has(id));
+  });
+}

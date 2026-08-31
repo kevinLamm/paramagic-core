@@ -1,5 +1,27 @@
 import { arcSweepFromAngles } from './ArcGeometry.js';
+import { deriveUuidForKey } from './IdentitySystem.js';
+import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+
+registerIdentitySchema('swell', {
+  declarations: (value) => (value?.constraints || []).map((object, index) => ({
+    object, key: 'id', value: object.id, path: ['extensions', 'swell', 'constraints', String(index), 'id'], kind: 'swell-constraint',
+  })),
+  liveReferenceKeys: [
+    'stackId', 'recordId', 'targetId', 'ownerId', 'ownerRecordId', 'swellOwnerId', 'swellPieceId', 'swellSourceId',
+  ],
+  liveReferenceArrayKeys: ['participantStackIds', 'recordIds', 'sourceIds', 'sourceRecordIds'],
+  lineageReferenceKeys: ['sourceRelationshipId', 'sourceRecordId', 'sourceStackId'],
+  targetKindsByKey: {
+    stackId: ['stack'],
+    participantStackIds: ['stack'],
+    recordId: ['entity'],
+    recordIds: ['entity'],
+    sourceIds: ['entity'],
+    sourceRecordIds: ['entity'],
+  },
+});
 import { drawingCurveCubicPoint, drawingCurveCubicSegment } from './DrawingTools.js';
+import { createUuid } from './IdentitySystem.js';
 
 export const SWELL_DEFAULT_EXPRESSIONS = Object.freeze({
   swellEnabled: false,
@@ -59,7 +81,7 @@ export function swellDefinitionForEntity(entity, segmentIndex = null) {
 export function withSwellDefinition(entity, definition = SWELL_DEFAULT_EXPRESSIONS, segmentIndex = null) {
   const normalized = normalizeSwellDefinition(definition);
   const composite = clone(entity?.composite || {});
-  if (!composite.id) composite.id = `swell-${globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+  if (!composite.id) composite.id = createUuid();
   if (!composite.kind) composite.kind = `swell-${entity?.type || 'geometry'}`;
   if (Number.isInteger(segmentIndex)) {
     composite.swell = normalizeSwellDefinition(composite.swell || SWELL_DEFAULT_EXPRESSIONS);
@@ -80,11 +102,11 @@ function swellFilletSourceEndpoints(entity) {
     : [];
 }
 
-function evaluatedDefinition(definition, evaluateLength) {
+function evaluatedDefinition(definition, evaluateLength, context = null) {
   const errors = {};
   const evaluate = (key, expression) => {
     try {
-      const value = Number(evaluateLength(expression));
+      const value = Number(evaluateLength(expression, context || definition));
       if (!Number.isFinite(value)) throw new Error('Expression did not resolve to a finite length.');
       return value;
     } catch (error) {
@@ -194,7 +216,7 @@ function tangentArc(start, end, tangent, tangentAt = 'end') {
 
 function featurePiece(ownerId, segmentIndex, role, entity, ordinal) {
   return {
-    id: `swell-derived::${ownerId}::${segmentIndex ?? 'entity'}::${role}${ordinal ? `-${ordinal}` : ''}`,
+    id: deriveUuidForKey('swell-piece', ownerId, segmentIndex ?? 'entity', role, ordinal || 0),
     ownerId,
     segmentIndex,
     role,
@@ -776,9 +798,10 @@ function applyBoundaryMetadata(results, sourceEntities, cycles) {
     const compositeIds = new Set(cycle
       .map(({ entityId }) => byId.get(entityId)?.composite?.id)
       .filter(Boolean));
+    const memberIds = cycle.map(({ entityId }) => entityId).sort();
     const cycleId = compositeIds.size === 1
       ? String([...compositeIds][0])
-      : `swell-cycle:${cycle.map(({ entityId }) => entityId).sort().join('|')}`;
+      : deriveUuidForKey('swell-cycle', ...memberIds);
     cycle.forEach(({ entityId, reversed }, index) => {
       const result = results.get(entityId);
       if (!result) return;
@@ -824,7 +847,7 @@ export function deriveSwellGeometry({ entities = [], constraints = [], evaluateL
     .map((endpoint) => endpointKey(endpoint.recordId, endpoint.index)));
   const descriptors = sourceEntities.flatMap(lineSegmentsForEntity).map((segment) => {
     const definition = swellDefinitionForEntity(segment.entity, segment.segmentIndex);
-    const evaluated = evaluatedDefinition(definition, evaluateLength);
+    const evaluated = evaluatedDefinition(definition, evaluateLength, segment.entity);
     const orientation = lineNormal(segment, groups, cycleCenters);
     if (!orientation) return null;
     if (evaluated.direction < 0) orientation.normal = scale(orientation.normal, -1);
@@ -852,7 +875,7 @@ export function deriveSwellGeometry({ entities = [], constraints = [], evaluateL
   }).filter(Boolean);
   const arcDescriptors = sourceEntities.filter((entity) => entity.type === 'arc').map((entity) => {
     const definition = swellDefinitionForEntity(entity);
-    const evaluated = evaluatedDefinition(definition, evaluateLength);
+    const evaluated = evaluatedDefinition(definition, evaluateLength, entity);
     const offset = deriveRoundOrCurve(entity, definition, evaluated, {
       cycleCenter: cycleCenters.get(entity.id) || null,
     })[0];
@@ -875,7 +898,7 @@ export function deriveSwellGeometry({ entities = [], constraints = [], evaluateL
   sourceEntities.forEach((entity) => {
     if (results.has(entity.id)) return;
     const definition = swellDefinitionForEntity(entity);
-    const evaluated = evaluatedDefinition(definition, evaluateLength);
+    const evaluated = evaluatedDefinition(definition, evaluateLength, entity);
     const preparedArc = arcDescriptors.find(({ ownerId }) => ownerId === entity.id);
     const derived = preparedArc ? [preparedArc.offset] : deriveRoundOrCurve(entity, definition, evaluated, {
       cycleCenter: cycleCenters.get(entity.id) || null,
@@ -990,7 +1013,7 @@ export function swellBoundariesFromDerived(derived = new Map()) {
       kind: 'swell-derived',
       recordIds: ordered.map(({ ownerId }) => ownerId),
       appearanceSourceId: ordered[0]?.ownerId,
-      stackId: ordered[0]?.sourceEntity?.stackId || 'stack-default',
+      stackId: ordered[0]?.sourceEntity?.stackId || null,
       features,
       polygon,
       points: polygon,

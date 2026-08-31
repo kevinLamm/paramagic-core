@@ -1,5 +1,5 @@
 import { bindFloatingPanelDrag } from './CanvasUIControls.js';
-import { DEFAULT_CLASS_ID } from './ClassSystem.js';
+import { DEFAULT_CLASS_ROLE } from './ClassSystem.js';
 import { createImageCatalog, isImageFillReference } from './ImageSystem.js';
 import { catalogImageStrokeSizePatch } from './ImageStrokeSystem.js';
 import { bindDeferredColorPicker } from './GeometryAppearanceSystem.js';
@@ -53,7 +53,7 @@ export function classPropertiesModalMarkup(state, classId = state.activeClassId)
       <button type="button" class="panel-close-button class-properties-close" aria-label="Close Class Properties" title="Close">&times;</button>
     </div>
     <p class="properties-selection-status">${escapeHtml(selected.name)}</p>
-    <label class="property-row"><span>Name</span><input name="name" value="${escapeHtml(selected.name)}" autocomplete="off" spellcheck="false"${selected.id === DEFAULT_CLASS_ID ? ' disabled title="Class X cannot be renamed"' : ''} /></label>
+    <label class="property-row"><span>Name</span><input name="name" value="${escapeHtml(selected.name)}" autocomplete="off" spellcheck="false"${selected.systemRole === DEFAULT_CLASS_ROLE ? ' disabled title="Class X cannot be renamed"' : ''} /></label>
     <div class="property-row"><span>Fill Color</span><div class="property-inline property-color-controls"><input data-class-fill-color aria-label="Class fill color picker" type="color" value="${colorValue(properties.fillExpression, '#ffffff')}" /><button type="button" data-class-image-fill class="property-image-fill-button" aria-label="Choose class image fill" title="Choose image fill">${icons.image}</button><input name="fillExpression" aria-label="Class fill hex, expression, or image path" type="text" value="${escapeHtml(properties.fillExpression)}" spellcheck="false" /></div></div>
     <label class="property-row image-fill-property-row"${fillIsImage ? '' : ' hidden'}><span>Image Fill Mode</span><select name="fillImageMode"><option value="tile"${properties.fillImageMode === 'tile' || !properties.fillImageMode ? ' selected' : ''}>Tiled</option><option value="scale"${properties.fillImageMode === 'scale' ? ' selected' : ''}>Scale</option><option value="stretch"${properties.fillImageMode === 'stretch' ? ' selected' : ''}>Stretch</option></select></label>
     <label class="property-row image-fill-property-row"${fillIsImage ? '' : ' hidden'}><span>Image Fill Rotation Angle</span><input name="fillImageRotationAngle" type="number" step="1" value="${escapeHtml(properties.fillImageRotationAngle ?? 0)}" /></label>
@@ -70,7 +70,6 @@ export function classPropertiesModalMarkup(state, classId = state.activeClassId)
     <label class="property-row"><span>Font Name</span><select name="fontName">${['Arial', 'Helvetica', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Times New Roman', 'Georgia', 'Garamond', 'Courier New', 'Comic Sans MS', 'Impact', 'Lucida Console'].map((name) => `<option value="${name}"${properties.fontName === name ? ' selected' : ''}>${name}</option>`).join('')}</select></label>
     <label class="property-row"><span>Font Size</span><input name="fontSize" type="number" min="1" step="1" value="${escapeHtml(properties.fontSize)}" /></label>
     <label class="property-row"><span>Font Color</span><input name="fontColor" type="color" value="${colorValue(properties.fontColor, '#202020')}" /></label>
-    <label class="property-row text-checkbox-row"><span>Scale with Zoom</span><input data-class-scale-with-zoom type="checkbox"${properties.scaleWithZoom === false ? '' : ' checked'} /></label>
     <label class="property-row text-checkbox-row"><span>Multiline</span><input data-class-multiline type="checkbox"${properties.multiline === false ? '' : ' checked'} /></label>
     <div class="property-row"><span>Alignment</span><div class="text-alignment-options" role="group" aria-label="Class text alignment">
       <button type="button" data-class-text-align="left" aria-label="Left alignment" title="Left alignment" aria-pressed="${properties.textAlign === 'left'}" class="${properties.textAlign === 'left' ? 'active' : ''}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 10h10M4 14h16M4 18h12"/></svg></button>
@@ -137,7 +136,7 @@ export function createClassTools({
       options.push(option);
     });
     target.replaceChildren(...options);
-    target.value = mixed ? '' : selectedId || DEFAULT_CLASS_ID;
+    target.value = mixed ? '' : selectedId || state.classes[0]?.id || '';
     target.disabled = disabled;
   }
 
@@ -277,9 +276,6 @@ export function createClassTools({
     content.querySelector('[data-class-visible]').addEventListener('change', (event) => {
       visibleExpression.value = event.currentTarget.checked ? 'TRUE' : 'FALSE';
       canvas.updateClassProperties(classId, { visibleExpression: visibleExpression.value });
-    });
-    content.querySelector('[data-class-scale-with-zoom]').addEventListener('change', (event) => {
-      canvas.updateClassProperties(classId, { scaleWithZoom: event.currentTarget.checked });
     });
     content.querySelector('[data-class-multiline]').addEventListener('change', (event) => {
       canvas.updateClassProperties(classId, { multiline: event.currentTarget.checked });

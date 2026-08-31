@@ -71,7 +71,7 @@ function solvableComponents(graph) {
 function componentScope(component) {
   return {
     ...component,
-    componentIds: new Set([component.id]),
+    componentKeys: new Set([component.componentKey]),
   };
 }
 
@@ -105,11 +105,15 @@ function translationGaugeVariables(model) {
     && (constraint.type === 'Fixed' || referencesCanvasOrigin(constraint))
   ))) return [];
 
-  const byId = new Map(variables.map((variable) => [variable.id, variable]));
+  const byOwnerAndParameter = new Map(variables.map((variable) => [
+    `${variable.ownerId}\u0000${variable.parameterKey}`,
+    variable,
+  ]));
   for (const variable of variablesInEntityCreationOrder(model, variables)) {
-    if (!variable.active || !variable.id.endsWith('.x')) continue;
-    const paired = byId.get(`${variable.id.slice(0, -2)}.y`);
-    if (paired?.active && paired.owner === variable.owner) return [variable, paired];
+    if (!variable.active || !String(variable.parameterKey || '').endsWith('.x')) continue;
+    const pairedKey = `${String(variable.parameterKey).slice(0, -2)}.y`;
+    const paired = byOwnerAndParameter.get(`${variable.ownerId}\u0000${pairedKey}`);
+    if (paired?.active && paired.ownerId === variable.ownerId) return [variable, paired];
   }
   return [];
 }
@@ -206,7 +210,8 @@ export function solveConstraintComponents({
     rejectedSteps += Number(result.rejectedSteps) || 0;
     (result.changedEntityIds || []).forEach((id) => changedEntityIds.add(id));
     (result.problematicConstraintIds || []).forEach((id) => problematicConstraintIds.add(id));
-    if (!isSuccessfulSolve(result)) {
+    const acceptedInteractiveResult = solveMode === 'interactive' && result.status === 'preview';
+    if (!isSuccessfulSolve(result) && !acceptedInteractiveResult) {
       failedResult = result;
       break;
     }
@@ -244,12 +249,17 @@ export function solveConstraintComponents({
     };
   }
 
+  const previewResult = componentResults.find((result) => result.status === 'preview');
+  const preview = Boolean(previewResult);
   const converged = componentResults.some((result) => result.status === 'converged');
   return {
+    ...(previewResult || {}),
     ...common,
-    status: converged ? 'converged' : 'unchanged',
+    status: preview ? 'preview' : converged ? 'converged' : 'unchanged',
     changedEntityIds: [...changedEntityIds],
     problematicConstraintIds: [],
-    message: converged ? 'Constraint components converged.' : 'Constraints already satisfied.',
+    message: preview
+      ? 'Constraint components reached the interactive solve budget.'
+      : converged ? 'Constraint components converged.' : 'Constraints already satisfied.',
   };
 }

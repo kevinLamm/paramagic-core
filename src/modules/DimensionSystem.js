@@ -1,9 +1,11 @@
 import { formatUnitlessValue } from './solver/Units.js';
 import { rememberRepeatableTool } from './CanvasUIControls.js';
-import { CANVAS_ORIGIN_RECORD_ID } from './CanvasOrigin.js';
+import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from './ArcGeometry.js';
 
 // --- Dimension Feature Geometry ---
+const dimensionPresentationRecords = new WeakMap();
+
 const pointDistanceMath = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
 function distanceToSegmentMath(point, start, end) {
@@ -436,23 +438,59 @@ export function dimensionMode(entity) {
   return entity.dimensionMode || (entity.text?.toLowerCase().includes('driven') ? 'driven' : 'driving');
 }
 
+export function dimensionIncludedInValueOnly(entity) {
+  const hasDrivingPreference = entity?.dimensionMode === 'driving'
+    || (!entity?.dimensionMode && Object.hasOwn(entity || {}, 'includeInValueOnly'));
+  if (hasDrivingPreference) return entity?.includeInValueOnly === true;
+  return entity?.excludeFromExport !== true;
+}
+
 export function dimensionExcludedFromExport(entity) {
-  return dimensionMode(entity) === 'driven' && entity?.excludeFromExport === true;
+  return !dimensionIncludedInValueOnly(entity);
 }
 
 export function dimensionHiddenInTextMode(entity, textMode = 'named-value') {
   if (textMode !== 'value') return false;
-  return dimensionMode(entity) === 'driving' || dimensionExcludedFromExport(entity);
+  return !dimensionIncludedInValueOnly(entity);
 }
 
-export function createDrivenDimensionExportPersistence({ solver, onChange } = {}) {
+export function dimensionTextEditable(entity, textMode = 'named-value') {
+  return dimensionMode(entity) === 'driving' && textMode !== 'value';
+}
+
+export const DRIVEN_DIMENSION_PRESENTATION_COLOR = '#06402B';
+
+export function applyValueOnlyExportDimensionAppearance(root, {
+  color = DRIVEN_DIMENSION_PRESENTATION_COLOR,
+} = {}) {
+  const groups = [...(root?.querySelectorAll?.(
+    '.dimension-record.dimension-driven, .dimension-record.dimension-driving',
+  ) || [])];
+  groups.forEach((group) => {
+    group.querySelectorAll?.('.dimension-path, .dimension-extension, .dimension-arrow')
+      .forEach((node) => node.style?.setProperty?.('stroke', color));
+    group.querySelectorAll?.('.dimension-arrow, .dimension-text')
+      .forEach((node) => node.style?.setProperty?.('fill', color));
+  });
+  return root;
+}
+
+export function setDimensionIncludedInValueOnly(entity, included) {
+  if (dimensionMode(entity) === 'driving') entity.includeInValueOnly = Boolean(included);
+  else entity.excludeFromExport = !included;
+  return entity;
+}
+
+export function createDimensionValueOnlyPersistence({ solver, onChange } = {}) {
   return (entity) => {
-    if (!entity?.dimensionId || dimensionMode(entity) !== 'driven') return false;
+    if (!entity?.dimensionId) return false;
     const updated = solver?.updateDimensionAnnotation?.(entity.dimensionId, entity);
     if (updated) onChange?.(entity);
     return Boolean(updated);
   };
 }
+
+export const createDrivenDimensionExportPersistence = createDimensionValueOnlyPersistence;
 
 export function uprightDimensionControlPoint(point, textTransform = '') {
   const result = [Number(point?.[0]) || 0, Number(point?.[1]) || 0];
@@ -489,7 +527,7 @@ export function updateDimensionNode(record, scale) {
   if (record.text) {
     const textSize = 14 / safeScale;
     record.text.setAttribute('font-size', textSize);
-    record.text.style.fontSize = `${textSize}px`;
+    if (record.text.style) record.text.style.fontSize = `${textSize}px`;
   }
   if (entity.text) entity.text = dimensionDisplayText(entity, entity.text);
   if (record.text && entity.text) record.text.textContent = entity.text;
@@ -498,7 +536,7 @@ export function updateDimensionNode(record, scale) {
     record.extensionA.setAttribute('d', `M ${layout.extensionA.start[0]} ${layout.extensionA.start[1]} L ${layout.extensionA.end[0]} ${layout.extensionA.end[1]}`);
     record.extensionB.setAttribute('d', `M ${layout.extensionB.start[0]} ${layout.extensionB.start[1]} L ${layout.extensionB.end[0]} ${layout.extensionB.end[1]}`);
     record.path.setAttribute('d', `M ${layout.dimensionStart[0]} ${layout.dimensionStart[1]} L ${layout.dimensionEnd[0]} ${layout.dimensionEnd[1]}`);
-    record.pathHit.setAttribute('d', record.path.getAttribute('d'));
+    record.pathHit?.setAttribute('d', record.path.getAttribute('d'));
     record.arrowA.setAttribute('d', layout.arrowA);
     record.arrowB.setAttribute('d', layout.arrowB);
     record.text.setAttribute('x', layout.textPoint[0]);
@@ -512,7 +550,7 @@ export function updateDimensionNode(record, scale) {
     entity.target = layout.target;
     entity.label = layout.label;
     record.path.setAttribute('d', layout.leaderPath);
-    record.pathHit.setAttribute('d', layout.leaderPath);
+    record.pathHit?.setAttribute('d', layout.leaderPath);
     record.arrowA.setAttribute('d', layout.arrowA);
     record.arrowB?.setAttribute('d', layout.arrowB);
     record.text.setAttribute('x', layout.label[0]);
@@ -526,7 +564,7 @@ export function updateDimensionNode(record, scale) {
     record.extensionA.setAttribute('d', `M ${layout.extensionA.start[0]} ${layout.extensionA.start[1]} L ${layout.extensionA.end[0]} ${layout.extensionA.end[1]}`);
     record.extensionB.setAttribute('d', `M ${layout.extensionB.start[0]} ${layout.extensionB.start[1]} L ${layout.extensionB.end[0]} ${layout.extensionB.end[1]}`);
     record.path.setAttribute('d', layout.arcPath);
-    record.pathHit.setAttribute('d', layout.arcPath);
+    record.pathHit?.setAttribute('d', layout.arcPath);
     record.arrowA.setAttribute('d', layout.arrowA);
     record.arrowB.setAttribute('d', layout.arrowB);
     record.text.setAttribute('x', layout.textPoint[0]);
@@ -543,7 +581,7 @@ export function updateDimensionNode(record, scale) {
     const layout = mclDimensionLayout(entity, scale);
     entity.label = layout.label;
     record.path.setAttribute('d', layout.leaderPath);
-    record.pathHit.setAttribute('d', layout.leaderPath);
+    record.pathHit?.setAttribute('d', layout.leaderPath);
     record.arrowA.setAttribute('d', layout.arrow);
     record.text.setAttribute('x', layout.label[0]);
     record.text.setAttribute('y', layout.label[1]);
@@ -571,17 +609,21 @@ export function updateDimensionNode(record, scale) {
   }
   if (record.exportToggle) {
     const excluded = dimensionExcludedFromExport(entity);
+    const included = !excluded;
+    const mode = dimensionMode(entity);
     record.group.classList.toggle('dimension-export-excluded', excluded);
-    record.exportToggle.setAttribute('aria-pressed', String(excluded));
+    record.exportToggle.setAttribute('aria-pressed', String(included));
     record.exportToggle.setAttribute(
       'aria-label',
-      excluded
-        ? 'Include driven dimension in exports and thumbnails'
-        : 'Exclude driven dimension from exports and thumbnails',
+      included
+        ? `Hide ${mode} dimension from Value Only view, exports, and thumbnails`
+        : `Show ${mode} dimension in Value Only view, exports, and thumbnails`,
     );
     record.exportToggle.setAttribute(
       'data-tooltip',
-      excluded ? 'Include in exports and thumbnails' : 'Exclude from exports and thumbnails',
+      included
+        ? 'Hide from Value Only view, exports, and thumbnails'
+        : 'Show in Value Only view, exports, and thumbnails',
     );
     try {
       const box = record.text.getBBox();
@@ -604,6 +646,65 @@ export function updateDimensionNode(record, scale) {
       );
     }
   }
+}
+
+function cloneDimensionPresentationEntity(entity) {
+  try {
+    return structuredClone(entity);
+  } catch {
+    return JSON.parse(JSON.stringify(entity));
+  }
+}
+
+export function prepareDimensionPresentationClone(sourceGroup, cloneGroup, recordOverride = null) {
+  const sourceRecord = recordOverride || dimensionPresentationRecords.get(sourceGroup);
+  if (!sourceRecord || !cloneGroup?.querySelector) return cloneGroup;
+  const entity = cloneDimensionPresentationEntity(sourceRecord.entity);
+  if (entity.dimensionId) cloneGroup.setAttribute('data-dimension-id', entity.dimensionId);
+  const text = cloneGroup.querySelector('.dimension-text');
+  if (text) entity.text = text.textContent || '';
+  entity.managedDimensionText = true;
+  const extensions = [...cloneGroup.querySelectorAll('.dimension-extension:not(.hit-target)')];
+  const arrows = [...cloneGroup.querySelectorAll('.dimension-arrow')];
+  dimensionPresentationRecords.set(cloneGroup, {
+    entity,
+    group: cloneGroup,
+    path: cloneGroup.querySelector('.dimension-path:not(.hit-target)'),
+    pathHit: null,
+    extensionA: extensions[0] || null,
+    extensionB: extensions[1] || null,
+    arrowA: arrows[0] || null,
+    arrowB: arrows[1] || null,
+    text,
+    textHit: null,
+    exportToggle: null,
+  });
+  return cloneGroup;
+}
+
+export function setDimensionPresentationText(group, value) {
+  const record = dimensionPresentationRecords.get(group);
+  const text = String(value ?? '');
+  if (!record) {
+    const textNode = group?.querySelector?.('.dimension-text');
+    if (textNode) textNode.textContent = text;
+    return Boolean(textNode);
+  }
+  record.entity.text = text;
+  record.entity.managedDimensionText = true;
+  if (record.text) record.text.textContent = text;
+  return true;
+}
+
+export function updateDimensionPresentationScale(root, scale) {
+  if (!root) return 0;
+  const groups = [root, ...(root.querySelectorAll?.('.dimension-record') || [])];
+  return groups.reduce((count, group) => {
+    const record = dimensionPresentationRecords.get(group);
+    if (!record) return count;
+    updateDimensionNode(record, scale);
+    return count + 1;
+  }, 0);
 }
 
 export function createDimensionRecord({
@@ -654,12 +755,12 @@ export function createDimensionRecord({
   text.textContent = entity.text;
   const textHit = add(group, 'rect', { class: 'dimension-text-hit selectable-entity hit-target' });
   let exportToggle = null;
-  if (dimensionMode(entity) === 'driven' && onToggleExport) {
+  if (onToggleExport) {
     exportToggle = add(group, 'g', {
       class: 'driven-dimension-export-toggle',
       role: 'button',
       tabindex: '0',
-      'aria-pressed': String(dimensionExcludedFromExport(entity)),
+      'aria-pressed': String(dimensionIncludedInValueOnly(entity)),
     });
     add(exportToggle, 'circle', { class: 'driven-dimension-export-toggle-circle', cx: 0, cy: 0, r: 10 });
     add(exportToggle, 'path', { class: 'driven-dimension-export-toggle-eye', d: 'M -6 0 Q 0 -5 6 0 Q 0 5 -6 0 Z M -2 0 A 2 2 0 1 0 2 0 A 2 2 0 1 0 -2 0' });
@@ -667,13 +768,21 @@ export function createDimensionRecord({
   }
   const handleGroup = add(group, 'g', { class: 'handle-group' });
   const record = { id: group.dataset.recordId, recordType: 'dimension', entity, group, node: path || text, path, pathHit, extensionA, extensionB, arrowA, arrowB, text, textHit, exportToggle, handleGroup, handles: [] };
+  dimensionPresentationRecords.set(group, record);
   const toggleExport = (event) => {
     event.preventDefault();
     event.stopPropagation();
-    entity.excludeFromExport = !dimensionExcludedFromExport(entity);
+    const previousIncludeInValueOnly = entity.includeInValueOnly;
+    const hadIncludeInValueOnly = Object.hasOwn(entity, 'includeInValueOnly');
+    const previousExcludeFromExport = entity.excludeFromExport;
+    const hadExcludeFromExport = Object.hasOwn(entity, 'excludeFromExport');
+    setDimensionIncludedInValueOnly(entity, !dimensionIncludedInValueOnly(entity));
     updateDimensionNode(record, record.scale || scale);
     if (onToggleExport?.(entity) === false) {
-      entity.excludeFromExport = !entity.excludeFromExport;
+      if (hadIncludeInValueOnly) entity.includeInValueOnly = previousIncludeInValueOnly;
+      else delete entity.includeInValueOnly;
+      if (hadExcludeFromExport) entity.excludeFromExport = previousExcludeFromExport;
+      else delete entity.excludeFromExport;
       updateDimensionNode(record, record.scale || scale);
     }
   };
@@ -735,7 +844,7 @@ export function dimensionAnchorRecordIds(entity) {
   const ids = new Set();
   const visit = (value) => {
     if (!value || typeof value !== 'object') return;
-    if (value.recordId && value.recordId !== CANVAS_ORIGIN_RECORD_ID) ids.add(value.recordId);
+    if (value.recordId && !isCanvasOriginReference(value)) ids.add(value.recordId);
     Object.values(value).forEach(visit);
   };
   visit(entity.anchors);
@@ -1032,7 +1141,7 @@ export function createDimensionLinkManager({
 
   function resolveAnchor(anchor, { rendered = false } = {}) {
     if (!anchor) return null;
-    if (anchor.recordId === CANVAS_ORIGIN_RECORD_ID) return [0, 0];
+    if (isCanvasOriginReference(anchor)) return [0, 0];
     const record = recordById(anchor.recordId, { includeFillets: true });
     if (!record) {
       const derived = resolveDerivedFeature(anchor);
@@ -1284,14 +1393,23 @@ const unitSmart = (point, fallback = [1, 0]) => {
 const formatDrawingLengthSmart = (value, drawingUnit) => formatUnitlessValue(value, drawingUnit || 'in');
 
 function pointAnchor(feature) {
-  return feature?.kind === 'point'
-    ? {
+  if (feature?.kind !== 'point') return null;
+  if (isCanvasOriginReference(feature)) {
+    return {
       type: 'point',
-      recordId: feature.recordId,
-      index: feature.index,
-      ...(feature.pointRole ? { pointRole: feature.pointRole } : {}),
-    }
-    : null;
+      kind: 'point',
+      referenceRole: feature.referenceRole,
+      entityType: 'canvas-origin',
+      pointRole: feature.pointRole || 'origin',
+      index: 0,
+    };
+  }
+  return {
+    type: 'point',
+    recordId: feature.recordId,
+    index: feature.index,
+    ...(feature.pointRole ? { pointRole: feature.pointRole } : {}),
+  };
 }
 
 function segmentEndpointAnchors(feature) {
@@ -1612,7 +1730,7 @@ function linkedPositionAxis(start, end, pointer) {
 
 function isOrdinaryGeometryPoint(feature) {
   return feature?.kind === 'point'
-    && feature.recordId !== CANVAS_ORIGIN_RECORD_ID
+    && !isCanvasOriginReference(feature)
     && !feature.linkedCopyId
     && !['control', 'notch', 'table', 'text'].includes(feature.entityType);
 }

@@ -43,14 +43,15 @@ export class ConstraintRegistry {
         columnByVariableId,
       );
       blocks.push({
-        id: `intrinsic:${binding.id}`,
+        runtimeKey: `intrinsic:${binding.id}`,
         type: 'Intrinsic',
         constraintId: null,
         variables: blockVariables,
         variableIds: blockVariables.map((variable) => variable.id),
         columnIndexes: blockVariables.map((variable) => columnByVariableId.get(variable.id)),
         equations: Array.from({ length: residualCount }, (_, offset) => ({
-          constraintId: `intrinsic-${intrinsicEquationIndex + offset}`,
+          constraintId: null,
+          runtimeConstraintKey: `intrinsic-${intrinsicEquationIndex + offset}`,
           equationIndex: intrinsicEquationIndex + offset,
         })),
         evaluateResiduals: () => binding.intrinsicResiduals(),
@@ -73,7 +74,7 @@ export class ConstraintRegistry {
       if (residualCount === 0) continue;
       const analyticalJacobian = analyticalJacobianImplementations[constraint.type];
       blocks.push({
-        id: `constraint:${constraint.id}`,
+        runtimeKey: `constraint:${constraint.id}`,
         type: constraint.type,
         constraintId: constraint.id,
         constraint,
@@ -100,7 +101,7 @@ export class ConstraintRegistry {
     const intrinsic = model.intrinsicResiduals();
     intrinsic.forEach((value, index) => {
       values.push(value);
-      equations.push({ constraintId: `intrinsic-${index}`, equationIndex: index });
+      equations.push({ constraintId: null, runtimeConstraintKey: `intrinsic-${index}`, equationIndex: index });
     });
     for (const constraint of model.constraints.values()) {
       if (constraint.enabled === false) continue;

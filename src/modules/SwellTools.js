@@ -11,6 +11,7 @@ import {
 import { nearestDimensionFeature, resolveDimensionFeatureSet } from './DimensionSystem.js';
 import { inwardTargetFromBoundary, projectPointToNotchFeature } from './NotchSystem.js';
 import { bindFloatingPanelDrag } from './CanvasUIControls.js';
+import { createUuid } from './IdentitySystem.js';
 
 export const SWELL_ICON = '<path d="M4 16h4c2.5 0 2.5-8 5-8h7"/><path d="M4 20h5c3.5 0 3.5-8 7-8h4"/>';
 
@@ -345,7 +346,7 @@ export function swellExternalConstraintRequest(type, features = [], request = {}
   if (!movableRef) return null;
   return {
     ...clone(request),
-    id: String(request.id || `swell-constraint-${globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`),
+    id: String(request.id || createUuid()),
     externalTarget: {
       type: 'swell-derived',
       derivedRef: { kind: derived.kind, recordId: derived.recordId, index: derived.index },
@@ -465,7 +466,10 @@ export function createSwellTools({
   }
 
   function syncGroupPresentation(group, ownerId) {
-    group.classList.toggle('stack-inactive', canvas.isRecordInActiveStack?.(ownerId) === false);
+    group.classList.toggle(
+      'stack-inactive',
+      Boolean(canvas.getActiveStackId?.()) && canvas.isRecordInActiveStack?.(ownerId) === false,
+    );
     group.classList.toggle('object-visibility-hidden', canvas.isObjectVisible?.(ownerId) === false);
     group.hidden = canvas.isRecordVisible?.(ownerId) === false;
   }
@@ -495,7 +499,7 @@ export function createSwellTools({
       class: 'canvas-record swell-derived-group',
       'data-record-id': result.ownerId,
       'data-swell-owner-id': result.ownerId,
-      'data-stack-id': canvas.getRecordStackId?.(result.ownerId) || 'stack-default',
+      'data-stack-id': canvas.getRecordStackId?.(result.ownerId) || '',
       'data-paint-derived': 'true',
       'data-paint-after-record-id': result.ownerId,
     });
@@ -528,7 +532,7 @@ export function createSwellTools({
       class: 'handle-group canvas-handle-group swell-derived-handle-group',
       'data-record-id': result.ownerId,
       'data-swell-owner-id': result.ownerId,
-      'data-stack-id': canvas.getRecordStackId?.(result.ownerId) || 'stack-default',
+      'data-stack-id': canvas.getRecordStackId?.(result.ownerId) || '',
     });
     syncGroupPresentation(handleGroup, result.ownerId);
     const seenHandles = new Set();
@@ -548,13 +552,13 @@ export function createSwellTools({
     });
     const handlePointerDown = (event) => {
       if (canvas.getSmartDimensionMode?.() || event.button !== 0) return;
+      const target = event.target.closest?.('[data-swell-source-id]');
+      if (!target || canvas.isRecordInActiveStack?.(target.dataset.swellSourceId) !== true) return;
       canvas.setBoundaryPropertyFeatureFromEvent?.(event);
       if (event.ctrlKey || event.metaKey) {
         event.stopPropagation();
         return;
       }
-      const target = event.target.closest?.('[data-swell-source-id]');
-      if (!target) return;
       const segmentIndex = Number(target.dataset.swellSegmentIndex);
       if (
         Number.isInteger(segmentIndex)
@@ -568,6 +572,7 @@ export function createSwellTools({
       if (canvas.getSmartDimensionMode?.()) return;
       const target = event.target.closest?.('[data-swell-source-id]');
       if (!target) return;
+      if (canvas.isRecordInActiveStack?.(target.dataset.swellSourceId) !== true) return;
       event.preventDefault();
       event.stopPropagation();
       if (!(event.ctrlKey || event.metaKey)) return;
@@ -597,7 +602,7 @@ export function createSwellTools({
         'data-boundary-id': boundary.id,
         'data-swell-owner-ids': boundary.recordIds.join(','),
         'data-selection-record-ids': boundary.recordIds.join(','),
-        'data-stack-id': canvas.getRecordStackId?.(ownerId) || 'stack-default',
+        'data-stack-id': canvas.getRecordStackId?.(ownerId) || '',
       });
       syncGroupPresentation(group, ownerId);
       const node = createSvg('path', { d: path, class: 'entity closed-entity selectable-entity swell-derived-fill' });
@@ -606,6 +611,7 @@ export function createSwellTools({
       const ownerIds = [...boundary.recordIds];
       group.addEventListener('pointerdown', (event) => {
         if (canvas.getSmartDimensionMode?.() || event.button !== 0) return;
+        if (!ownerIds.every((id) => canvas.isRecordInActiveStack?.(id) === true)) return;
         canvas.setBoundaryPropertyFeatureFromEvent?.(event);
         if (canvas.startRecordSetDrag?.(event, ownerIds, { preservePropertyFeature: true })) return;
         event.preventDefault();
@@ -613,6 +619,7 @@ export function createSwellTools({
       });
       group.addEventListener('click', (event) => {
         if (canvas.getSmartDimensionMode?.()) return;
+        if (!ownerIds.every((id) => canvas.isRecordInActiveStack?.(id) === true)) return;
         event.preventDefault();
         event.stopPropagation();
         canvas.selectRecords?.(ownerIds);
@@ -649,6 +656,7 @@ export function createSwellTools({
     let changed = false;
     try {
       externalConstraints = externalConstraints.filter((constraint) => {
+        if (canvas.isStackRelationshipAvailable?.(constraint) === false) return true;
         const valid = Boolean(derivedDimensionProvider.resolveFeature(constraint.externalTarget?.derivedRef));
         if (valid) changed = applyExternalConstraint(constraint) || changed;
         return valid;
@@ -780,7 +788,18 @@ export function createSwellTools({
   const constraintOperation = {
     applyConstraint({ type, features, request }) {
       if (!features.some((feature) => feature?.swellDerived)) return undefined;
-      const constraint = swellExternalConstraintRequest(type, features, request);
+      const stackId = request.stackId || canvas.getActiveStackId?.() || null;
+      const participantStackIds = [...new Set([
+        ...(request.participantStackIds || []),
+        ...features.map((feature) => canvas.getRecordStackId?.(
+          feature?.swellDerived ? feature.swellSourceId : feature?.recordId,
+        )),
+      ].filter(Boolean))].filter((id) => id !== stackId);
+      const constraint = swellExternalConstraintRequest(type, features, {
+        ...request,
+        stackId,
+        participantStackIds,
+      });
       if (!constraint) return { constraint: null };
       canvas.requestHistoryCheckpoint?.('add-swell-constraint');
       externalConstraints.push(constraint);
@@ -797,6 +816,7 @@ export function createSwellTools({
         || changedRecordIds?.has(constraint.externalTarget?.movableRef?.recordId));
     },
     isConstraintVisible(constraint) {
+      if (canvas.isStackRelationshipAvailable?.(constraint) === false) return false;
       const sourceId = constraint.externalTarget?.sourceId;
       return canvas.isRecordVisible?.(sourceId) !== false
         && canvas.isRecordInActiveStack?.(sourceId) !== false
@@ -808,6 +828,22 @@ export function createSwellTools({
       canvas.requestHistoryCheckpoint?.('delete-swell-constraint');
       externalConstraints.splice(index, 1);
       return true;
+    },
+    removeStackReferences(stackId, recordIds = []) {
+      const removedRecordIds = new Set(recordIds.map(String));
+      const referencesRemovedRecord = (value, visited = new Set()) => {
+        if (typeof value === 'string') return removedRecordIds.has(value);
+        if (!value || typeof value !== 'object' || visited.has(value)) return false;
+        visited.add(value);
+        return Object.values(value).some((item) => referencesRemovedRecord(item, visited));
+      };
+      const before = externalConstraints.length;
+      externalConstraints = externalConstraints.filter((constraint) => (
+        constraint.stackId !== stackId
+        && !constraint.participantStackIds?.includes(stackId)
+        && !referencesRemovedRecord(constraint)
+      ));
+      return externalConstraints.length !== before;
     },
   };
 
@@ -871,6 +907,7 @@ export function createSwellTools({
       externalConstraints = Array.isArray(value?.constraints) ? value.constraints.map(clone) : [];
       render();
     },
+    removeStackReferences: constraintOperation.removeStackReferences,
     clear() {
       externalConstraints = [];
       removeRenderedGroups();
@@ -904,7 +941,7 @@ export function createSwellTools({
       input.addEventListener('focus', () => {
         const entries = [
           ...(canvas.getDocumentVariables?.() || []),
-          ...(canvas.getParameters?.() || []),
+          ...(canvas.getParameterExpressionSymbols?.(selectionTargets()[0]?.entity) || canvas.getParameters?.() || []),
         ];
         const names = [...new Set(entries.map(({ name }) => name).filter(Boolean))];
         expressionNames.replaceChildren(...names.map((name) => {
@@ -1001,5 +1038,6 @@ export function createSwellTools({
     constraintOperation,
     selectionPropertyProvider,
     updateSelectedDefinitions,
+    removeStackReferences: constraintOperation.removeStackReferences,
   };
 }

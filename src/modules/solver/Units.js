@@ -14,6 +14,13 @@ export function formatUnitlessValue(value, unit = null, precision = 3) {
   return String(rounded);
 }
 
+export function formatParameterFieldValue(entry, drawingUnit = null, precision = 3) {
+  const unit = entry?.kind === 'control' || entry?.usesDrawingUnit === false
+    ? null
+    : drawingUnit;
+  return formatUnitlessValue(entry?.value, unit, precision);
+}
+
 export function unitDisplaySymbol(unit = null) {
   if (unit === 'in') return '"';
   if (unit === 'ft') return "'";
@@ -21,18 +28,35 @@ export function unitDisplaySymbol(unit = null) {
   return unit || '';
 }
 
-function formatDrivenDimensionNumber(value, unit = null, precision = 3) {
+function formatDxfDimensionNumber(value, unit = null, precision = 3) {
   const converted = valueInUnit(value, unit);
   if (unit === 'in') {
-    const twoDecimalValue = Number(converted.toFixed(2));
-    return String(Number((Math.round(twoDecimalValue * 4) / 4).toFixed(2)));
+    const rounded = Math.round((converted + Number.EPSILON) * 32) / 32;
+    return String(Number(rounded.toFixed(5)));
   }
   if (unit === 'mm') return String(Number(converted.toFixed(0)));
   return formatUnitlessValue(value, unit, precision);
 }
 
-export function formatDrivenDimensionValue(value, unit = null, precision = 3) {
-  const numeric = formatDrivenDimensionNumber(value, unit, precision);
+export function formatDxfDimensionValue(value, unit = null, precision = 3) {
+  const numeric = formatDxfDimensionNumber(value, unit, precision);
+  const symbol = unitDisplaySymbol(unit);
+  if (!symbol) return numeric;
+  return unit === 'in' || unit === 'ft' || unit === 'deg' ? `${numeric}${symbol}` : `${numeric} ${symbol}`;
+}
+
+function formatValueOnlyDimensionNumber(value, unit = null, precision = 3) {
+  const converted = valueInUnit(value, unit);
+  if (unit === 'in') {
+    const rounded = Math.round((converted + Number.EPSILON) * 8) / 8;
+    return String(Number(rounded.toFixed(3)));
+  }
+  if (unit === 'mm') return String(Number(converted.toFixed(0)));
+  return formatUnitlessValue(value, unit, precision);
+}
+
+export function formatValueOnlyDimensionValue(value, unit = null, precision = 3) {
+  const numeric = formatValueOnlyDimensionNumber(value, unit, precision);
   const symbol = unitDisplaySymbol(unit);
   if (!symbol) return numeric;
   return unit === 'in' || unit === 'ft' || unit === 'deg' ? `${numeric}${symbol}` : `${numeric} ${symbol}`;

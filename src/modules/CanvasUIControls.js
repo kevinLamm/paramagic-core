@@ -1,4 +1,13 @@
-import { createStableId } from './solver/SolverModel.js';
+import { createUuid } from './IdentitySystem.js';
+import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+
+registerIdentitySchema('controls', {
+  declarations: (value) => (value?.items || []).map((object, index) => ({
+    object, key: 'id', value: object.id, path: ['extensions', 'controls', 'items', String(index), 'id'], kind: 'control-item',
+  })),
+  liveReferenceKeys: ['parameterId'],
+  targetKindsByKey: { parameterId: ['parameter'] },
+});
 
 // --- Floating Panel Positioning & Drag Utilities ---
 const FLOATING_PANEL_MIN_TOP_PROPERTY = '--floating-panel-min-top';
@@ -421,7 +430,7 @@ export function clearRepeatableTool() {
 
 // --- Parameter Control Widgets & UI Panel ---
 const clone = (value) => JSON.parse(JSON.stringify(value));
-export const CONTROL_EXTENSION_VERSION = 1;
+export const CONTROL_EXTENSION_VERSION = 2;
 
 export const controlToolTypes = Object.freeze([
   'Slider Control',
@@ -464,6 +473,8 @@ const icons = Object.freeze({
   edit: '<path d="M5 19l3.5-.7L18 8.8 15.2 6 5.7 15.5zM13.8 7.4l2.8 2.8"/>',
   remove: '<path d="M5 7h14M9 7V4h6v3m-8 0l1 13h8l1-13M10 10v7m4-7v7"/>',
   drag: '<path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/>',
+  visible: '<path d="M2.5 12c2.5-4 6-6 9.5-6s7 2 9.5 6c-2.5 4-6 6-9.5 6s-7-2-9.5-6z"/><circle cx="12" cy="12" r="2.5"/>',
+  hidden: '<path d="M4 4l16 16M9.2 6.5A10.7 10.7 0 0112 6c6 0 9.5 6 9.5 6a15 15 0 01-2.4 3.1M6.4 8.1C3.9 9.8 2.5 12 2.5 12s3.5 6 9.5 6a10 10 0 003-.5"/>',
 });
 
 function svgIcon(name) {
@@ -539,7 +550,7 @@ export function parseControlArrayExpression(expression) {
 export function normalizeControlItem(input = {}) {
   const controlType = controlTypeKey(input.controlType);
   return {
-    id: String(input.id || createStableId('panel-control')),
+    id: String(input.id || createUuid()),
     controlType,
     label: String(input.label ?? ''),
     configurationExpression: String(
@@ -548,6 +559,7 @@ export function normalizeControlItem(input = {}) {
       ?? defaultExpressions[controlType],
     ),
     selectedIndex: Math.max(0, Math.round(Number(input.selectedIndex) || 0)),
+    visible: input.visible !== false,
     parameterId: String(input.parameterId || ''),
     parameterName: String(input.parameterName || ''),
   };
@@ -785,6 +797,14 @@ export function createControlPanelModel({
     return true;
   }
 
+  function setItemVisible(id, visible) {
+    const item = get(id);
+    if (!item) return false;
+    item.visible = Boolean(visible);
+    emit('visibility');
+    return true;
+  }
+
   function setConfigurationExpression(id, expression) {
     const item = get(id);
     if (!item) return null;
@@ -888,6 +908,7 @@ export function createControlPanelModel({
     remove,
     reorder,
     setLabel,
+    setItemVisible,
     setConfigurationExpression,
     setValue,
     previewValue,
@@ -946,15 +967,15 @@ export function controlRowMarkup(item, state, editing) {
         ? `<input class="panel-control-label-input" data-control-label value="${escapeHtml(item.label)}" placeholder="Control label" aria-label="${escapeHtml(item.parameterName)} label" />`
         : `<span class="panel-control-label">${escapeHtml(item.label)}</span>`}
       <span class="panel-control-parameter">${escapeHtml(item.parameterName)}</span>
+      ${editing ? `<button type="button" class="panel-control-visibility" data-control-visibility aria-pressed="${item.visible}" title="${item.visible ? 'Hide control in regular view' : 'Show control in regular view'}" aria-label="${item.visible ? 'Hide' : 'Show'} ${escapeHtml(item.parameterName)} in regular view">${svgIcon(item.visible ? 'visible' : 'hidden')}</button>` : ''}
       ${editing ? `<button type="button" class="panel-control-remove" data-control-remove title="Remove control" aria-label="Remove ${escapeHtml(item.parameterName)}">${svgIcon('remove')}</button>` : ''}
     </div>
     <div class="panel-control-runtime">${controlRuntimeMarkup(item, state)}</div>
     ${editing ? `<label class="panel-control-expression">
       <span>Expression</span>
-      <input data-control-expression list="controlPanelParameterNames" autocomplete="off" spellcheck="false"
-        value="${escapeHtml(item.configurationExpression)}"
+      <textarea data-control-expression rows="2" wrap="soft" autocomplete="off" spellcheck="false"
         placeholder="${item.controlType === 'horizontal-scrollbar' ? 'MinMax(0, 100, 50, 1)' : item.controlType === 'options' || item.controlType === 'dropdown' ? '{dog|cat|house}' : 'Expression'}"
-        aria-invalid="${error ? 'true' : 'false'}" />
+        aria-invalid="${error ? 'true' : 'false'}">${escapeHtml(item.configurationExpression)}</textarea>
     </label>
     <p class="panel-control-error" role="alert" ${error ? '' : 'hidden'}>${escapeHtml(error)}</p>` : ''}
   </article>`;
@@ -1010,7 +1031,6 @@ export function createControlTools({
       </label>
     </div>
     <div class="controls-list" data-controls-list aria-label="Drawing controls"></div>
-    <datalist id="controlPanelParameterNames"></datalist>
   `;
   host.append(panel);
 
@@ -1018,7 +1038,6 @@ export function createControlTools({
   const actions = panel.querySelector('.controls-panel-actions');
   const editButton = panel.querySelector('[data-controls-edit]');
   const addSelect = panel.querySelector('[data-control-add]');
-  const parameterNames = panel.querySelector('#controlPanelParameterNames');
   const panelDragController = bindFloatingPanelDrag(panel, {
     ignoreSelector: 'button, input, select, textarea, label, .controls-list',
   });
@@ -1127,22 +1146,28 @@ export function createControlTools({
     return applied;
   }
 
-  function refreshParameterNames() {
-    parameterNames.innerHTML = solver.parameters()
-      .map(({ name }) => `<option value="${escapeHtml(name)}"></option>`)
-      .join('');
+  function resizeControlExpression(field) {
+    if (!field) return;
+    field.style.height = 'auto';
+    const height = Math.min(180, Math.max(54, field.scrollHeight));
+    field.style.height = `${height}px`;
+    field.style.overflowY = field.scrollHeight > 180 ? 'auto' : 'hidden';
+  }
+
+  function resizeControlExpressions() {
+    list.querySelectorAll('[data-control-expression]').forEach(resizeControlExpression);
   }
 
   function render() {
-    refreshParameterNames();
     const items = model.list();
-    list.innerHTML = items.length
-      ? items.map((item) => controlRowMarkup(item, controlPanelState(item, solver), editing)).join('')
-      : `<p class="controls-empty-state">${editing ? 'Use Add control to build this userform.' : 'No controls have been added.'}</p>`;
+    const displayedItems = editing ? items : items.filter(({ visible }) => visible);
+    list.innerHTML = displayedItems.length
+      ? displayedItems.map((item) => controlRowMarkup(item, controlPanelState(item, solver), editing)).join('')
+      : `<p class="controls-empty-state">${editing ? 'Use Add control to build this userform.' : items.length ? 'No controls are visible.' : 'No controls have been added.'}</p>`;
+    resizeControlExpressions();
   }
 
   function syncRuntimeControls() {
-    refreshParameterNames();
     model.list().forEach((item) => {
       const row = list.querySelector(`[data-control-id="${CSS.escape(item.id)}"]`);
       if (!row) return;
@@ -1159,6 +1184,7 @@ export function createControlTools({
       if (expression && document.activeElement !== expression) {
         expression.value = item.configurationExpression;
         expression.setAttribute('aria-invalid', String(Boolean(state.error)));
+        resizeControlExpression(expression);
       }
       if (item.controlType === 'horizontal-scrollbar') {
         const slider = row.querySelector('.panel-control-scrollbar');
@@ -1223,11 +1249,20 @@ export function createControlTools({
       return;
     }
     const row = event.target.closest?.('[data-control-id]');
-    if (!row || !event.target.closest('[data-control-remove]')) return;
-    beginMutation('remove');
-    model.remove(row.dataset.controlId);
-    render();
-    notifyMutation('remove');
+    if (!row) return;
+    if (event.target.closest('[data-control-visibility]')) {
+      const item = model.get(row.dataset.controlId);
+      if (!item) return;
+      beginMutation('visibility');
+      model.setItemVisible(item.id, !item.visible);
+      render();
+      notifyMutation('visibility');
+    } else if (event.target.closest('[data-control-remove]')) {
+      beginMutation('remove');
+      model.remove(row.dataset.controlId);
+      render();
+      notifyMutation('remove');
+    }
   });
 
   list.addEventListener('focusin', (event) => {
@@ -1251,6 +1286,7 @@ export function createControlTools({
       return;
     }
     if (event.target.matches('[data-control-expression]')) {
+      resizeControlExpression(event.target);
       const outcome = model.setConfigurationExpression(id, event.target.value);
       applyControlMutation(id, outcome, { reason: 'expression', history: 'none' });
       return;

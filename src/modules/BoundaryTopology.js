@@ -4,7 +4,7 @@ import {
 } from './FilletSystem.js';
 import { sampleNotchFeature } from './NotchSystem.js';
 import { arcSweepFromAngles } from './ArcGeometry.js';
-import { CANVAS_ORIGIN_RECORD_ID } from './CanvasOrigin.js';
+import { deriveUuidForKey } from './IdentitySystem.js';
 
 // --- Closed Region Topology Cycle Detection ---
 function endpointIndices(entity) {
@@ -394,7 +394,8 @@ function boundaryIdForCycle(cycle, byId) {
     .map(({ entityId }) => byId.get(entityId)?.composite?.id)
     .filter(Boolean));
   if (compositeIds.size === 1) return [...compositeIds][0];
-  return `cycle:${cycle.map(({ entityId }) => entityId).sort().join('|')}`;
+  const memberIds = cycle.map(({ entityId }) => entityId).sort();
+  return deriveUuidForKey('boundary-cycle', ...memberIds);
 }
 
 function boundaryFromFeatures(id, features, recordIds, byId, kind) {
@@ -406,7 +407,7 @@ function boundaryFromFeatures(id, features, recordIds, byId, kind) {
     kind,
     recordIds: [...new Set(recordIds)],
     appearanceSourceId,
-    stackId: sourceEntity?.stackId || 'stack-default',
+    stackId: sourceEntity?.stackId || null,
     features,
     polygon,
     points: polygon,
@@ -456,7 +457,7 @@ export function resolveClosedBoundariesForRecordIds(entities = [], constraints =
   const scopedConstraints = constraints.filter((constraint) => {
     const referencedIds = (constraint?.featureRefs || [])
       .map((feature) => feature?.recordId)
-      .filter((recordId) => recordId && recordId !== CANVAS_ORIGIN_RECORD_ID);
+      .filter(Boolean);
     return referencedIds.length > 0 && referencedIds.every((recordId) => requested.has(recordId));
   });
   return resolveClosedBoundaries(scopedEntities, scopedConstraints);

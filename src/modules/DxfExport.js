@@ -7,6 +7,12 @@ import {
 } from './DxfExportGeometry.js';
 import { normalizeDrawingData, resolveDrawingScene } from './DrawingIO.js';
 import { isSymmetricCenterline } from './SymmetricTool.js';
+import { tableDxfEntities } from './TableTools.js';
+import { deriveUuidForKey } from './IdentitySystem.js';
+import {
+  normalizeStackArchitectureState,
+  subtreeStackIds,
+} from './StackArchitecture.js';
 
 export const DXF_EXPORT_SOLVE_TOLERANCE = 1e-8;
 
@@ -50,7 +56,7 @@ function sceneSourceIds(entity) {
 function sceneEntityBase(entity, id) {
   return {
     id,
-    stackId: entity.stackId || 'stack-default',
+    stackId: entity.stackId || null,
     sourceIds: sceneSourceIds(entity),
     appearance: clone(entity.appearance || {}),
     ...(entity.construction === true ? { construction: true } : {}),
@@ -176,6 +182,14 @@ function sceneEntityToDxfGeometry(entity, index, {
       segments,
     }] : [];
   }
+  if (entity.type === 'table') {
+    return tableDxfEntities(entity).map((fragment, fragmentIndex) => transformedEntity({
+      ...fragment,
+      _resolvedMatrix: entity._resolvedMatrix,
+      _resolvedSourceId: entity._resolvedSourceId || entity.id,
+      _resolvedSourceIds: entity._resolvedSourceIds,
+    }, `${id}:${fragmentIndex}`));
+  }
   if (entity.type === 'polygon' || entity.type === 'polyline') {
     const transformed = transformedEntity(entity, id);
     const boundary = polylineBoundary(transformed, id, curveTolerance);
@@ -193,6 +207,7 @@ export function resolvedSceneDxfGeometry(scene, options = {}) {
 
 function resolvedSnapshot(snapshotInput, {
   stackId = null,
+  stackIds = null,
   evaluateNumeric = null,
   evaluateLength = null,
   evaluateExpression = null,
@@ -201,6 +216,7 @@ function resolvedSnapshot(snapshotInput, {
   const drawing = normalizeDrawingData(snapshotInput);
   const scene = resolveDrawingScene(drawing, {
     stackId,
+    stackIds,
     evaluateNumeric,
     evaluateLength,
     evaluateExpression,
@@ -219,16 +235,28 @@ function resolvedSnapshot(snapshotInput, {
 }
 
 export function createStackDxfSnapshot(snapshotInput, stackId, options = {}) {
-  const snapshot = resolvedSnapshot(snapshotInput, { ...options, stackId });
+  const drawing = normalizeDrawingData(snapshotInput);
+  const stackState = normalizeStackArchitectureState(drawing.extensions?.stacks);
+  const subtreeIds = new Set(subtreeStackIds(stackState, stackId));
+  const enabledIds = options.effectiveEnabledStackIds
+    ? new Set(options.effectiveEnabledStackIds)
+    : null;
+  const includedIds = enabledIds
+    ? [...subtreeIds].filter((id) => enabledIds.has(id))
+    : [...subtreeIds];
+  const snapshot = resolvedSnapshot(drawing, { ...options, stackId: null, stackIds: includedIds });
   return {
     ...snapshot,
     entities: snapshot.entities.map((entity, index) => ({
       ...entity,
-      id: `dxf-${stackId}-${index}`,
+      id: deriveUuidForKey('dxf-export', stackId, index, entity.id),
     })),
   };
 }
 
 export function createDrawingDxfSnapshot(snapshotInput, options = {}) {
-  return resolvedSnapshot(snapshotInput, options);
+  return resolvedSnapshot(snapshotInput, {
+    ...options,
+    stackIds: options.effectiveEnabledStackIds || options.stackIds || null,
+  });
 }

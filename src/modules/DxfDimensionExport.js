@@ -1,7 +1,6 @@
 import {
   angleDimensionLayout,
   dimensionExcludedFromExport,
-  dimensionMode,
   distanceDimensionLayout,
   mclDimensionLayout,
   radiusDimensionLayout,
@@ -50,7 +49,7 @@ function arcMiddlePoint(center, start, end, sweep) {
   ];
 }
 
-function valueOnlyText(entity, resolveValueText) {
+function valueOnlyText(entity, resolveValueText, precision = 3) {
   const resolved = resolveValueText?.(entity) ?? entity.text ?? '';
   const perimeter = /^\s*PERIM\s+/i.test(String(resolved));
   const value = String(resolved)
@@ -59,7 +58,7 @@ function valueOnlyText(entity, resolveValueText) {
     .replace(/^PERIM\s+/i, '')
     .trim();
   const match = value.match(/^([-+]?(?:\d+\.?\d*|\.\d+))(.*)$/);
-  const formatted = match ? `${Number(match[1]).toFixed(3)}${match[2]}` : value;
+  const formatted = match ? `${Number(match[1]).toFixed(precision)}${match[2]}` : value;
   return perimeter ? `PERIM ${formatted}` : formatted;
 }
 
@@ -198,16 +197,14 @@ function leaderPlan(entity, text) {
 
 export function createDxfDimensionPlans(drawing = {}, {
   resolveValueText = null,
+  precision = 3,
 } = {}) {
   const annotations = drawing.dimensionAnnotations || drawing.annotations || [];
   let nativeIndex = 0;
   return annotations
-    .filter((entity) => (
-      dimensionMode(entity) === 'driven'
-      && !dimensionExcludedFromExport(entity)
-    ))
+    .filter((entity) => !dimensionExcludedFromExport(entity))
     .map((entity) => {
-      const text = valueOnlyText(entity, resolveValueText);
+      const text = valueOnlyText(entity, resolveValueText, precision);
       let plan = null;
       if (entity.type === 'dimension-line') plan = distancePlan(entity, nativeIndex, text);
       if (entity.type === 'radius-dimension') plan = radiusPlan(entity, nativeIndex, text);

@@ -1,5 +1,6 @@
 import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { arcDirectionFromPoints } from './ArcGeometry.js';
+import { createUuid } from './IdentitySystem.js';
 
 export function drawingArcFromPoints(start, arcPoint, end) {
   const ccw = arcDirectionFromPoints(start, arcPoint, end);
@@ -93,7 +94,6 @@ export function drawingGeometryHitTargetClass(entity) {
 const pointDistance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const angleSnapStep = Math.PI / 6;
 const angleSnapTolerance = Math.PI / 24;
-let compositeSerial = 0;
 
 function rectanglePoints(a, b) {
   return [
@@ -102,12 +102,6 @@ function rectanglePoints(a, b) {
     [b[0], b[1]],
     [a[0], b[1]],
   ];
-}
-
-function createCompositeId(kind) {
-  if (globalThis.crypto?.randomUUID) return `${kind}-${globalThis.crypto.randomUUID()}`;
-  compositeSerial += 1;
-  return `${kind}-${compositeSerial}`;
 }
 
 export function addEditableLineChain({
@@ -120,10 +114,10 @@ export function addEditableLineChain({
   decorateEntity = (entity) => entity,
 }) {
   if (!Array.isArray(chainPoints) || chainPoints.length < 2 || typeof addObject !== 'function') return [];
-  const compositeId = createCompositeId(kind);
+  const compositeId = createUuid();
   const segmentCount = closed ? chainPoints.length : chainPoints.length - 1;
   if (typeof addObjects === 'function') {
-    const ids = Array.from({ length: segmentCount }, (_, index) => `${compositeId}-segment-${index}`);
+    const ids = Array.from({ length: segmentCount }, () => createUuid());
     const entries = ids.map((id, index) => {
       const nextIndex = (index + 1) % chainPoints.length;
       const start = chainPoints[index];
@@ -344,7 +338,7 @@ export function createDrawingTools({
       const completedTool = activeTool;
       const record = canvas.addTable({ x: rawPoint[0], y: rawPoint[1] });
       completeActiveTool(completedTool);
-      if (record) canvas.beginTableEdit?.(record);
+      if (record) canvas.beginTableEdit?.(record, { placementPointerEvent: event });
       return true;
     }
 

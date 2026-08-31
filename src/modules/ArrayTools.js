@@ -1,5 +1,5 @@
 import { resolveVectorDrawingPoint } from './DrawingTools.js';
-import { createStableId } from './solver/SolverModel.js';
+import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 import { valueInUnit } from './solver/Units.js';
 import { clampPanelPosition, positionHeaderToolMenu } from './CanvasUIControls.js';
 import {
@@ -7,7 +7,26 @@ import {
   resolveDimensionFeatureSet,
   transformDimensionFeatureSet,
 } from './DimensionSystem.js';
-import { splitDerivedPresentationNodes } from './CanvasPaintOrder.js';
+import {
+  directClosedRegionNodesForSourceIds,
+  splitDerivedPresentationNodes,
+} from './CanvasPaintOrder.js';
+import { prepareNotchDerivativePresentationClone } from './NotchSystem.js';
+import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+
+registerIdentitySchema('arrayTools', {
+  declarations: (value) => (value?.arrays || []).map((object, index) => ({
+    object, key: 'id', value: object.id, path: ['extensions', 'arrayTools', 'arrays', String(index), 'id'], kind: 'array-definition',
+  })),
+  liveReferenceKeys: ['stackId', 'recordId'],
+  liveReferenceArrayKeys: ['sourceIds'],
+  lineageReferenceKeys: ['sourceDefinitionId', 'sourceStackId'],
+  targetKindsByKey: {
+    stackId: ['stack'],
+    recordId: ['entity'],
+    sourceIds: ['entity'],
+  },
+});
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MAX_ARRAY_ITEMS = 500;
@@ -43,26 +62,19 @@ const arrayTypeLabels = Object.freeze({
   circular: 'Circular Array',
 });
 
-const ARRAY_DERIVED_PREFIX = 'array-derived';
-const ARRAY_CENTER_PREFIX = 'array-center';
-
-export function arrayCenterRecordId(arrayId) {
-  return `${ARRAY_CENTER_PREFIX}:${encodeURIComponent(String(arrayId))}`;
-}
-
 export function isArrayCenterPointEntity(entity, arrayId = null) {
   return entity?.type === 'point'
     && entity.composite?.kind === 'array-center'
     && (arrayId === null || entity.composite.arrayId === arrayId);
 }
 
-export function createArrayCenterPointEntity(definition, point, id = arrayCenterRecordId(definition?.id)) {
+export function createArrayCenterPointEntity(definition, point, id = createUuid()) {
   const center = finitePoint(point, [0, 0]);
   return {
     id,
     type: 'point',
     point: center,
-    stackId: String(definition?.stackId || 'stack-default'),
+    stackId: definition?.stackId ? String(definition.stackId) : null,
     composite: {
       kind: 'array-center',
       arrayId: String(definition?.id || ''),
@@ -71,7 +83,7 @@ export function createArrayCenterPointEntity(definition, point, id = arrayCenter
 }
 
 export function arrayDerivedRecordId(arrayId, placementIndex, sourceId) {
-  return `${ARRAY_DERIVED_PREFIX}:${encodeURIComponent(String(arrayId))}:${Number(placementIndex)}:${encodeURIComponent(String(sourceId))}`;
+  return deriveUuidForKey('array-placement', arrayId, Number(placementIndex), sourceId);
 }
 
 export function parseArrayDerivedRecordId(recordId) {
@@ -115,7 +127,7 @@ export function isArrayOriginPlacement(definition, placement) {
 }
 
 export function arrayDerivedOwnerId(arrayId, placementIndex, sourceOwnerId) {
-  return `array-subtract:${encodeURIComponent(String(arrayId))}:${Number(placementIndex)}:${encodeURIComponent(String(sourceOwnerId))}`;
+  return deriveUuidForKey('array-subtract-placement', arrayId, Number(placementIndex), sourceOwnerId);
 }
 
 function ownerBoundaryPolygon(owner) {
@@ -247,6 +259,8 @@ function arrayType(value) {
 }
 
 export function normalizeArrayDefinition(input = {}) {
+  const id = String(input.id || createUuid());
+  const stackId = input.stackId ? String(input.stackId) : null;
   const type = arrayType(input.arrayType || input.type);
   const centerPoint = finitePoint(input.centerPoint, null);
   const centerRef = input.centerRef?.recordId && Number.isInteger(Number(input.centerRef.index))
@@ -257,8 +271,10 @@ export function normalizeArrayDefinition(input = {}) {
     }
     : null;
   return {
-    id: String(input.id || createStableId('array')),
-    stackId: String(input.stackId || 'stack-default'),
+    id,
+    sourceDefinitionId: String(input.sourceDefinitionId || id),
+    sourceStackId: input.sourceStackId || stackId ? String(input.sourceStackId || stackId) : null,
+    stackId,
     arrayType: type,
     sourceIds: uniqueIds(input.sourceIds),
     rowCountExpression: String(input.rowCountExpression ?? '2'),
@@ -505,6 +521,7 @@ export function arraySourceIdsFromSelection(recordIds = [], entities = new Map()
 }
 
 function sanitizeClone(node) {
+  prepareNotchDerivativePresentationClone(node);
   node.removeAttribute('id');
   node.removeAttribute('data-record-id');
   node.removeAttribute('aria-label');
@@ -653,10 +670,10 @@ export function createArrayTools({ toolbar, canvas }) {
     const resolvedBounds = bounds === undefined ? sourceBounds(definition.sourceIds) : bounds;
     return evaluateArrayDefinition(definition, {
       evaluateNumeric: (expression) => evaluateArrayCountExpression(expression, {
-        evaluateLength: (value) => canvas.evaluateLengthExpression(value),
+        evaluateLength: (value) => canvas.evaluateLengthExpression(value, definition),
         drawingUnit: canvas.getDrawingUnit?.(),
       }),
-      evaluateLength: (expression) => canvas.evaluateLengthExpression(expression),
+      evaluateLength: (expression) => canvas.evaluateLengthExpression(expression, definition),
       sourceBounds: resolvedBounds,
       centerPoint: definition.arrayType === 'circular' ? resolveCenter(definition) : null,
     });
@@ -725,7 +742,7 @@ export function createArrayTools({ toolbar, canvas }) {
     const entity = createArrayCenterPointEntity(
       definition,
       center,
-      owned?.id || arrayCenterRecordId(definition.id),
+      owned?.id || createUuid(),
     );
     const saved = canvas.upsertAuxiliaryGeometry?.(entity) || entity;
     definition.centerPoint = [...center];
@@ -799,11 +816,7 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function regionNodesFor(sourceIds) {
-    const selected = new Set(sourceIds);
-    return [...svg.querySelectorAll('.closed-constrained-region[data-parent-ids]')].filter((region) => {
-      const parents = String(region.dataset.parentIds || '').split(',').map((id) => id.trim()).filter(Boolean);
-      return parents.length > 0 && parents.every((id) => selected.has(id));
-    });
+    return directClosedRegionNodesForSourceIds(objectLayer, sourceIds);
   }
 
   function templateFor(definition, entities) {
@@ -885,9 +898,9 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function renderDefinition(definition, entities) {
-    const stackId = definition.stackId || 'stack-default';
+    const stackId = definition.stackId;
     const stackVisible = canvas.isStackVisible?.(stackId) !== false;
-    const stackActive = canvas.isStackActive?.(stackId) !== false;
+    const stackActive = !canvas.getActiveStackId?.() || canvas.isStackActive?.(stackId) !== false;
     const objectVisible = definition.sourceIds.some((recordId) => (
       canvas.isObjectVisible?.(recordId) !== false
     ));
@@ -987,12 +1000,39 @@ export function createArrayTools({ toolbar, canvas }) {
     const sourceSet = canvas.getDimensionFeatureSet?.(sourceId, { rendered: true });
     if (!sourceSet) return null;
     const recordId = arrayDerivedRecordId(definition.id, placementIndex, sourceId);
-    return transformDimensionFeatureSet(
+    const transformed = transformDimensionFeatureSet(
       sourceSet,
       arrayPlacementTransform(placement, renderData.center),
       recordId,
       node,
     );
+    transformed.features = (transformed.features || []).map((feature) => ({
+      ...feature,
+      derivedKind: 'array-placement',
+      arrayId: definition.id,
+      arrayPlacementIndex: placementIndex,
+      arraySourceId: sourceId,
+    }));
+    return transformed;
+  }
+
+  function resolveArrayDerivedTarget(recordId) {
+    const legacy = parseArrayDerivedRecordId(recordId);
+    if (legacy) return legacy;
+    const entities = entityMap();
+    for (const definition of arrays) {
+      const renderData = definitionRenderData(definition, entities);
+      if (!renderData) continue;
+      const sourceIds = dimensionSourceIds(definition, entities);
+      for (let placementIndex = 0; placementIndex < renderData.evaluated.placements.length; placementIndex += 1) {
+        for (const sourceId of sourceIds) {
+          if (arrayDerivedRecordId(definition.id, placementIndex, sourceId) === recordId) {
+            return { arrayId: definition.id, placementIndex, sourceId };
+          }
+        }
+      }
+    }
+    return null;
   }
 
   function derivedFeatureFromEvent({ target, world, mode = 'driven' }) {
@@ -1020,7 +1060,13 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function resolveDerivedFeature(request) {
-    const parsed = parseArrayDerivedRecordId(request?.recordId);
+    const parsed = request?.derivedKind === 'array-placement'
+      ? {
+        arrayId: request.arrayId,
+        placementIndex: Number(request.arrayPlacementIndex),
+        sourceId: request.arraySourceId,
+      }
+      : resolveArrayDerivedTarget(request?.recordId);
     if (!parsed) return null;
     const definition = definitionsById().get(parsed.arrayId);
     if (!definition) return null;
@@ -1044,7 +1090,7 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function derivedFeatureDependsOn(recordId, changedRecordIds) {
-    const parsed = parseArrayDerivedRecordId(recordId);
+    const parsed = resolveArrayDerivedTarget(recordId);
     if (!parsed || !changedRecordIds) return false;
     const definition = definitionsById().get(parsed.arrayId);
     if (!definition) return false;
@@ -1060,7 +1106,7 @@ export function createArrayTools({ toolbar, canvas }) {
   };
 
   function populateExpressionOptions() {
-    parameterNames.replaceChildren(...(canvas.getParameters?.() || [])
+    parameterNames.replaceChildren(...(canvas.getParameterExpressionSymbols?.(editingDraft) || canvas.getParameters?.() || [])
       .filter((entry) => entry.name && !entry.error)
       .map((entry) => {
         const option = document.createElement('option');
@@ -1203,8 +1249,8 @@ export function createArrayTools({ toolbar, canvas }) {
     activeType = type;
     window.dispatchEvent(new CustomEvent('paramagic:tool-activated', { detail: { source: 'array' } }));
     openEditor(normalizeArrayDefinition({
-      id: createStableId('array'),
-      stackId: canvas.getActiveStackId?.() || 'stack-default',
+      id: createUuid(),
+      stackId: canvas.getActiveStackId?.() || null,
       arrayType: arrayTypeKeys[type],
       sourceIds: [],
       rowSpacingExpression: '20',
@@ -1400,6 +1446,44 @@ export function createArrayTools({ toolbar, canvas }) {
     return true;
   }
 
+  function removeStackReferences(stackId, recordIds = []) {
+    const removedRecordIds = new Set(recordIds.map(String));
+    const removed = arrays.filter((definition) => (
+      definition.stackId === stackId
+      || definition.sourceIds.some((id) => removedRecordIds.has(String(id)))
+      || removedRecordIds.has(String(definition.centerRef?.recordId || ''))
+    ));
+    if (!removed.length) return false;
+    const removedArrayIds = new Set(removed.map(({ id }) => id));
+    const referencesRemovedArray = (value, visited = new Set()) => {
+      if (typeof value === 'string') return false;
+      if (!value || typeof value !== 'object' || visited.has(value)) return false;
+      if (removedArrayIds.has(value.arrayId)) return true;
+      visited.add(value);
+      return Object.values(value).some((item) => referencesRemovedArray(item, visited));
+    };
+    const annotationIds = (canvas.getDrawingData?.().dimensionAnnotations || [])
+      .filter(referencesRemovedArray)
+      .map(({ id }) => id);
+    if (annotationIds.length) canvas.deleteRecords?.(annotationIds, { checkpoint: false, notify: false });
+    removed.forEach((definition) => {
+      applyArrayParentVisibility(definition, { restore: true });
+      removeOwnedCenterControl(definition);
+    });
+    for (let index = arrays.length - 1; index >= 0; index -= 1) {
+      if (removedArrayIds.has(arrays[index].id)) arrays.splice(index, 1);
+    }
+    if (removedArrayIds.has(selectedArrayId)) {
+      selectedArrayId = null;
+      editingDraft = null;
+      editingSourceBounds = null;
+      popup.hidden = true;
+      mode = 'idle';
+    }
+    renderNow();
+    return true;
+  }
+
   const delegate = {
     pointerDown(event) {
       if (event.button !== 0 || mode !== 'selecting-center' || !editingDraft) return false;
@@ -1575,6 +1659,8 @@ export function createArrayTools({ toolbar, canvas }) {
     if (mode === 'selecting-sources' || mode === 'selecting-center') return;
     const group = event.target.closest?.('.array-group[data-array-id]');
     if (!group) return;
+    const definition = arrays.find(({ id }) => id === group.dataset.arrayId);
+    if (!canvas.getActiveStackId?.() || canvas.isStackActive?.(definition?.stackId) === false) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     selectArray(group.dataset.arrayId);
@@ -1590,6 +1676,8 @@ export function createArrayTools({ toolbar, canvas }) {
     }
     const group = event.target.closest?.('.array-group[data-array-id]');
     if (group) {
+      const definition = arrays.find(({ id }) => id === group.dataset.arrayId);
+      if (!canvas.getActiveStackId?.() || canvas.isStackActive?.(definition?.stackId) === false) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       selectArray(group.dataset.arrayId);
@@ -1718,6 +1806,7 @@ export function createArrayTools({ toolbar, canvas }) {
     removeDefinition,
     setDefinitionStack,
     reassignStack,
+    removeStackReferences,
     derivedDimensionProvider,
     subtractOperandProvider,
     selectionPropertyProvider,

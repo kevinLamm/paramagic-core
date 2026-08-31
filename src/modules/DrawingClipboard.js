@@ -1,8 +1,21 @@
-import { normalizeDrawingData } from './DrawingIO.js';
-import {
-  hydratePortableImageAssets, serializePortablePackageJson,
-} from './ImageSystem.js';
+import { normalizeDrawingData, normalizeDrawingDataWithIdentityMap } from './DrawingIO.js';
+import { hydratePortableImageAssets } from './ImageSystem.js';
 import { normalizeSeamLineExtension } from './SeamLineSystem.js';
+import {
+  DEFAULT_STACK_ROLE,
+  DRAWING_NODE_KIND,
+  defaultStackId,
+  descendantStackIds,
+  normalizeStackArchitectureState,
+  subtreeStackIds,
+} from './StackArchitecture.js';
+import { dimensionDisplayName } from './NamingSystem.js';
+import {
+  prepareStackClipboardDimensions,
+  retargetStackClipboardDimensions,
+} from './StackClipboardSystem.js';
+import { createDormantStackRelationships } from './StackRelationshipSystem.js';
+import { expressionSymbolReferences } from './solver/ParameterRepository.js';
 
 export const PARAMAGIC_CLIPBOARD_FORMAT = 'ParaMagic Clipboard';
 export const PARAMAGIC_CLIPBOARD_VERSION = 1;
@@ -45,18 +58,34 @@ function isAutomaticDependent(entity) {
     || entity?.composite?.kind === 'finish-size-offset';
 }
 
-function parameterTokens(value, knownNames, result = new Set()) {
+function expressionSources(value, key) {
+  if (typeof value !== 'string') return [];
+  if (key === 'text') {
+    const fields = [...value.matchAll(/\[([^\]]+)\]/g)].map((match) => match[1].trim()).filter(Boolean);
+    return fields.length ? fields : [];
+  }
+  return key === 'expression' || /Expression$/.test(key) ? [value] : [];
+}
+
+function collectParameterReferences(value, symbolsForStack, result = new Set(), contextStackId = null, key = '') {
   if (Array.isArray(value)) {
-    value.forEach((item) => parameterTokens(item, knownNames, result));
+    value.forEach((item) => collectParameterReferences(item, symbolsForStack, result, contextStackId, key));
     return result;
   }
   if (value && typeof value === 'object') {
-    Object.values(value).forEach((item) => parameterTokens(item, knownNames, result));
+    const nextContext = value.stackId || contextStackId;
+    Object.entries(value).forEach(([childKey, item]) => {
+      collectParameterReferences(item, symbolsForStack, result, nextContext, childKey);
+    });
     return result;
   }
-  if (typeof value !== 'string') return result;
-  value.match(/[A-Za-z_][A-Za-z0-9_]*/g)?.forEach((name) => {
-    if (knownNames.has(name)) result.add(name);
+  expressionSources(value, key).forEach((expression) => {
+    try {
+      expressionSymbolReferences(expression, symbolsForStack(contextStackId))
+        .forEach(({ parameterId }) => { if (parameterId) result.add(parameterId); });
+    } catch {
+      // Invalid expressions retain their stored error state; valid references elsewhere are still copied.
+    }
   });
   return result;
 }
@@ -65,20 +94,43 @@ export function createClipboardPackage(snapshotInput, {
   entityIds = [],
   arrayIds = [],
   linkedCopyIds = [],
+  stackIds = null,
   label = 'ParaMagic Selection',
 } = {}) {
-  const snapshot = normalizeDrawingData(snapshotInput);
+  const normalized = normalizeDrawingDataWithIdentityMap(snapshotInput);
+  const snapshot = normalized.drawing;
+  const canonicalId = (value) => normalized.idMap.get(String(value)) || String(value);
+  const stackState = normalizeStackArchitectureState(snapshot.extensions?.stacks);
+  const fallbackStackId = defaultStackId(stackState);
+  const includedStackIds = stackIds ? new Set(unique(stackIds)) : null;
+  const packageRootStackId = includedStackIds ? unique(stackIds)[0] : null;
+  const packageStacks = includedStackIds
+    ? stackState.stacks.filter(({ id }) => includedStackIds.has(id)).map((stack) => ({
+      ...clone(stack),
+      parentStackId: includedStackIds.has(stack.parentStackId) ? stack.parentStackId : null,
+      ...(stack.id === packageRootStackId
+        ? { systemRole: DEFAULT_STACK_ROLE, removable: false }
+        : { systemRole: undefined, removable: true }),
+    }))
+    : clone(stackState.stacks);
+  const packageStackState = normalizeStackArchitectureState({
+    version: stackState.version,
+    activeStackId: packageStacks.some(({ id }) => id === stackState.activeStackId)
+      ? stackState.activeStackId
+      : packageStacks[0]?.id,
+    stacks: packageStacks,
+  });
   const entityMap = new Map(snapshot.entities.filter(({ id }) => id).map((entity) => [entity.id, entity]));
   const annotationMap = new Map(snapshot.dimensionAnnotations.filter(({ id }) => id).map((entity) => [entity.id, entity]));
   const knownEntityIds = new Set([...entityMap.keys()]);
-  const includedIds = new Set(unique(entityIds).filter((id) => entityMap.has(id)));
+  const includedIds = new Set(unique(entityIds).map(canonicalId).filter((id) => entityMap.has(id)));
   const inferOwnedFeatures = includedIds.size > 0;
-  const explicitAnnotationIds = new Set(unique(entityIds).filter((id) => annotationMap.has(id)));
+  const explicitAnnotationIds = new Set(unique(entityIds).map(canonicalId).filter((id) => annotationMap.has(id)));
   const arrayDefinitions = snapshot.extensions?.arrayTools?.arrays || [];
-  const includedArrayIds = new Set(unique(arrayIds)
+  const includedArrayIds = new Set(unique(arrayIds).map(canonicalId)
     .filter((id) => arrayDefinitions.some((definition) => definition.id === id)));
   const linkedCopyDefinitions = snapshot.extensions?.linkedCopyTools?.copies || [];
-  const includedLinkedCopyIds = new Set(unique(linkedCopyIds)
+  const includedLinkedCopyIds = new Set(unique(linkedCopyIds).map(canonicalId)
     .filter((id) => linkedCopyDefinitions.some((definition) => definition.id === id)));
 
   explicitAnnotationIds.forEach((annotationId) => {
@@ -144,10 +196,18 @@ export function createClipboardPackage(snapshotInput, {
 
   const arrays = arrayDefinitions
     .filter(({ id }) => includedArrayIds.has(id))
-    .map(clone);
+    .map((definition) => ({
+      ...clone(definition),
+      sourceDefinitionId: definition.sourceDefinitionId || definition.id,
+      sourceStackId: definition.sourceStackId || definition.stackId || fallbackStackId,
+    }));
   const linkedCopies = linkedCopyDefinitions
     .filter(({ id }) => includedLinkedCopyIds.has(id))
-    .map(clone);
+    .map((definition) => ({
+      ...clone(definition),
+      sourceDefinitionId: definition.sourceDefinitionId || definition.id,
+      sourceStackId: definition.sourceStackId || definition.stackId || fallbackStackId,
+    }));
   const entities = snapshot.entities.filter(({ id }) => includedIds.has(id)).map(clone);
   const dimensionAnnotations = snapshot.dimensionAnnotations.filter((annotation) => {
     if (explicitAnnotationIds.has(annotation.id)) return true;
@@ -160,31 +220,75 @@ export function createClipboardPackage(snapshotInput, {
     return refs.size > 0 && [...refs].every((id) => includedIds.has(id));
   }).map(clone);
 
-  const parameterByName = new Map(snapshot.parameters.filter(({ name }) => name).map((entry) => [entry.name, entry]));
+  const globalParameterByName = new Map(snapshot.parameters
+    .filter(({ kind, name }) => kind !== 'dimension' && name)
+    .map((entry) => [entry.name, entry]));
   const parameterById = new Map(snapshot.parameters.filter(({ id }) => id).map((entry) => [entry.id, entry]));
-  const knownNames = new Set(parameterByName.keys());
-  const requiredNames = parameterTokens({ entities, dimensionAnnotations, arrays, linkedCopies }, knownNames);
+  const globalSymbols = snapshot.parameters
+    .filter(({ kind, name }) => kind !== 'dimension' && name)
+    .map((entry) => ({ name: entry.name, parameterId: entry.id, caseInsensitive: false }));
+  const qualifiedDimensionSymbols = snapshot.parameters
+    .filter(({ kind, name }) => kind === 'dimension' && name)
+    .map((entry) => ({
+      name: dimensionDisplayName(entry, stackState),
+      parameterId: entry.id,
+      caseInsensitive: true,
+    }));
+  const localDimensionSymbols = new Map();
+  snapshot.parameters.filter(({ kind, name }) => kind === 'dimension' && name).forEach((entry) => {
+    const ownerStackId = entry.stackId || fallbackStackId;
+    if (!localDimensionSymbols.has(ownerStackId)) localDimensionSymbols.set(ownerStackId, []);
+    localDimensionSymbols.get(ownerStackId).push({
+      name: entry.name,
+      parameterId: entry.id,
+      caseInsensitive: true,
+    });
+  });
+  const symbolsForStack = (stackId) => [
+    ...globalSymbols,
+    ...qualifiedDimensionSymbols,
+    ...(stackId ? localDimensionSymbols.get(stackId) || [] : []),
+  ];
+  const requiredParameterIds = collectParameterReferences(
+    { entities, constraints, dimensionAnnotations, arrays, linkedCopies, stacks: packageStackState.stacks },
+    symbolsForStack,
+  );
   dimensionAnnotations.forEach((annotation) => {
     const parameter = parameterById.get(annotation.dimensionId);
-    if (parameter?.name) requiredNames.add(parameter.name);
+    if (parameter?.id) requiredParameterIds.add(parameter.id);
   });
   entities.filter(({ type }) => type === 'control').forEach((entity) => {
-    const parameter = parameterById.get(entity.parameterId) || parameterByName.get(entity.parameterName);
-    if (parameter?.name) requiredNames.add(parameter.name);
+    const parameter = parameterById.get(entity.parameterId) || globalParameterByName.get(entity.parameterName);
+    if (parameter?.id) requiredParameterIds.add(parameter.id);
   });
   changed = true;
   while (changed) {
     changed = false;
-    [...requiredNames].forEach((name) => {
-      const parameter = parameterByName.get(name);
-      parameterTokens(parameter?.expression, knownNames).forEach((dependencyName) => {
-        if (requiredNames.has(dependencyName)) return;
-        requiredNames.add(dependencyName);
+    [...requiredParameterIds].forEach((parameterId) => {
+      const parameter = parameterById.get(parameterId);
+      collectParameterReferences(
+        { expression: parameter?.expression },
+        symbolsForStack,
+        new Set(),
+        parameter?.kind === 'dimension' ? parameter.stackId || fallbackStackId : null,
+      ).forEach((dependencyId) => {
+        if (requiredParameterIds.has(dependencyId)) return;
+        requiredParameterIds.add(dependencyId);
         changed = true;
       });
     });
   }
-  const parameters = snapshot.parameters.filter(({ name }) => requiredNames.has(name)).map(clone);
+  const includedDimensionIds = new Set([
+    ...dimensionAnnotations.map(({ dimensionId }) => dimensionId).filter(Boolean),
+    ...(includedStackIds ? snapshot.parameters
+      .filter(({ kind, stackId }) => kind === 'dimension' && includedStackIds.has(stackId || fallbackStackId))
+      .map(({ id }) => id) : []),
+  ]);
+  includedDimensionIds.forEach((dimensionId) => requiredParameterIds.add(dimensionId));
+  const parameters = snapshot.parameters.filter((parameter) => (
+    requiredParameterIds.has(parameter.id)
+    && (parameter.kind !== 'dimension' || includedDimensionIds.has(parameter.id))
+  )).map(clone);
   const extensions = {};
   if (arrays.length) {
     extensions.arrayTools = {
@@ -193,11 +297,29 @@ export function createClipboardPackage(snapshotInput, {
     };
   }
   if (linkedCopies.length) {
+    const positionConstraints = (snapshot.extensions?.linkedCopyTools?.positionConstraints || [])
+      .filter((constraint) => {
+        if (!includedLinkedCopyIds.has(constraint.externalDrivingTarget?.copyId)) return false;
+        const refs = collectMatchingStrings(constraint, knownEntityIds);
+        return [...refs].every((id) => includedIds.has(id));
+      })
+      .map(clone);
     extensions.linkedCopyTools = {
       version: snapshot.extensions?.linkedCopyTools?.version || 1,
       copies: linkedCopies,
+      ...(positionConstraints.length ? { positionConstraints } : {}),
     };
   }
+  const swellConstraints = (snapshot.extensions?.swell?.constraints || [])
+    .filter((constraint) => {
+      const refs = collectMatchingStrings(constraint, knownEntityIds);
+      return refs.size > 0 && [...refs].every((id) => includedIds.has(id));
+    })
+    .map(clone);
+  if (swellConstraints.length) extensions.swell = {
+    version: snapshot.extensions?.swell?.version || 1,
+    constraints: swellConstraints,
+  };
   const seamDefinitions = normalizeSeamLineExtension(snapshot.extensions?.seamLines).definitions
     .filter((definition) => (
       includedIds.has(definition.regionId)
@@ -209,21 +331,36 @@ export function createClipboardPackage(snapshotInput, {
       definitions: seamDefinitions,
     };
   }
-  const drawing = {
+  extensions.stacks = packageStackState;
+  const dormantRelationships = createDormantStackRelationships(snapshot, [...includedIds]);
+  if (dormantRelationships.templates.length) extensions.stackRelationships = dormantRelationships;
+  const preparedDimensions = prepareStackClipboardDimensions({
+    stackArchitectureVersion: snapshot.stackArchitectureVersion,
     drawingUnit: snapshot.drawingUnit,
     dxfExportUnit: snapshot.dxfExportUnit,
     filletRadius: snapshot.filletRadius,
+    documentMetadata: clone(snapshot.documentMetadata || {}),
+    classes: clone(snapshot.classes || []),
+    activeClassId: snapshot.activeClassId || null,
     entities,
     constraints,
     parameters,
     dimensionAnnotations,
     ...(Object.keys(extensions).length ? { extensions } : {}),
-  };
+  }, {
+    parameters: snapshot.parameters,
+    requiredParameterIds,
+    includedDimensionIds,
+    stackState,
+  });
   return {
     format: PARAMAGIC_CLIPBOARD_FORMAT,
     version: PARAMAGIC_CLIPBOARD_VERSION,
     label,
-    drawing,
+    ...(preparedDimensions.externalDimensionReferences.length
+      ? { externalDimensionReferences: preparedDimensions.externalDimensionReferences }
+      : {}),
+    drawing: preparedDimensions.drawing,
   };
 }
 
@@ -235,34 +372,130 @@ export function parseClipboardPackage(value) {
   return { ...parsed, drawing: normalizeDrawingData(parsed.drawing) };
 }
 
-export function retargetClipboardDrawing(packageInput, stackId) {
+export function retargetClipboardDrawing(packageInput, stackId, targetStackState = null) {
   const packageValue = parseClipboardPackage(packageInput);
   const drawing = clone(packageValue.drawing);
-  drawing.entities = drawing.entities.map((entity) => ({ ...entity, stackId }));
-  drawing.dimensionAnnotations = drawing.dimensionAnnotations.map((entity) => ({ ...entity, stackId }));
-  delete drawing.extensions?.stacks;
+  const sourceStackState = normalizeStackArchitectureState(drawing.extensions?.stacks);
+  const resolvedTargetState = normalizeStackArchitectureState(targetStackState || (stackId ? {
+    activeStackId: stackId,
+    stacks: [{ id: stackId, name: 'Clipboard Target', visible: true }],
+  } : null));
+  const targetStack = resolvedTargetState.stacks.find(({ id }) => id === stackId)
+    || resolvedTargetState.stacks.find(({ id }) => id === resolvedTargetState.activeStackId)
+    || resolvedTargetState.stacks[0];
+  const sourceDimensionById = new Map(drawing.parameters
+    .filter(({ kind }) => kind === 'dimension')
+    .map((parameter) => [parameter.id, parameter]));
+  const dormantDimensionParameters = (drawing.extensions?.stackRelationships?.templates || [])
+    .filter(({ type }) => type === 'dimension')
+    .map((template) => template.payload?.parameter)
+    .filter(Boolean);
+  const qualifierDimensions = [...new Map([
+    ...drawing.parameters.filter(({ kind }) => kind === 'dimension'),
+    ...dormantDimensionParameters,
+  ].map((parameter) => [parameter.sourceDimensionId || parameter.id, parameter])).values()];
+  const rewritten = retargetStackClipboardDimensions(drawing, {
+    copiedDimensions: qualifierDimensions,
+    externalDimensionReferences: packageValue.externalDimensionReferences,
+    sourceStackState,
+    targetStackState: resolvedTargetState,
+    targetStack,
+  });
+  drawing.entities = rewritten.entities.map((entity) => ({
+    ...entity,
+    sourceRecordId: entity.sourceRecordId || entity.id,
+    sourceStackId: entity.sourceStackId || sourceStackState.stacks.find(({ id }) => id === entity.stackId)?.sourceStackId || entity.stackId,
+    stackId: targetStack.id,
+  }));
+  drawing.constraints = rewritten.constraints.map((constraint) => ({
+    ...constraint,
+    stackId: targetStack.id,
+    participantStackIds: [],
+  }));
+  drawing.parameters = rewritten.parameters.map((parameter) => parameter.kind === 'dimension' ? {
+    ...parameter,
+    sourceDimensionId: parameter.sourceDimensionId || parameter.id,
+    stackId: targetStack.id,
+    participantStackIds: [],
+  } : parameter);
+  drawing.dimensions = clone(drawing.parameters);
+  drawing.dimensionAnnotations = rewritten.dimensionAnnotations.map((entity) => ({
+    ...entity,
+    sourceRelationshipId: entity.sourceRelationshipId || entity.dimensionId || entity.id,
+    stackId: targetStack.id,
+    participantStackIds: [],
+    dimensionName: sourceDimensionById.get(entity.dimensionId)?.name || entity.dimensionName,
+  }));
+  drawing.extensions = { ...(rewritten.extensions || {}), stacks: {
+    version: resolvedTargetState.version,
+    activeStackId: targetStack.id,
+    stacks: [{ ...targetStack, systemRole: DEFAULT_STACK_ROLE, removable: false }],
+  } };
   if (drawing.extensions?.arrayTools?.arrays) {
     drawing.extensions.arrayTools.arrays = drawing.extensions.arrayTools.arrays
-      .map((definition) => ({ ...definition, stackId }));
+      .map((definition) => ({ ...definition, stackId: targetStack.id }));
   }
   if (drawing.extensions?.linkedCopyTools?.copies) {
     drawing.extensions.linkedCopyTools.copies = drawing.extensions.linkedCopyTools.copies
-      .map((definition) => ({ ...definition, stackId }));
+      .map((definition) => ({ ...definition, stackId: targetStack.id }));
   }
   return drawing;
 }
 
-function downloadText(text, name, type) {
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(new Blob([text], { type }));
-  link.download = name;
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(link.href), 0);
+export function createStackSubtreePackage(snapshotInput, stackId, { label = null } = {}) {
+  const snapshot = normalizeDrawingData(snapshotInput);
+  const stackState = normalizeStackArchitectureState(snapshot.extensions?.stacks);
+  const selectedStackIds = subtreeStackIds(stackState, stackId);
+  if (!selectedStackIds.length) throw new Error(`Stack ${stackId} does not exist.`);
+  const owners = new Set(selectedStackIds);
+  const entityIds = snapshot.entities
+    .filter((entity) => owners.has(entity.stackId || defaultStackId(stackState)))
+    .map(({ id }) => id);
+  const arrayIds = (snapshot.extensions?.arrayTools?.arrays || [])
+    .filter((definition) => owners.has(definition.stackId || defaultStackId(stackState)))
+    .map(({ id }) => id);
+  const linkedCopyIds = (snapshot.extensions?.linkedCopyTools?.copies || [])
+    .filter((definition) => owners.has(definition.stackId || defaultStackId(stackState)))
+    .map(({ id }) => id);
+  const packageValue = createClipboardPackage(snapshot, {
+    entityIds,
+    arrayIds,
+    linkedCopyIds,
+    stackIds: selectedStackIds,
+    label: label || stackState.stacks.find(({ id }) => id === stackId)?.name || 'Stack',
+  });
+  packageValue.drawing.documentContext = {
+    ...(packageValue.drawing.documentContext || {}),
+    contentKind: 'stack-export',
+    displayName: packageValue.label,
+  };
+  return packageValue;
 }
 
-function safeName(value, extension) {
-  const base = String(value || 'Stack').replace(/[\\/:*?"<>|]+/g, '-').trim() || 'Stack';
-  return `${base}.${extension}`;
+export function createDrawingContainerPackage(snapshotInput, containerId, { label = null } = {}) {
+  const snapshot = normalizeDrawingData(snapshotInput);
+  const stackState = normalizeStackArchitectureState(snapshot.extensions?.stacks);
+  const container = stackState.stacks.find(({ id }) => id === containerId);
+  if (container?.kind !== DRAWING_NODE_KIND) {
+    throw new Error(`Drawing container ${containerId} does not exist.`);
+  }
+  const selectedStackIds = descendantStackIds(stackState, containerId);
+  if (!selectedStackIds.length) throw new Error(`Drawing container “${container.name}” has no Stacks to export.`);
+  const packageValue = createClipboardPackage(snapshot, {
+    entityIds: snapshot.entities.filter(({ stackId }) => selectedStackIds.includes(stackId)).map(({ id }) => id),
+    arrayIds: (snapshot.extensions?.arrayTools?.arrays || [])
+      .filter(({ stackId }) => selectedStackIds.includes(stackId)).map(({ id }) => id),
+    linkedCopyIds: (snapshot.extensions?.linkedCopyTools?.copies || [])
+      .filter(({ stackId }) => selectedStackIds.includes(stackId)).map(({ id }) => id),
+    stackIds: selectedStackIds,
+    label: label || container.name || 'Drawing',
+  });
+  packageValue.drawing.documentContext = {
+    ...(packageValue.drawing.documentContext || {}),
+    contentKind: 'drawing',
+    displayName: packageValue.label,
+  };
+  return packageValue;
 }
 
 export function createDrawingClipboard({
@@ -274,7 +507,6 @@ export function createDrawingClipboard({
   copyButton = null,
   pasteButton = null,
   importAsset = null,
-  stackExporters = {},
   onStatus = () => {},
 } = {}) {
   let internalText = '';
@@ -383,62 +615,58 @@ export function createDrawingClipboard({
       return false;
     }
     canvas.requestHistoryCheckpoint?.('paste');
-    const result = canvas.pasteDrawingData(retargetClipboardDrawing(packageValue, stackId));
+    const result = canvas.pasteDrawingData(
+      retargetClipboardDrawing(packageValue, stackId, canvas.getStackState?.()),
+      { targetStackId: stackId },
+    );
     onStatus(`Pasted ${result.count} object${result.count === 1 ? '' : 's'}.`);
     return result;
   }
 
   function packageForStack(stackId) {
     const snapshot = canvas.getDrawingData();
-    const entityIds = snapshot.entities
-      .filter((entity) => (entity.stackId || 'stack-default') === stackId)
-      .map(({ id }) => id);
-    const arrayIds = (snapshot.extensions?.arrayTools?.arrays || [])
-      .filter((definition) => (definition.stackId || 'stack-default') === stackId)
-      .map(({ id }) => id);
-    const linkedCopyIds = (snapshot.extensions?.linkedCopyTools?.copies || [])
-      .filter((definition) => (definition.stackId || 'stack-default') === stackId)
-      .map(({ id }) => id);
-    return createClipboardPackage(snapshot, { entityIds, arrayIds, linkedCopyIds, label: canvas.getStackState().stacks.find(({ id }) => id === stackId)?.name || 'Stack' });
+    const node = canvas.getStackState().stacks.find(({ id }) => id === stackId);
+    return node?.kind === DRAWING_NODE_KIND
+      ? createDrawingContainerPackage(snapshot, stackId, { label: node.name })
+      : createStackSubtreePackage(snapshot, stackId, { label: node?.name || 'Stack' });
   }
 
-  async function exportStack(stackId, format) {
-    const stack = canvas.getStackState().stacks.find(({ id }) => id === stackId);
-    if (!stack) return false;
-    const packageValue = packageForStack(stackId);
-    try {
-      const exporter = stackExporters[format];
-      if (typeof exporter === 'function') {
-        await exporter({
-          stack,
-          stackId,
-          snapshot: canvas.getDrawingData(),
-          packageValue,
-        });
-      } else {
-        downloadText(await serializePortablePackageJson(packageValue), safeName(stack.name, 'json'), 'application/x-paramagic+json');
-      }
-      return true;
-    } catch (error) {
-      onStatus(`Stack export failed: ${error.message}`, true);
-      return false;
-    }
-  }
-
-  async function importStack(file) {
+  async function importStack(file, { parentStackId = null } = {}) {
     let packageValue;
     try {
-      packageValue = parseClipboardPackage(await hydratePortableImageAssets(
-        JSON.parse(await file.text()), { importAsset },
-      ));
+      const hydrated = await hydratePortableImageAssets(JSON.parse(await file.text()), { importAsset });
+      if (hydrated?.format === PARAMAGIC_CLIPBOARD_FORMAT) {
+        packageValue = parseClipboardPackage(hydrated);
+      } else {
+        packageValue = {
+          format: PARAMAGIC_CLIPBOARD_FORMAT,
+          version: PARAMAGIC_CLIPBOARD_VERSION,
+          label: String(file.name || '').replace(/\.(?:paramagic|json)$/i, '') || 'Stack',
+          drawing: normalizeDrawingData(hydrated),
+        };
+      }
     } catch (error) {
       onStatus(error.message, true);
       return false;
     }
-    const stack = canvas.addStack(packageValue.label || file.name.replace(/\.json$/i, ''));
+    const drawing = clone(packageValue.drawing);
+    const insertAsDrawing = drawing.documentContext?.contentKind !== 'stack-export';
+    const sourceStackState = normalizeStackArchitectureState(drawing.extensions?.stacks);
+    const sourceRoot = sourceStackState.stacks.find(({ parentStackId }) => !parentStackId);
+    if (!insertAsDrawing && sourceRoot?.systemRole === DEFAULT_STACK_ROLE && sourceStackState.stacks.length === 1) {
+      sourceRoot.name = packageValue.label || file.name.replace(/\.(?:paramagic|json)$/i, '');
+      drawing.extensions = { ...(drawing.extensions || {}), stacks: sourceStackState };
+    }
     canvas.requestHistoryCheckpoint?.('insert-stack');
-    const result = canvas.pasteDrawingData(retargetClipboardDrawing(packageValue, stack.id));
-    onStatus(`Inserted stack “${stack.name}” with ${result.count} objects.`);
+    const result = canvas.pasteDrawingData(drawing, {
+      insertParentStackId: parentStackId,
+      insertAsDrawing,
+      drawingContainerName: packageValue.label,
+    });
+    const insertedRootId = result.insertedRootNodeIds?.[0] || result.idMap?.get(sourceRoot?.id);
+    const insertedName = canvas.getStackState?.().stacks.find(({ id }) => id === insertedRootId)?.name
+      || sourceRoot?.name || packageValue.label;
+    onStatus(`Inserted ${insertAsDrawing ? 'drawing' : 'Stack'} “${insertedName}” with ${result.count} objects.`);
     return result;
   }
 
@@ -460,7 +688,6 @@ export function createDrawingClipboard({
     copy,
     cut,
     paste,
-    exportStack,
     importStack,
     packageForSelection,
     packageForStack,

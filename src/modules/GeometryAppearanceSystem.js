@@ -64,6 +64,9 @@ export function createGeometryAppearanceSystem({
   syncGeometryStacking = () => {},
   notifyObjectChange = () => {},
 } = {}) {
+  const evaluateNumericFor = (entity, expression) => solver.evaluateParameterExpression(expression, { stackId: entity?.stackId });
+  const evaluateLengthFor = (entity, expression) => solver.evaluateDrawingLengthExpression(expression, { stackId: entity?.stackId });
+
   function appearance(entity = {}) {
     const sourceAppearance = resolveEntityAppearance(entity) || {};
     const rawZIndex = sourceAppearance.zIndex;
@@ -74,20 +77,20 @@ export function createGeometryAppearanceSystem({
     const strokeOpacityExpression = String(sourceAppearance.strokeOpacityExpression ?? ((sourceAppearance.strokeOpacity ?? 1) * 100));
     const resolvedFill = resolveGeometryFillAppearance(
       sourceAppearance,
-      (expression) => solver.evaluateParameterExpression(expression),
-      (expression) => solver.evaluateDrawingLengthExpression(expression),
+      (expression) => evaluateNumericFor(entity, expression),
+      (expression) => evaluateLengthFor(entity, expression),
     );
     const resolvedStroke = resolveGeometryStrokeAppearance(
       sourceAppearance,
-      (expression) => solver.evaluateParameterExpression(expression),
-      (expression) => solver.evaluateDrawingLengthExpression(expression),
+      (expression) => evaluateNumericFor(entity, expression),
+      (expression) => evaluateLengthFor(entity, expression),
     );
     let fillOpacity = Number.isFinite(Number(sourceAppearance.fillOpacity)) ? Number(sourceAppearance.fillOpacity) : 1;
     let strokeOpacity = Number.isFinite(Number(sourceAppearance.strokeOpacity)) ? Number(sourceAppearance.strokeOpacity) : 1;
     let fillOpacityError = null;
     let strokeOpacityError = null;
-    try { fillOpacity = resolveOpacityExpression(fillOpacityExpression, (expression) => solver.evaluateParameterExpression(expression)); } catch (error) { fillOpacityError = error.message; }
-    try { strokeOpacity = resolveOpacityExpression(strokeOpacityExpression, (expression) => solver.evaluateParameterExpression(expression)); } catch (error) { strokeOpacityError = error.message; }
+    try { fillOpacity = resolveOpacityExpression(fillOpacityExpression, (expression) => evaluateNumericFor(entity, expression)); } catch (error) { fillOpacityError = error.message; }
+    try { strokeOpacity = resolveOpacityExpression(strokeOpacityExpression, (expression) => evaluateNumericFor(entity, expression)); } catch (error) { strokeOpacityError = error.message; }
     return {
       fillExpression,
       fillType: resolvedFill.fillType,
@@ -193,7 +196,7 @@ export function createGeometryAppearanceSystem({
     const strokeAppearances = strokeRecords.map((record) => appearance(record.entity));
     const imageAppearances = selectedImages.map((record) => imageAppearance(
       record.entity,
-      (expression) => solver.evaluateParameterExpression(expression),
+      (expression) => evaluateNumericFor(record.entity, expression),
     ));
     const opacityAppearances = [...fillAppearances, ...imageAppearances];
     const fillColors = new Set(fillAppearances.map(({ fillColor }) => fillColor.toLowerCase()));
@@ -324,11 +327,12 @@ export function createGeometryAppearanceSystem({
     }).map((record) => record.id));
     if (!selectedAppearanceRecords.length && !selectedImages.length) return { success: false, error: 'No editable object selected.' };
     const fillExpression = patch.fillExpression ?? patch.fillColor;
+    const validationEntity = selectedAppearanceRecords[0]?.entity || selectedImages[0]?.entity || {};
     const resolvedFill = fillExpression !== undefined
       ? resolveGeometryFillAppearance(
         { fillExpression },
-        (expression) => solver.evaluateParameterExpression(expression),
-        (expression) => solver.evaluateDrawingLengthExpression(expression),
+        (expression) => evaluateNumericFor(validationEntity, expression),
+        (expression) => evaluateLengthFor(validationEntity, expression),
       )
       : null;
     if (resolvedFill?.fillType === 'image') {
@@ -375,15 +379,15 @@ export function createGeometryAppearanceSystem({
             ...(patch.fillImageLeftExpression !== undefined ? { fillImageLeftExpression: patch.fillImageLeftExpression } : {}),
             ...(patch.fillImageTopExpression !== undefined ? { fillImageTopExpression: patch.fillImageTopExpression } : {}),
           },
-          (expression) => solver.evaluateParameterExpression(expression),
-          (expression) => solver.evaluateDrawingLengthExpression(expression),
+          (expression) => evaluateNumericFor(record.entity, expression),
+          (expression) => evaluateLengthFor(record.entity, expression),
         );
         Object.assign(next, resolved.appearance);
         if (resolved.error) errors.push(resolved.error);
       }
       if (fillOpacityExpression !== undefined) {
         next.fillOpacityExpression = String(fillOpacityExpression);
-        try { next.fillOpacity = resolveOpacityExpression(fillOpacityExpression, (expression) => solver.evaluateParameterExpression(expression)); } catch (error) { errors.push(error.message); }
+        try { next.fillOpacity = resolveOpacityExpression(fillOpacityExpression, (expression) => evaluateNumericFor(record.entity, expression)); } catch (error) { errors.push(error.message); }
       }
       if (strokeTargets.has(record.id)) {
         if (strokeExpression !== undefined
@@ -400,8 +404,8 @@ export function createGeometryAppearanceSystem({
                 ? { strokeImageHeightExpression: patch.strokeImageHeightExpression }
                 : {}),
             },
-            (expression) => solver.evaluateParameterExpression(expression),
-            (expression) => solver.evaluateDrawingLengthExpression(expression),
+            (expression) => evaluateNumericFor(record.entity, expression),
+            (expression) => evaluateLengthFor(record.entity, expression),
           );
           Object.assign(next, resolved.appearance);
           if (resolved.error) errors.push(resolved.error);
@@ -409,7 +413,7 @@ export function createGeometryAppearanceSystem({
         if (strokeThickness !== null) next.strokeThickness = strokeThickness;
         if (strokeOpacityExpression !== undefined) {
           next.strokeOpacityExpression = String(strokeOpacityExpression);
-          try { next.strokeOpacity = resolveOpacityExpression(strokeOpacityExpression, (expression) => solver.evaluateParameterExpression(expression)); } catch (error) { errors.push(error.message); }
+          try { next.strokeOpacity = resolveOpacityExpression(strokeOpacityExpression, (expression) => evaluateNumericFor(record.entity, expression)); } catch (error) { errors.push(error.message); }
         }
       }
       return { id: record.id, appearance: next, patch };

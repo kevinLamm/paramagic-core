@@ -3,6 +3,7 @@ import { clampTranslatedPanelOffset } from './CanvasUIControls.js';
 import { normalizeDrawingData, parseDrawingText, serializeDrawingJson } from './DrawingIO.js';
 import { unitFactors, valueInUnit } from './solver/Units.js';
 import { loadOpenCv, imageWorldToLocalPoint, normalizeImageTraceSettings, prepareImageTrace, tracePreparedImageRegion } from './ImageTrace.js';
+import { createUuid } from './IdentitySystem.js';
 
 // --- Image Fill System & References ---
 const IMAGE_REFERENCE = /^(?:basic|user|imported)\/[A-Za-z0-9%._~!$&'()+,;=:@/-]+$/;
@@ -1040,7 +1041,7 @@ function normalizeManifestAsset(value, index) {
   const width = Number(asset.standardTileWidth);
   const height = Number(asset.standardTileHeight);
   return {
-    id: reference,
+    assetReference: reference,
     scope: 'basic',
     reference,
     name: String(asset.name || derivedName),
@@ -1707,13 +1708,6 @@ export async function warpImageEntity(input) {
 
 // --- Image Manipulation ---
 const minimumImageSize = 24;
-let fallbackId = 0;
-
-function createId() {
-  if (globalThis.crypto?.randomUUID) return `image-${globalThis.crypto.randomUUID()}`;
-  fallbackId += 1;
-  return `image-${Date.now().toString(36)}-${fallbackId}`;
-}
 
 function finite(value, fallback) {
   return Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -1752,9 +1746,9 @@ export function normalizeImageEntity(input = {}) {
   const originalWidth = Math.max(minimumImageSize, Math.abs(finite(input.originalWidth, input.warp?.originalWidth ?? baseWidth)));
   const originalHeight = Math.max(minimumImageSize, Math.abs(finite(input.originalHeight, input.warp?.originalHeight ?? baseHeight)));
   return {
-    id: input.id || createId(),
+    id: input.id || createUuid(),
     type: 'image',
-    stackId: String(input.stackId || 'stack-default'),
+    stackId: input.stackId ? String(input.stackId) : null,
     name: String(input.name || 'Image'),
     source,
     originalSource,
@@ -2160,7 +2154,6 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     else {
       record.traceActive = true;
       record.tracePanel.hidden = false;
-      record.resetPanel.hidden = true;
       window.dispatchEvent(new CustomEvent('paramagic:tool-activated', { detail: { source: 'image-trace' } }));
     }
     updateRecord(record);
@@ -2187,7 +2180,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
   function updateRecord(record) {
     const entity = record.entity;
     const scale = getScale();
-    const appearance = imageAppearance(entity, evaluateNumeric);
+    const appearance = imageAppearance(entity, (expression) => evaluateNumeric(expression, entity));
     record.group.setAttribute('transform', `translate(${entity.x} ${entity.y})`);
     record.transform.setAttribute('transform', `rotate(${entity.rotation}) scale(${entity.flipX ? -1 : 1} ${entity.flipY ? -1 : 1})`);
     record.image.setAttribute('x', -entity.width / 2);
@@ -2233,7 +2226,6 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     record.warpButton.setAttribute('aria-pressed', String(Boolean(entity.warp?.enabled)));
     record.warpButton.classList.toggle('active', Boolean(entity.warp?.enabled));
     if (entity.locked) {
-      record.resetPanel.hidden = true;
       record.selectedWarpCorner = null;
     }
     record.group.classList.toggle('locked', entity.locked);
@@ -2250,7 +2242,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
   }
 
   function beginDrag(event, record, mode, cornerIndex = null) {
-    if (!canStartDrag()) return;
+    if (!canStartDrag(record)) return;
     if (event.button === 0 && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       event.stopPropagation();
@@ -2335,21 +2327,6 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     warpButton.setAttribute('aria-pressed', 'false');
     const traceButton = toolbarButton('Trace Region', 'trace');
     traceButton.setAttribute('aria-pressed', 'false');
-    const resetPanel = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
-    resetPanel.className = 'image-reset-warning';
-    resetPanel.hidden = true;
-    resetPanel.innerHTML = `
-      <p>Reset this image's size, rotation, and flips?</p>
-      <div class="image-reset-actions">
-        <button type="button" class="image-reset-confirm" aria-label="Reset image" title="Reset image">
-          <svg viewBox="0 0 24 24" aria-hidden="true">${toolbarIcons.reset}</svg>
-        </button>
-        <button type="button" class="image-reset-cancel" aria-label="Cancel image reset" title="Cancel">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
-        </button>
-      </div>`;
-    const resetConfirmButton = resetPanel.querySelector('.image-reset-confirm');
-    const resetCancelButton = resetPanel.querySelector('.image-reset-cancel');
     const tracePanel = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
     tracePanel.className = 'image-trace-panel';
     tracePanel.hidden = true;
@@ -2369,7 +2346,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     const traceStatus = tracePanel.querySelector('.image-trace-status');
     const traceCreateButton = tracePanel.querySelector('.image-trace-create');
     const traceCancelButton = tracePanel.querySelector('.image-trace-cancel');
-    toolbarContent.append(lockButton, horizontalButton, verticalButton, resetButton, warpButton, traceButton, resetPanel, tracePanel);
+    toolbarContent.append(lockButton, horizontalButton, verticalButton, resetButton, warpButton, traceButton, tracePanel);
     toolbar.appendChild(toolbarContent);
     const record = {
       id: entity.id,
@@ -2394,7 +2371,6 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       warpButton,
       traceButton,
       selectedWarpCorner: null,
-      resetPanel,
       tracePanel,
       traceToleranceInput,
       traceDetailInput,
@@ -2457,17 +2433,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       event.stopPropagation();
       if (record.entity.locked) return;
       closeTrace(record);
-      resetPanel.hidden = !resetPanel.hidden;
-    });
-    resetCancelButton.addEventListener('click', (event) => {
-      event.stopPropagation();
-      resetPanel.hidden = true;
-    });
-    resetConfirmButton.addEventListener('click', (event) => {
-      event.stopPropagation();
-      if (record.entity.locked) return;
       record.entity = resetImageEntity(record.entity);
-      resetPanel.hidden = true;
       finishChange(record);
     });
     warpButton.addEventListener('click', (event) => {
@@ -2579,7 +2545,6 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     }
     record.group.classList.toggle('selected', selected);
     record.toolbar.style.display = selected ? '' : 'none';
-    if (!selected) record.resetPanel.hidden = true;
     record.handleGroup.style.display = selected && !record.entity.locked && !record.traceActive ? '' : 'none';
     record.rotationStem.style.display = selected && !record.entity.locked && !record.traceActive ? '' : 'none';
     record.warpGuide.style.display = selected && record.entity.warp?.enabled ? '' : 'none';
@@ -2587,10 +2552,10 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
   }
 
   function setAppearance(record, patch) {
-    const current = imageAppearance(record.entity, evaluateNumeric);
+    const current = imageAppearance(record.entity, (expression) => evaluateNumeric(expression, record.entity));
     const expression = patch.fillOpacityExpression ?? current.fillOpacityExpression;
     const appearance = { ...(record.entity.appearance || {}), fillOpacityExpression: String(expression), fillOpacity: current.fillOpacity };
-    try { appearance.fillOpacity = resolveOpacityExpression(expression, evaluateNumeric); } catch { /* retain last valid opacity */ }
+    try { appearance.fillOpacity = resolveOpacityExpression(expression, (value) => evaluateNumeric(value, record.entity)); } catch { /* retain last valid opacity */ }
     record.entity.appearance = appearance;
     finishChange(record);
     return true;
@@ -2881,5 +2846,8 @@ export async function hydratePortableImageAssets(documentInput, { importAsset } 
 
 export async function parsePortableDrawingText(fileName, text, { importAsset } = {}) {
   if (/\.dxf$/i.test(fileName)) return parseDrawingText(fileName, text);
-  return normalizeDrawingData(await hydratePortableImageAssets(JSON.parse(text), { importAsset }));
+  const hydrated = await hydratePortableImageAssets(JSON.parse(text), { importAsset });
+  return normalizeDrawingData(hydrated?.format === 'ParaMagic Clipboard' && hydrated.drawing
+    ? hydrated.drawing
+    : hydrated);
 }

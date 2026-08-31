@@ -144,6 +144,7 @@ export function createObjectVisibilitySystem({
   canvasElement = null,
   owners = () => [],
   ownerForRecord = () => null,
+  additionalVisibilityRecord = () => false,
   evaluateExpression = null,
   resolveEntityAppearance = (entity) => entity?.appearance || {},
   applyEntityAppearanceOverrides = (entity, appearance) => ({ ...entity, appearance }),
@@ -156,12 +157,15 @@ export function createObjectVisibilitySystem({
 } = {}) {
   let showHiddenObjects = false;
   let visibleByRecordId = new Map();
+  const isStandaloneVisibilityRecord = (record) => (
+    isGeometryVisibilityRecord(record) || additionalVisibilityRecord(record)
+  );
 
   function stateForOwner(owner) {
     const entity = visibilityEntityForOwner(owner, records);
     return objectVisibilityState(
       { ...entity, appearance: resolveEntityAppearance(entity) },
-      evaluateExpression,
+      (expression) => evaluateExpression?.(expression, entity),
     );
   }
 
@@ -172,7 +176,7 @@ export function createObjectVisibilitySystem({
     });
     const coveredRecordIds = new Set([...result.values()]
       .flatMap((owner) => owner.recordIds || []));
-    records.filter(isGeometryVisibilityRecord).forEach((record) => {
+    records.filter(isStandaloneVisibilityRecord).forEach((record) => {
       if (!coveredRecordIds.has(record.id)) {
         result.set(record.id, singleRecordVisibilityOwner(record));
       }
@@ -188,7 +192,7 @@ export function createObjectVisibilitySystem({
     ));
     if (resolvedOwner) return resolvedOwner;
     const record = records.find((candidate) => (
-      candidate.id === recordId && isGeometryVisibilityRecord(candidate)
+      candidate.id === recordId && isStandaloneVisibilityRecord(candidate)
     ));
     return record ? singleRecordVisibilityOwner(record) : null;
   }
@@ -236,19 +240,30 @@ export function createObjectVisibilitySystem({
     const expression = patch.visibleExpression !== undefined
       ? normalizeVisibleExpression(patch.visibleExpression)
       : (patch.visible === false ? 'FALSE' : 'TRUE');
-    const evaluated = evaluateVisibleExpression(expression, evaluateExpression);
-    if (evaluated.error) {
+    const evaluatedTargets = targets.map((owner) => {
+      const entity = visibilityEntityForOwner(owner, records);
+      return {
+        owner,
+        evaluated: evaluateVisibleExpression(expression, (value) => evaluateExpression?.(value, entity)),
+      };
+    });
+    const evaluationError = evaluatedTargets.find(({ evaluated }) => evaluated.error)?.evaluated.error || null;
+    if (evaluationError) {
       targetIds.forEach((id) => {
         const record = records.find((candidate) => candidate.id === id);
-        if (record) record.visibilityError = evaluated.error;
+        if (record) record.visibilityError = evaluationError;
       });
       notifySelectionChange();
-      return { success: false, error: evaluated.error };
+      return { success: false, error: evaluationError };
     }
     if (history) requestHistoryCheckpoint('object-visibility-update');
+    const evaluationByRecordId = new Map(evaluatedTargets.flatMap(({ owner, evaluated }) => (
+      (owner.recordIds || []).map((id) => [id, evaluated])
+    )));
     const updates = [...targetIds].map((id) => {
       const record = records.find((candidate) => candidate.id === id);
       const entity = record?.entity;
+      const evaluated = evaluationByRecordId.get(id);
       const appearance = {
         ...resolveEntityAppearance(entity),
         visible: evaluated.value,
@@ -360,7 +375,10 @@ export function thumbnailVisibilitySourceIds(entity) {
 export function filterVisibleResolvedEntities(drawing = {}, entities = [], evaluateExpression) {
   const visibleById = new Map((drawing.entities || [])
     .filter(({ id }) => id)
-    .map((entity) => [entity.id, objectVisibilityState(entity, evaluateExpression).value]));
+    .map((entity) => [
+      entity.id,
+      objectVisibilityState(entity, (expression) => evaluateExpression?.(expression, entity)).value,
+    ]));
   return entities.filter((entity) => {
     const sourceIds = thumbnailVisibilitySourceIds(entity).filter((id) => visibleById.has(id));
     return !sourceIds.length || sourceIds.every((id) => visibleById.get(id) !== false);

@@ -7,6 +7,23 @@ import {
   subtractDrawingResults,
   subtractMaterialTarget,
 } from './SubtractSystem.js';
+import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
+import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+
+registerIdentitySchema('seamLines', {
+  declarations: (value) => (value?.definitions || []).map((object, index) => ({
+    object, key: 'id', value: object.id, path: ['extensions', 'seamLines', 'definitions', String(index), 'id'], kind: 'seam-line-definition',
+  })),
+  liveReferenceKeys: ['regionId', 'recordId', 'sourceId', 'targetId'],
+  liveReferenceArrayKeys: ['recordIds'],
+  targetKindsByKey: {
+    regionId: ['entity'],
+    recordId: ['entity'],
+    recordIds: ['entity'],
+    sourceId: ['entity'],
+    targetId: ['entity'],
+  },
+});
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -185,6 +202,7 @@ export function normalizeSeamLineDefinition(value = {}) {
     if (normalized) overrides.set(seamLineEdgeKey(normalized), normalized);
   });
   return {
+    id: String(value.id || createUuid()),
     regionId: regionId || recordIds[0],
     recordIds,
     defaultEnabled: value.defaultEnabled === true,
@@ -743,12 +761,15 @@ function trimSplineOffsetToNeighbor(spline, atEnd, neighbor, neighborAtStart) {
       splineJoinPoint,
       neighborArc,
     )
-    : seamLineSplineLineTrim(
-      spline.points,
-      neighborJoinPoint,
-      neighborAtStart ? neighbor.startTangent : neighbor.endTangent,
-      splineJoinPoint,
-    );
+    : {
+      point: lineIntersection(
+        splineJoinPoint,
+        atEnd ? spline.endTangent : spline.startTangent,
+        neighborJoinPoint,
+        neighborAtStart ? neighbor.startTangent : neighbor.endTangent,
+      ),
+      segmentIndex: atEnd ? spline.points.length - 2 : 0,
+    };
   if (!hit) return null;
   if (atEnd) {
     spline.points = [...spline.points.slice(0, hit.segmentIndex + 1), hit.point];
@@ -980,11 +1001,6 @@ export function createSeamLineEntities(
       if (combinedArc) return [combinedArc];
       return run.map((item) => offsetArcEntity(item)).filter(Boolean);
     }
-    if (run.some(({ feature }) => feature.kind === 'arc')) {
-      return run.flatMap((item) => item.feature.kind === 'arc'
-        ? [offsetArcEntity(item)].filter(Boolean)
-        : [polylineEntity([item], item.points)]);
-    }
     return [polylineEntity(run, points)];
   };
   const runs = connectedRuns(offsets).flatMap((run) => {
@@ -1148,8 +1164,8 @@ export function materializeSeamLineEntitiesForDrawing(drawing = {}, options = {}
       boundary.features,
     ).map((entity, index) => ({
       ...entity,
-      id: `seam-line-v2:${definition.regionId}:${index}`,
-      stackId: boundary.stackId || 'stack-default',
+       id: deriveUuidForKey('seam-line-presentation', definition.id, index),
+       stackId: boundary.stackId || null,
       appearance: {
         strokeThickness: 1.5,
         strokeOpacity: 1,
@@ -1228,6 +1244,7 @@ export function createSeamLineSystem({
   resolvePresentationHost = () => null,
   isStackVisible = () => true,
   isStackActive = () => true,
+  getActiveStackId = () => null,
 }) {
   let propertyFeatures = [];
   let state = normalizeSeamLineExtension();
@@ -1325,7 +1342,10 @@ export function createSeamLineSystem({
   function setDefinition(nextDefinition, previousDefinition = null) {
     const previous = previousDefinition || state.definitions.find((definition) => definition.regionId === nextDefinition.regionId);
     const definitions = state.definitions.filter((definition) => definition !== previous);
-    const normalized = normalizeSeamLineDefinition(nextDefinition);
+    const normalized = normalizeSeamLineDefinition({
+      ...nextDefinition,
+      id: nextDefinition.id || previous?.id,
+    });
     const enabledOverrides = normalized?.overrides.filter((item) => item.enabled !== normalized.defaultEnabled) || [];
     if (normalized && (normalized.defaultEnabled || enabledOverrides.length)) {
       definitions.push({ ...normalized, overrides: enabledOverrides });
@@ -1430,10 +1450,10 @@ export function createSeamLineSystem({
         'data-seam-line-id': entity.id,
         'data-owner-record-id': ownerRecordId || '',
         'data-source-ids': sourceIds.join(','),
-        'data-stack-id': entity.stackId || 'stack-default',
+        'data-stack-id': entity.stackId || '',
       });
-      group.classList.toggle('stack-hidden', !isStackVisible(entity.stackId || 'stack-default'));
-      group.classList.toggle('stack-inactive', !isStackActive(entity.stackId || 'stack-default'));
+      group.classList.toggle('stack-hidden', !isStackVisible(entity.stackId));
+      group.classList.toggle('stack-inactive', Boolean(getActiveStackId()) && !isStackActive(entity.stackId));
       group.style.pointerEvents = 'none';
       group.appendChild(node);
       entry.groups.push(group);

@@ -4,6 +4,7 @@ import {
   readParameterTableFile,
   replaceParametersFromRows,
 } from './ParameterTableIO.js';
+import { stackNameById } from './NamingSystem.js';
 
 const PARAMETER_TABLE_GROUPS = [
   { key: 'parameter', label: 'Parameters' },
@@ -127,11 +128,15 @@ export function controlLabelForParameter(entry, controlItems = []) {
   return String(control?.label ?? '').trim();
 }
 
-export function parameterNameEditorMarkup(entry, { controlItems = [] } = {}) {
+export function parameterNameEditorMarkup(entry, { controlItems = [], stackState = null } = {}) {
   const controlLabel = controlLabelForParameter(entry, controlItems);
+  const stackName = entry?.kind === 'dimension'
+    ? stackNameById(stackState).get(entry?.stackId)
+    : '';
   return `<div class="parameter-name-editor">
     <input class="parameter-name" aria-label="Parameter name" value="${escapeHtml(entry?.name)}" />
     ${controlLabel ? `<span class="parameter-control-label-ghost" aria-label="Control label: ${escapeHtml(controlLabel)}">${escapeHtml(controlLabel)}</span>` : ''}
+    ${stackName ? `<span class="parameter-stack-name-ghost" data-stack-id="${escapeHtml(entry.stackId)}" aria-label="Stack name: ${escapeHtml(stackName)}">@${escapeHtml(stackName)}</span>` : ''}
   </div>`;
 }
 
@@ -196,6 +201,7 @@ export function createParametersPanelController({
   closeButton,
   drawingName = '',
   expressionForEntry,
+  nameForEntry,
   onViewChange,
   onHelp,
   onRender,
@@ -232,6 +238,7 @@ export function createParametersPanelController({
       try {
         downloadParameterTable(await createParameterTableExport(solver.parameters(), button.dataset.parameterExportFormat, {
           expressionForEntry,
+          nameForEntry,
         }), drawingName);
         setStatus(`Exported all Parameters, Dimensions, and Controls as ${button.dataset.parameterExportFormat.toUpperCase()}.`);
       } catch (error) {

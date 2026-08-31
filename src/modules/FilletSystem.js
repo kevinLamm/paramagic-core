@@ -1,6 +1,7 @@
 import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { arcSweepFromAngles } from './ArcGeometry.js';
 import { isSwellEntity, swellDefinitionForEntity, withSwellDefinition } from './SwellGeometry.js';
+import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const subtract = (a, b) => [a[0] - b[0], a[1] - b[1]];
@@ -423,7 +424,7 @@ export function regularFilletConstraints({ arcId, filletArc, firstEntity, firstR
   const secondTangentMode = arcTangentMode(secondEntity, filletArc);
   return [
     {
-      id: `${arcId}:coincident-start`,
+      id: deriveUuidForKey('fillet-solve', arcId, 'coincident-start'),
       type: 'Coincident',
       featureRefs: [
         { kind: 'point', recordId: firstRecordId, index: firstIndex },
@@ -432,7 +433,7 @@ export function regularFilletConstraints({ arcId, filletArc, firstEntity, firstR
       source: 'fillet',
     },
     {
-      id: `${arcId}:coincident-end`,
+      id: deriveUuidForKey('fillet-solve', arcId, 'coincident-end'),
       type: 'Coincident',
       featureRefs: [
         { kind: 'point', recordId: secondRecordId, index: secondIndex },
@@ -441,14 +442,14 @@ export function regularFilletConstraints({ arcId, filletArc, firstEntity, firstR
       source: 'fillet',
     },
     {
-      id: `${arcId}:tangent-first`,
+      id: deriveUuidForKey('fillet-solve', arcId, 'tangent-first'),
       type: 'Tangent',
       featureRefs: [firstTangent, { kind: 'arc', recordId: arcId }],
       ...(firstTangentMode ? { tangentMode: firstTangentMode } : {}),
       source: 'fillet',
     },
     {
-      id: `${arcId}:tangent-second`,
+      id: deriveUuidForKey('fillet-solve', arcId, 'tangent-second'),
       type: 'Tangent',
       featureRefs: [secondTangent, { kind: 'arc', recordId: arcId }],
       ...(secondTangentMode ? { tangentMode: secondTangentMode } : {}),
@@ -543,7 +544,7 @@ export function filletTopologyConstraints(constraints = [], fillets = []) {
   });
   const synthetic = fillets.flatMap((fillet) => [
     {
-      id: `${fillet.id}:start`,
+      id: deriveUuidForKey('fillet-topology', fillet.id, 'start'),
       type: 'Coincident',
       featureRefs: [
         { kind: 'point', recordId: fillet.sourceA.recordId, index: fillet.sourceA.index },
@@ -551,7 +552,7 @@ export function filletTopologyConstraints(constraints = [], fillets = []) {
       ],
     },
     {
-      id: `${fillet.id}:end`,
+      id: deriveUuidForKey('fillet-topology', fillet.id, 'end'),
       type: 'Coincident',
       featureRefs: [
         { kind: 'point', recordId: fillet.sourceB.recordId, index: fillet.sourceB.index },
@@ -563,8 +564,7 @@ export function filletTopologyConstraints(constraints = [], fillets = []) {
 }
 
 export function createFilletId() {
-  if (globalThis.crypto?.randomUUID) return `fillet-${globalThis.crypto.randomUUID()}`;
-  return `fillet-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return createUuid();
 }
 
 export function createFilletTools({ toolbar, canvas }) {
@@ -907,9 +907,10 @@ export function createFilletSystem({
   }
 
   function validateRadiusExpression(recordId, expression) {
+    const record = records.find((candidate) => candidate.id === recordId && candidate.recordType === 'fillet');
     let radius;
     try {
-      radius = solver.evaluateDrawingLengthExpression(expression);
+      radius = solver.evaluateDrawingLengthExpression(expression, { stackId: record?.entity?.stackId });
     } catch (error) {
       return { valid: false, error: error.message };
     }

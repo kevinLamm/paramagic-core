@@ -1,18 +1,19 @@
 import {
   createDimensionLinkManager,
   createDimensionRecord,
-  createDrivenDimensionExportPersistence,
+  createDimensionValueOnlyPersistence,
   dimensionAnchorRecordIds,
   dimensionHandles,
   dimensionHiddenInTextMode,
   dimensionMode,
   dimensionParentStates,
+  dimensionTextEditable,
   isDimensionEntity,
   moveDimensionHandle,
   moveDimensionLine,
   updateDimensionNode,
 } from './DimensionSystem.js';
-import { formatUnitlessValue, formatUnitValue } from './solver/Units.js';
+import { formatParameterFieldValue, formatUnitlessValue, formatUnitValue } from './solver/Units.js';
 import { mergeDrawingData, mergeDrawingDataWithMap, normalizeDrawingData } from './DrawingIO.js';
 import {
   closedGeometryTopologyEntities,
@@ -38,15 +39,27 @@ import { createNotchSystem } from './NotchSystem.js';
 import { isNotchEntity, projectPointToNotchFeature, createNotchBoundaryResolver } from './NotchSystem.js';
 import { createOverlapSelectionCycler, clampCanvasZoom } from './CanvasViewport.js';
 import {
-  CANVAS_ORIGIN_RECORD_ID,
   canvasOriginPointFeature,
 } from './CanvasOrigin.js';
-import { createTextEntity, createTextSystem, isTextEntity, rememberTextDefaults } from './TextTools.js';
+import {
+  createTextEntity,
+  createTextSystem,
+  isTextEntity,
+  isTextVisibilityRecord,
+  rememberTextDefaults,
+} from './TextTools.js';
 import { createTableSystem, normalizeTableEntity, tableCornerPoints, tableCornerIndexFromSolverIndex, tableSolverCornerIndex } from './TableTools.js';
 import { deleteCurveControlPoint, insertCurveControlPoint } from './DrawingTools.js';
 import { createSeamLineSystem } from './SeamLineSystem.js';
 import { isSubtractableEntity, createSubtractSystem } from './SubtractSystem.js';
 import { createStackSystem } from './StackSystem.js';
+import { subtreeStackIds } from './StackArchitecture.js';
+import {
+  createStackActivationCoordinator,
+  createStackActivationSystem,
+} from './StackActivationSystem.js';
+import { qualifiedDimensionName, rewriteQualifiedDimensionReferences } from './NamingSystem.js';
+import { pruneDormantStackRelationships } from './StackRelationshipSystem.js';
 import { createObjectVisibilitySystem } from './ObjectVisibility.js';
 import { createClassSystem, isClassGeometryEntity } from './ClassSystem.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from './ArcGeometry.js';
@@ -65,6 +78,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   let windowSelect = null;
   let suppressNextCanvasClick = false;
   let hoveredId = null;
+  let hoveredOwnerStackId = null;
   let hoveredRegion = null;
   let selectedSegment = null;
   const selectedSegments = new Map();
@@ -93,10 +107,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const objectChangeListeners = new Set();
   const presentationChangeListeners = new Set();
   const selectionChangeListeners = new Set();
+  const canvasHoverListeners = new Set();
   const drawingExtensionProviders = new Map();
   const derivedDimensionFeatureProviders = new Set();
   const derivedBoundaryFeatureProviders = new Set();
   const derivedPresentationProviders = new Set();
+  const derivedSelectionProviders = new Set();
   const subtractOperandProviders = new Set();
   const selectionPropertyProviders = new Set();
   let loadedDrawingExtensions = {};
@@ -105,6 +121,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const g = document.createElementNS(ns, 'g');
   const axisLayer = document.createElementNS(ns, 'g');
   const objectLayer = document.createElementNS(ns, 'g');
+  const stackHoverLayer = document.createElementNS(ns, 'g');
   const hoverLayer = document.createElementNS(ns, 'g');
   const overlapCycleLayer = document.createElementNS(ns, 'g');
   const handleLayer = document.createElementNS(ns, 'g');
@@ -116,26 +133,72 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   let subtractSystem = null;
   let seamLineSystem = null;
   let objectVisibilitySystem = null;
+  let stackActivationSystem = null;
+  let stackActivationCoordinator = null;
   const selectionBox = document.createElement('div');
   const dimensionEditPanel = document.createElement('div');
   const stackSystem = createStackSystem({
     records,
     selectedIds,
     canvasElement: canvas,
+    hoverOverlayLayer: stackHoverLayer,
+    resolveCanvasInteractionStackId: () => hoveredOwnerStackId,
     onRecordDisabled(record) {
       selectedSegments.delete(record.id);
       if (selectedSegment?.recordId === record.id) selectedSegment = null;
-      if (hoveredId === record.id) hoveredId = null;
     },
-    onChange: ({ history = 'coalesce' } = {}) => {
+    onChange: ({ history = 'coalesce', reason = '' } = {}) => {
+      solver.setStackState?.(stackSystem.getState());
+      const activationResult = reason !== 'activation' ? stackActivationCoordinator?.refresh({
+        compile: ['add', 'remove-subtree', 'rename', 'restore', 'enabled', 'enabled-expression'].includes(reason),
+        allowRollback: reason !== 'restore',
+      }) : null;
       syncStackPresentation();
       syncGeometryStacking();
       seamLineSystem?.refresh();
       constraintOverlaySystem?.render?.();
       syncState();
-      objectChangeListeners.forEach((listener) => listener({ count: records.length, history }));
+      const resolvedHistory = activationResult?.status === 'failed' ? 'none' : history;
+      objectChangeListeners.forEach((listener) => listener({ count: records.length, history: resolvedHistory }));
+      return activationResult;
+    },
+    onPresentationChange: () => {
+      syncStackPresentation();
     },
   });
+  stackActivationSystem = createStackActivationSystem({
+    getStackState: stackSystem.getState,
+    expressionSymbols: (options) => solver.parameterExpressionSymbols?.(options) || [],
+    expressionEntries: (options) => solver.parameterExpressionEntries?.(options) || [],
+    evaluateExpression: (expression, options) => solver.evaluateParameterExpression(expression, options),
+  });
+  stackActivationCoordinator = createStackActivationCoordinator({
+    activationSystem: stackActivationSystem,
+    getParameters: () => solver.parameters?.() || [],
+    getStackState: stackSystem.getState,
+    getStackRuntimeState: stackSystem.getRuntimeState,
+    restoreStackState: (state) => stackSystem.restore(state, { preserveSelection: true }),
+    applyStackRuntimeStates: stackSystem.setActivationStates,
+    setEnabledStackIds: (stackIds) => solver.setEnabledStackIds?.(stackIds) || { changed: false },
+    getSolverSnapshot: () => solver.getSketchSnapshot?.(),
+    restoreSolverSnapshot: (snapshot) => solver.loadSketch(snapshot),
+    entityIdsForStackIds: (stackIds) => records
+      .filter((record) => stackIds.has(record.entity?.stackId) && solver.getEntity?.(record.id))
+      .map(({ id }) => id),
+    solve: (options) => solver.solve(options),
+    applySolvedGeometry: (changedEntityIds) => {
+      if (changedEntityIds?.length) {
+        applySolverSnapshot(solver.getGeometrySnapshot(changedEntityIds), { incremental: true });
+      } else {
+        applySolverSnapshot();
+      }
+    },
+    afterStable: () => {
+      syncStackPresentation();
+      syncGeometryStacking();
+    },
+  });
+  solver.setStackState?.(stackSystem.getState(), { rewriteExpressions: false, emit: false });
   const classSystem = createClassSystem({
     records,
     selectedIds,
@@ -175,12 +238,13 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     <p class="dimension-edit-error" role="alert" aria-live="polite"></p>
   `;
   canvas.append(selectionBox, dimensionEditPanel);
+  stackHoverLayer.setAttribute('class', 'canvas-stack-hover-layer');
   hoverLayer.setAttribute('class', 'canvas-hover-layer');
   overlapCycleLayer.setAttribute('class', 'canvas-overlap-cycle-layer');
   handleLayer.setAttribute('class', 'canvas-handle-layer');
   svg.insertBefore(imageFillDefs, svg.firstChild);
   svg.appendChild(g);
-  g.append(axisLayer, objectLayer, hoverLayer, overlapCycleLayer, handleLayer, interactionLayer, previewLayer);
+  g.append(axisLayer, objectLayer, stackHoverLayer, hoverLayer, overlapCycleLayer, handleLayer, interactionLayer, previewLayer);
   const imageFillSystem = createImageFillSystem({
     defs: imageFillDefs,
     addSvg: add,
@@ -283,7 +347,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const dimensionEditLabelText = dimensionEditPanel.querySelector('.dimension-edit-label > span');
   const dimensionEditOptions = dimensionEditPanel.querySelector('#dimensionEditParameterNames');
   const dimensionEditError = dimensionEditPanel.querySelector('.dimension-edit-error');
-  const persistDrivenDimensionExport = createDrivenDimensionExportPersistence({
+  const persistDimensionValueOnly = createDimensionValueOnlyPersistence({
     solver,
     onChange: () => notifyObjectChange({ history: 'commit' }),
   });
@@ -294,20 +358,20 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     screenToWorld,
     getScale: () => camera.scale,
     getDrawingUnit: () => solver.drawingUnit || 'in',
-    evaluateNumeric: (expression) => solver.evaluateParameterExpression(expression),
+    evaluateNumeric: (expression, entity = null) => solver.evaluateParameterExpression(expression, { stackId: entity?.stackId || stackSystem.activeStackId() }),
     onSelect: (recordId, event = null) => {
       if (event?.ctrlKey || event?.metaKey) toggleSelection(recordId);
       else selectOnly(recordId);
     },
     onMoveStart: (event, record) => {
-      if (event.button !== 0 || selectedIds.size < 2 || !selectedIds.has(record.id)) return false;
+      if (!isRecordInteractive(record) || event.button !== 0 || selectedIds.size < 2 || !selectedIds.has(record.id)) return false;
       event.preventDefault();
       event.stopPropagation();
       if (!record.entity.locked) beginRecordsDrag(event);
       record.group.setPointerCapture(event.pointerId);
       return true;
     },
-    canStartDrag: () => !isToolDragBlocked(),
+    canStartDrag: (record) => !isToolDragBlocked() && isRecordInteractive(record),
     onChange: () => {
       syncGeometryStacking();
       syncState();
@@ -325,11 +389,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     }),
   });
 
-  const evaluateFieldExpression = (expression) => {
+  const evaluateFieldExpression = (expression, entity = null) => {
+    const options = { stackId: entity?.stackId || stackSystem.activeStackId() };
     try {
-      return solver.evaluateDrawingLengthExpression(expression);
+      return solver.evaluateDrawingLengthExpression(expression, options);
     } catch {
-      return solver.evaluateParameterExpression(expression);
+      return solver.evaluateParameterExpression(expression, options);
     }
   };
 
@@ -338,10 +403,19 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     interactionSurface: canvas,
     getScale: () => camera.scale,
     getAppearance: geometryAppearanceSystem.appearance,
-    getParameters: () => [...solver.documentVariables?.() || [], ...solver.parameters()],
-    formatParameter: (entry) => formatUnitlessValue(entry.value, solver.drawingUnit || 'in'),
+    getParameters: (entity = null) => [
+      ...solver.documentVariables?.() || [],
+      ...solver.parameterExpressionEntries({
+        stackId: entity?.stackId || stackSystem.activeStackId(),
+        includeLocalAliases: true,
+      }),
+    ],
+    formatParameter: (entry) => formatParameterFieldValue(entry, solver.drawingUnit || 'in'),
     evaluateExpression: evaluateFieldExpression,
-    canInteract: () => !(drawingMode || smartDimensionDelegate || featureCommandDelegate),
+    canInteract: (_event, record) => (
+      !(drawingMode || smartDimensionDelegate || featureCommandDelegate)
+      && isRecordInteractive(record)
+    ),
     onClearPropertyFeature: () => seamLineSystem.clearPropertyFeature(),
     onSelect: (record) => selectOnly(record.id),
     onToggleSelection: (record) => toggleSelection(record.id),
@@ -365,8 +439,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     previewLayer,
     screenToWorld,
     getScale: () => camera.scale,
-    getParameters: () => [...solver.documentVariables?.() || [], ...solver.parameters()],
-    formatParameter: (entry) => formatUnitlessValue(entry.value, solver.drawingUnit || 'in'),
+    getParameters: (entity = null) => [
+      ...solver.documentVariables?.() || [],
+      ...solver.parameterExpressionEntries({
+        stackId: entity?.stackId || stackSystem.activeStackId(),
+        includeLocalAliases: true,
+      }),
+    ],
+    formatParameter: (entry) => formatParameterFieldValue(entry, solver.drawingUnit || 'in'),
     evaluateExpression: evaluateFieldExpression,
     onSelect: selectOnly,
     onHandlePointerDown: (event, record, index) => startHandleDrag(event, record, index),
@@ -470,7 +550,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function recordAppearance(record) {
     return record.recordType === 'image'
-      ? imageAppearance(record.entity, (expression) => solver.evaluateParameterExpression(expression))
+      ? imageAppearance(record.entity, (expression) => solver.evaluateParameterExpression(expression, { stackId: record.entity.stackId }))
       : geometryAppearanceSystem.appearance(record.entity);
   }
 
@@ -498,6 +578,83 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       .map(({ record }) => record);
   }
 
+  function orderedDerivedPaintNodes() {
+    return currentDerivedPaintPlan().unanchored.filter((node) => (
+      String(node.dataset?.paintOrderKey || '').trim()
+    ));
+  }
+
+  function editablePaintOrder() {
+    const childPositions = new Map(
+      [...objectLayer.children].map((node, index) => [node, index]),
+    );
+    const recordItems = editableStackOrder().map((record) => {
+      const explicitZIndex = Number(recordAppearance(record).zIndex);
+      return {
+        paintKey: record.id,
+        recordId: record.id,
+        record,
+        node: record.group,
+        stackId: record.entity.stackId || stackSystem.activeStackId(),
+        stackOrder: stackSystem.orderForEntity(record.entity),
+        zIndex: recordAppearance(record).zIndex !== null
+          && recordAppearance(record).zIndex !== undefined
+          && Number.isFinite(explicitZIndex)
+          ? explicitZIndex
+          : records.indexOf(record),
+        domOrder: childPositions.get(record.group) ?? records.indexOf(record),
+      };
+    });
+    const maximumByStack = new Map();
+    recordItems.forEach((item) => {
+      maximumByStack.set(item.stackId, Math.max(maximumByStack.get(item.stackId) ?? -1, item.zIndex));
+    });
+    const unindexedCountByStack = new Map();
+    const derivedItems = orderedDerivedPaintNodes().map((node) => {
+      const stackId = String(node.dataset?.stackId || stackSystem.activeStackId());
+      const explicitZIndex = Number(node.dataset?.paintZIndex);
+      const hasExplicitZIndex = String(node.dataset?.paintZIndex || '').trim() !== ''
+        && Number.isFinite(explicitZIndex);
+      const unindexedOffset = (unindexedCountByStack.get(stackId) || 0) + 1;
+      if (!hasExplicitZIndex) unindexedCountByStack.set(stackId, unindexedOffset);
+      return {
+        paintKey: String(node.dataset.paintOrderKey),
+        node,
+        stackId,
+        stackOrder: stackSystem.orderForEntity({ stackId }),
+        zIndex: hasExplicitZIndex
+          ? explicitZIndex
+          : (maximumByStack.get(stackId) ?? -1) + unindexedOffset,
+        domOrder: childPositions.get(node) ?? Number.MAX_SAFE_INTEGER,
+      };
+    });
+    return [...recordItems, ...derivedItems].sort((first, second) => (
+      first.stackOrder - second.stackOrder
+      || first.zIndex - second.zIndex
+      || first.domOrder - second.domOrder
+    ));
+  }
+
+  function nextObjectZIndex(stackId = stackSystem.activeStackId()) {
+    const values = editablePaintOrder()
+      .filter((item) => item.stackId === stackId)
+      .map(({ zIndex }) => zIndex)
+      .filter(Number.isFinite);
+    return (values.length ? Math.max(...values) : -1) + 1;
+  }
+
+  function assignNewObjectPaintOrder(entity) {
+    if (!entity || entity.appearance?.zIndex !== null && entity.appearance?.zIndex !== undefined) return entity;
+    if (!orderedDerivedPaintNodes().length) return entity;
+    return {
+      ...entity,
+      appearance: {
+        ...(entity.appearance || {}),
+        zIndex: nextObjectZIndex(entity.stackId || stackSystem.activeStackId()),
+      },
+    };
+  }
+
   function syncGeometryStacking() {
     const derivedNodes = [...objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]')];
     const {
@@ -506,7 +663,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       unanchored,
       anchorRecordIds,
     } = organizeDerivedPaintNodes(derivedNodes);
-    const editable = editableStackOrder();
+    const orderedDerived = new Set(unanchored.filter((node) => (
+      String(node.dataset?.paintOrderKey || '').trim()
+    )));
+    const remainingUnanchored = unanchored.filter((node) => !orderedDerived.has(node));
+    const editable = editablePaintOrder();
     const construction = records.filter((record) => (
       ['geometry', 'image', 'fillet', 'table'].includes(record.recordType)
       && record.entity.construction
@@ -521,7 +682,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       (afterByRecordId.get(record.id) || []).forEach((node) => objectLayer.appendChild(node));
       afterByRecordId.delete(record.id);
     };
-    const stackPositions = new Map(editable.map((record, index) => [record.id, index]));
+    const stackPositions = new Map(editable.flatMap(({ record }, index) => (
+      record ? [[record.id, index]] : []
+    )));
     const regionsByPosition = new Map();
     closedRegionNodes.forEach((region) => {
       const positions = (region.dataset.parentIds || '').split(',').map((id) => stackPositions.get(id)).filter(Number.isFinite);
@@ -529,11 +692,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       if (!regionsByPosition.has(position)) regionsByPosition.set(position, []);
       regionsByPosition.get(position).push(region);
     });
-    editable.forEach((record, index) => {
+    editable.forEach((item, index) => {
       (regionsByPosition.get(index) || []).forEach((region) => objectLayer.appendChild(region));
-      appendRecord(record);
+      if (item.record) appendRecord(item.record);
+      else objectLayer.appendChild(item.node);
     });
-    unanchored.forEach((node) => objectLayer.appendChild(node));
+    remainingUnanchored.forEach((node) => objectLayer.appendChild(node));
     [...construction, ...notches, ...dimensions].forEach(appendRecord);
     beforeByRecordId.forEach((nodes) => {
       nodes.forEach((node) => objectLayer.appendChild(node));
@@ -672,8 +836,10 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function syncStackPresentation() {
-    canvas.dataset.activeStackId = stackSystem.activeStackId();
-    stackSystem.syncPresentation(closedRegionNodes);
+    const activeStackId = stackSystem.activeStackId();
+    if (activeStackId) canvas.dataset.activeStackId = activeStackId;
+    else delete canvas.dataset.activeStackId;
+    stackSystem.syncPresentation(closedRegionNodes, objectLayer.children);
   }
 
   function isRecordInteractive(record) {
@@ -895,6 +1061,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
        region.style.setProperty('--region-fill', regionAppearance.fillPaint);
       region.classList.toggle('selected', boundary.recordIds.every((id) => selectedIds.has(id)));
       region.addEventListener('pointerdown', (event) => {
+        if (!boundary.recordIds.every((id) => isRecordInteractive(recordById(id)))) return;
         if (featureCommandDelegate) return;
         const boundaryRecordIds = new Set(boundary.recordIds);
         const segmentNode = document.elementsFromPoint(event.clientX, event.clientY)
@@ -937,6 +1104,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         refreshHoverHighlight();
       });
       region.addEventListener('click', (event) => {
+        if (!boundary.recordIds.every((id) => isRecordInteractive(recordById(id)))) return;
         event.preventDefault();
         event.stopPropagation();
         if (suppressRecordClick) {
@@ -1285,6 +1453,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   function bindRecordEvents(record) {
     const isDimensionTextTarget = (event) => event.target.closest?.('.dimension-text, .dimension-text-hit');
     const handlePointerDown = (event) => {
+      if (!isRecordInteractive(record)) return;
       if (drawingMode || smartDimensionDelegate || featureCommandDelegate) return;
       if (record.recordType === 'geometry') seamLineSystem.setPropertyFeatureFromEvent(event);
       else if (!(event.ctrlKey || event.metaKey)) seamLineSystem.clearPropertyFeature();
@@ -1331,6 +1500,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       if (record.recordType === 'geometry') startObjectDrag(event, record);
     };
     const handleClick = (event) => {
+      if (!isRecordInteractive(record)) return;
       event.stopPropagation();
       if (
         record.recordType === 'dimension'
@@ -1371,6 +1541,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     }
     if (record.recordType === 'dimension' && dimensionMode(record.entity) === 'driving' && record.entity.dimensionId) {
       const handleDimensionDoubleClick = (event) => {
+        if (!isRecordInteractive(record)) return;
         if (!isDimensionTextTarget(event)) return;
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -1395,7 +1566,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         .filter((record) => record.recordType === 'geometry' && isRecordInteractive(record))
         .map((record) => cloneEntity(record.entity))
       : [];
-    const assignedEntity = stackSystem.assignEntity(classSystem.assignEntity(entity));
+    const assignedEntity = assignNewObjectPaintOrder(
+      stackSystem.assignEntity(classSystem.assignEntity(entity)),
+    );
     const modelEntity = solverAlreadyUpdated
       ? solver.getEntity(entity.id) || assignedEntity
       : solver.addEntity(assignedEntity);
@@ -1455,7 +1628,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         .map((record) => cloneEntity(record.entity))
       : [];
     const stagedEntries = requestedEntries.map(({ entity, snapRefs = [] }) => ({
-      entity: stackSystem.assignEntity(classSystem.assignEntity(entity)),
+      entity: assignNewObjectPaintOrder(stackSystem.assignEntity(classSystem.assignEntity(entity))),
       snapRefs,
     }));
     const constraints = shouldAutoConstrain
@@ -1534,7 +1707,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function addImage(inputEntity) {
-    const record = imageTools.createRecord(normalizeImageEntity(stackSystem.assignEntity(inputEntity)));
+    const record = imageTools.createRecord(normalizeImageEntity(
+      assignNewObjectPaintOrder(stackSystem.assignEntity(inputEntity)),
+    ));
     records.push(record);
     syncGeometryStacking();
     selectOnly(record.id);
@@ -1543,7 +1718,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function addText(inputEntity = {}) {
-    const textEntity = createTextEntity(stackSystem.assignEntity(inputEntity));
+    const textEntity = createTextEntity(assignNewObjectPaintOrder(stackSystem.assignEntity(inputEntity)));
     const assignedEntity = classSystem.assignEntity(textEntity, inputEntity.classId, {
       fresh: !inputEntity.classId,
     });
@@ -1556,7 +1731,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function addTable(inputEntity = {}) {
-    const tableEntity = stackSystem.assignEntity(normalizeTableEntity(inputEntity));
+    const tableEntity = assignNewObjectPaintOrder(stackSystem.assignEntity(normalizeTableEntity(inputEntity)));
     solver.addEntity(tableTools.constraintEntity(tableEntity));
     const record = tableTools.createRecord(tableEntity);
     if (!record) return null;
@@ -1601,7 +1776,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       scale: camera.scale,
       updateRecordHandles,
       bindRecordEvents,
-      onToggleExport: persistDrivenDimensionExport,
+      onToggleExport: persistDimensionValueOnly,
     });
     syncDimensionPresentation(record);
     promoteHandleGroup(record);
@@ -1613,6 +1788,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function notifyObjectChange({ history = 'coalesce' } = {}) {
+    refreshStackActivation();
     records.filter((record) => record.recordType === 'geometry').forEach(geometryAppearanceSystem.apply);
     records.filter((record) => record.recordType === 'text').forEach(textTools.updateRecord);
     subtractSystem.refreshPresentation();
@@ -1621,6 +1797,10 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     seamLineSystem.refresh();
     syncState();
     objectChangeListeners.forEach((listener) => listener({ count: records.length, history }));
+  }
+
+  function refreshStackActivation(options = {}) {
+    return stackActivationCoordinator?.refresh(options) || null;
   }
 
   function requestHistoryCheckpoint(reason = 'generic') {
@@ -1742,7 +1922,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     canvasElement: canvas,
     owners: subtractSystem.owners,
     ownerForRecord: subtractSystem.ownerForRecord,
-    evaluateExpression: (expression) => solver.evaluateParameterExpression(expression),
+    additionalVisibilityRecord: isTextVisibilityRecord,
+    evaluateExpression: (expression, entity = null) => solver.evaluateParameterExpression(expression, { stackId: entity?.stackId || stackSystem.activeStackId() }),
     resolveEntityAppearance: (entity) => (
       isClassGeometryEntity(entity) ? classSystem.resolveAppearance(entity) : entity?.appearance || {}
     ),
@@ -1818,7 +1999,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     syncGeometryStacking,
     getScale: () => camera.scale,
     getDrawingSnapshot: () => drawingSnapshot(),
-    evaluateLength: (expression) => solver.evaluateDrawingLengthExpression(expression),
+    evaluateLength: (expression, entity = null) => solver.evaluateDrawingLengthExpression(expression, {
+      stackId: entity?.stackId || stackSystem.activeStackId(),
+    }),
     resolvePresentationHost: (ownerRecordId, entity) => {
       for (const provider of derivedPresentationProviders) {
         const host = provider.resolveHost?.(ownerRecordId, entity);
@@ -1832,6 +2015,13 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     isStackVisible: stackSystem.isStackVisible,
     isStackActive: stackSystem.isStackActive,
+    getActiveStackId: stackSystem.activeStackId,
+    isStackRelationshipAvailable(relationship) {
+      return [
+        relationship?.stackId || stackSystem.activeStackId(),
+        ...(relationship?.participantStackIds || []),
+      ].every((stackId) => stackId && stackSystem.isStackEffectivelyEnabled(stackId));
+    },
   });
   registerDrawingExtension('seamLines', seamLineSystem.extensionProvider);
 
@@ -2007,17 +2197,20 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     }
   }
 
-  function dimensionParameterOptions(excludeId = null) {
-    return solver.parameters()
-      .filter((entry) => entry.name && entry.id !== excludeId && !entry.error)
-      .map((entry) => ({
-        name: entry.name,
-        label: entry.kind === 'dimension' ? `${entry.name} (dimension)` : entry.name,
+  function dimensionParameterOptions(excludeId = null, stackId = null) {
+    const entries = new Map(solver.parameters().map((entry) => [entry.id, entry]));
+    return solver.parameterExpressionSymbols({ stackId })
+      .filter((symbol) => symbol.name && symbol.parameterId !== excludeId && !entries.get(symbol.parameterId)?.error)
+      .map((symbol) => ({
+        name: symbol.name,
+        label: symbol.kind === 'dimension'
+          ? `${symbol.name}${symbol.local ? ' (this Stack)' : ' (dimension)'}`
+          : symbol.name,
       }));
   }
 
-  function populateExpressionOptions(target, excludeId = null) {
-    target.replaceChildren(...dimensionParameterOptions(excludeId).map((entry) => {
+  function populateExpressionOptions(target, excludeId = null, stackId = null) {
+    target.replaceChildren(...dimensionParameterOptions(excludeId, stackId).map((entry) => {
       const option = document.createElement('option');
       option.value = entry.name;
       option.label = entry.label;
@@ -2053,14 +2246,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function openDimensionEditPanel(record) {
     const isControl = Boolean(record?.updateExpression);
-    if (!record || (!isControl && (record.recordType !== 'dimension' || dimensionMode(record.entity) !== 'driving' || !record.entity.dimensionId)) || (isControl && dimensionTextMode === 'value')) return;
+    if (!record || (!isControl && (
+      record.recordType !== 'dimension'
+      || !dimensionTextEditable(record.entity, dimensionTextMode)
+      || !record.entity.dimensionId
+    )) || (isControl && dimensionTextMode === 'value')) return;
     const parameterId = record.expressionParameterId?.() || record.entity.dimensionId;
     const current = solver.dimensions.get(parameterId);
     if (!current) return;
     selectOnly(record.id);
     dimensionEdit = { record, dimensionId: parameterId };
     dimensionEditLabelText.textContent = record.expressionLabel?.() || 'Dimension';
-    populateExpressionOptions(dimensionEditOptions, parameterId);
+    populateExpressionOptions(dimensionEditOptions, parameterId, current.stackId || record.entity.stackId);
     dimensionEditInput.value = expressionWithoutUnits(current.expression || '');
     dimensionEditError.textContent = '';
     dimensionEditPanel.classList.remove('invalid');
@@ -2098,7 +2295,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     if (externalTarget?.type === 'notch-distance') {
       let value;
       try {
-        value = solver.evaluateDrawingLengthExpression(expression);
+        value = solver.evaluateDrawingLengthExpression(expression, { stackId: current.stackId });
       } catch (error) {
         dimensionEditPanel.classList.add('invalid');
         dimensionEditError.textContent = error.message;
@@ -2181,7 +2378,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const fontNames = new Set(resolvedTexts.map(({ entity }) => entity.fontName));
     const fontSizes = new Set(resolvedTexts.map(({ entity }) => entity.fontSize));
     const fontColors = new Set(resolvedTexts.map(({ entity }) => entity.fontColor));
-    const scaleWithZoomValues = new Set(resolvedTexts.map(({ entity }) => entity.scaleWithZoom !== false));
     const multilineValues = new Set(resolvedTexts.map(({ entity }) => entity.multiline !== false));
     const textAlignValues = new Set(resolvedTexts.map(({ entity }) => entity.textAlign || 'left'));
     const textVerticalAlignValues = new Set(resolvedTexts.map(({ entity }) => entity.textVerticalAlign || 'top'));
@@ -2212,7 +2408,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       fontName: fontNames.size === 1 ? resolvedTexts[0].entity.fontName : null,
       fontSize: fontSizes.size === 1 ? resolvedTexts[0].entity.fontSize : null,
       fontColor: fontColors.size === 1 ? resolvedTexts[0].entity.fontColor : null,
-      scaleWithZoom: scaleWithZoomValues.size === 1 ? resolvedTexts[0].entity.scaleWithZoom !== false : null,
       multiline: multilineValues.size === 1 ? resolvedTexts[0].entity.multiline !== false : null,
       textAlign: textAlignValues.size === 1 ? resolvedTexts[0].entity.textAlign || 'left' : null,
       textVerticalAlign: textVerticalAlignValues.size === 1 ? resolvedTexts[0].entity.textVerticalAlign || 'top' : null,
@@ -2224,7 +2419,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       },
     };
     selectionPropertyProviders.forEach((provider) => {
-      const patch = provider.selectionProperties?.();
+      const patch = provider.selectionProperties?.(cloneEntity(properties));
       if (!patch) return;
       const errors = { ...properties.errors, ...(patch.errors || {}) };
       Object.assign(properties, patch, { errors });
@@ -2272,6 +2467,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function selectOnly(id, { segmentIndex = null } = {}) {
     overlapSelectionCycler?.clear();
+    derivedSelectionProviders.forEach((provider) => provider.clearSelection?.());
     if (dimensionEdit && dimensionEdit.record.id !== id) closeDimensionEditPanel();
     selectedIds.clear();
     selectedSegments.clear();
@@ -2323,6 +2519,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function selectRecords(ids = []) {
     overlapSelectionCycler?.clear();
+    derivedSelectionProviders.forEach((provider) => provider.clearSelection?.());
     selectedIds.clear();
     selectedSegment = null;
     selectedSegments.clear();
@@ -2351,6 +2548,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function clearSelection() {
     overlapSelectionCycler?.clear();
+    derivedSelectionProviders.forEach((provider) => provider.clearSelection?.());
     closeDimensionEditPanel();
     selectedIds.clear();
     selectedSegment = null;
@@ -2420,29 +2618,31 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return true;
   }
 
-  function arrangeRecordIds(recordIds, action) {
-    const order = editableStackOrder();
-    const requested = new Set(recordIds);
-    const selected = new Set(order.filter((record) => requested.has(record.id)).map((record) => record.id));
+  function arrangeRecordIds(recordIds, action, derivedPaintKeys = []) {
+    const order = editablePaintOrder();
+    const requested = new Set([...recordIds, ...derivedPaintKeys]);
+    const selected = new Set(order.filter((item) => requested.has(item.paintKey)).map((item) => item.paintKey));
     if (!selected.size) return false;
     let arranged = [...order];
-    if (action === 'front') arranged = [...arranged.filter((record) => !selected.has(record.id)), ...arranged.filter((record) => selected.has(record.id))];
-    if (action === 'back') arranged = [...arranged.filter((record) => selected.has(record.id)), ...arranged.filter((record) => !selected.has(record.id))];
+    if (action === 'front') arranged = [...arranged.filter((item) => !selected.has(item.paintKey)), ...arranged.filter((item) => selected.has(item.paintKey))];
+    if (action === 'back') arranged = [...arranged.filter((item) => selected.has(item.paintKey)), ...arranged.filter((item) => !selected.has(item.paintKey))];
     if (action === 'forward') {
       for (let index = arranged.length - 2; index >= 0; index -= 1) {
-        if (!selected.has(arranged[index].id) || selected.has(arranged[index + 1].id)) continue;
+        if (!selected.has(arranged[index].paintKey) || selected.has(arranged[index + 1].paintKey)) continue;
         [arranged[index], arranged[index + 1]] = [arranged[index + 1], arranged[index]];
       }
     }
     if (action === 'backward') {
       for (let index = 1; index < arranged.length; index += 1) {
-        if (!selected.has(arranged[index].id) || selected.has(arranged[index - 1].id)) continue;
+        if (!selected.has(arranged[index].paintKey) || selected.has(arranged[index - 1].paintKey)) continue;
         [arranged[index - 1], arranged[index]] = [arranged[index], arranged[index - 1]];
       }
     }
     if (!['front', 'back', 'forward', 'backward'].includes(action)) return false;
-    if (arranged.every((record, index) => record.id === order[index].id)) return false;
-    const updates = arranged.map((record, zIndex) => ({ record, zIndex, appearance: { ...(record.entity.appearance || {}), zIndex } }));
+    if (arranged.every((item, index) => item.paintKey === order[index].paintKey)) return false;
+    const updates = arranged.flatMap(({ record }, zIndex) => (
+      record ? [{ record, zIndex, appearance: { ...(record.entity.appearance || {}), zIndex } }] : []
+    ));
     const changed = solver.updateEntityAppearances(updates
       .filter(({ record }) => record.recordType === 'geometry')
       .map(({ record, appearance }) => ({ id: record.id, appearance })));
@@ -2471,6 +2671,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         record.updateNode();
       }
     });
+    const derivedUpdates = arranged.flatMap((item, zIndex) => (
+      item.record ? [] : [{ paintKey: item.paintKey, zIndex }]
+    ));
+    derivedUpdates.forEach(({ paintKey, zIndex }) => {
+      const node = objectLayer.querySelector(`:scope > [data-paint-order-key="${globalThis.CSS?.escape ? CSS.escape(paintKey) : paintKey.replace(/["\\]/g, '\\$&')}"]`);
+      node?.setAttribute('data-paint-z-index', zIndex);
+    });
+    derivedSelectionProviders.forEach((provider) => provider.setPaintZIndices?.(derivedUpdates));
     syncGeometryStacking();
     notifyObjectChange();
     syncState();
@@ -2478,7 +2686,10 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function arrangeSelectedGeometry(action) {
-    return arrangeRecordIds([...selectedIds], action);
+    const derivedPaintKeys = [...derivedSelectionProviders].flatMap((provider) => (
+      [...(provider.selectedPaintKeys?.() || [])]
+    ));
+    return arrangeRecordIds([...selectedIds], action, derivedPaintKeys);
   }
 
   function deleteSelection({ checkpoint = true, notify = true } = {}) {
@@ -2499,13 +2710,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       return !(record?.recordType === 'image' && record.entity.locked);
     }));
     if (!deletionIds.size) return;
-    records.forEach((record) => {
-      if (dimensionReferencesAny(record, deletionIds)) deletionIds.add(record.id);
-      if (
-        record.recordType === 'fillet'
-        && [record.entity.sourceA.recordId, record.entity.sourceB.recordId].some((id) => selectedGeometryIds.has(id))
-      ) deletionIds.add(record.id);
-    });
+    let expanded = true;
+    while (expanded) {
+      const beforeSize = deletionIds.size;
+      records.forEach((record) => {
+        if (dimensionReferencesAny(record, deletionIds)) deletionIds.add(record.id);
+        if (
+          record.recordType === 'fillet'
+          && [record.entity.sourceA.recordId, record.entity.sourceB.recordId].some((id) => deletionIds.has(id))
+        ) deletionIds.add(record.id);
+      });
+      expanded = deletionIds.size !== beforeSize;
+    }
     notchSystem.includeDependentDeletionIds(deletionIds, selectedGeometryIds);
     notchSystem.includeDependentDeletionIds(deletionIds, deletionIds);
     seamLineSystem.removeReferences([...deletionIds]);
@@ -2552,6 +2768,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       updateRecordNode(record);
       updateRecordHandles(record);
     });
+    const participation = solver.refreshStackParticipation?.();
+    const dimensionsById = new Map((participation?.dimensions || []).map((entry) => [entry.id, entry]));
+    records.forEach((record) => {
+      if (record.recordType !== 'dimension' || !record.entity.dimensionId) return;
+      const entry = dimensionsById.get(record.entity.dimensionId);
+      if (!entry) return;
+      record.entity.stackId = entry.stackId;
+      record.entity.participantStackIds = [...(entry.participantStackIds || [])];
+      record.entity.dimensionName = entry.name;
+      applyManagedDimensionText(record.entity);
+      updateDimensionNode(record, camera.scale);
+    });
     syncStackPresentation();
     syncGeometryStacking();
     constraintOverlaySystem?.render?.();
@@ -2567,8 +2795,35 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const target = stackSystem.stack(stackId);
     if (!target?.removable) return false;
     requestHistoryCheckpoint('stack-remove');
-    setRecordStackIds(stackSystem.recordIdsForStack(stackId), 'stack-default', { checkpoint: false, notify: false });
-    return stackSystem.removeStack(stackId);
+    const removedStackIds = subtreeStackIds(stackSystem.getState(), stackId);
+    const removedStackIdSet = new Set(removedStackIds);
+    const recordIds = stackSystem.recordIdsForSubtree(stackId);
+    const removedIds = new Set(recordIds);
+    const removedSourceStackIds = stackSystem.getState().stacks
+      .filter(({ id }) => removedStackIdSet.has(id))
+      .map((stack) => stack.sourceStackId || stack.id);
+    const remainingSourceStackIds = stackSystem.getState().stacks
+      .filter(({ id }) => !removedStackIdSet.has(id))
+      .map((stack) => stack.sourceStackId || stack.id);
+    if (loadedDrawingExtensions.stackRelationships) {
+      loadedDrawingExtensions.stackRelationships = pruneDormantStackRelationships(
+        loadedDrawingExtensions.stackRelationships,
+        { removedSourceStackIds, remainingSourceStackIds },
+      );
+    }
+    drawingExtensionProviders.forEach((provider) => removedStackIds.forEach((removedStackId) => {
+      provider.removeStackReferences?.(removedStackId, recordIds);
+    }));
+    const removed = solver.removeStackDataMany?.(removedStackIds, recordIds)
+      || removedStackIds.reduce((result, removedStackId) => {
+        const current = solver.removeStackData?.(removedStackId, recordIds) || {};
+        Object.entries(current).forEach(([key, values]) => {
+          result[key] = [...new Set([...(result[key] || []), ...(values || [])])];
+        });
+        return result;
+      }, {});
+    deleteRecords([...new Set([...recordIds, ...(removed.annotationIds || [])])], { checkpoint: false, notify: false });
+    return Boolean(stackSystem.removeStackSubtree(stackId));
   }
 
   function clearDrawing() {
@@ -2669,7 +2924,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         scale: camera.scale,
         updateRecordHandles,
         bindRecordEvents,
-        onToggleExport: persistDrivenDimensionExport,
+        onToggleExport: persistDimensionValueOnly,
       });
       syncDimensionPresentation(record);
       promoteHandleGroup(record);
@@ -2684,6 +2939,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     restoreDrawingExtensions();
     seamLineSystem.refresh();
     refreshLinkedDimensions();
+    refreshStackActivation({ compile: true, allowRollback: false });
     constraintOverlaySystem?.render?.();
     syncStackPresentation();
     if (zoomToFit) zoomAll();
@@ -2697,16 +2953,27 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return loadDrawingData(mergeDrawingData(drawingSnapshot(), snapshot));
   }
 
-  function pasteDrawingData(snapshot) {
+  function pasteDrawingData(snapshot, {
+    targetStackId = null,
+    insertParentStackId = null,
+    insertAsDrawing = false,
+    drawingContainerName = '',
+  } = {}) {
     const inserted = normalizeDrawingData(snapshot);
-    const { drawing, idMap } = mergeDrawingDataWithMap(drawingSnapshot(), inserted, { inheritControlParameters: false });
+    const { drawing, idMap, insertedRootNodeIds } = mergeDrawingDataWithMap(drawingSnapshot(), inserted, {
+      inheritControlParameters: false,
+      targetStackId,
+      insertParentStackId,
+      insertAsDrawing,
+      drawingContainerName,
+    });
     const insertedIds = [
       ...inserted.entities.map(({ id }) => id),
       ...inserted.dimensionAnnotations.map(({ id }) => id),
     ].map((id) => idMap.get(id)).filter(Boolean);
     loadDrawingData(drawing, { zoomToFit: false, history: 'commit' });
     selectRecords(insertedIds);
-    return { count: insertedIds.length, recordIds: insertedIds, idMap };
+    return { count: insertedIds.length, recordIds: insertedIds, idMap, insertedRootNodeIds };
   }
 
   function drawingSnapshot() {
@@ -2768,35 +3035,21 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const handle = event.target.closest?.('.point-handle[data-handle-index]');
     const recordId = handle?.closest?.('.canvas-record, .canvas-handle-group')?.dataset.recordId;
     const record = records.find((item) => item.id === recordId && item.recordType === 'geometry');
-    if (record?.entity?.type !== 'curve') return false;
+    if (record?.entity?.type !== 'curve' || !isRecordInteractive(record)) return false;
     const result = deleteCurveControlPoint(record.entity.points, Number(handle.dataset.handleIndex));
     return applyCurveControlPointEdit(record, result, 'delete');
   }
 
   function startSelectionDragFromHandle(event, record) {
-    if (isToolDragBlocked()) return;
+    if (isToolDragBlocked() || !isRecordInteractive(record)) return;
     event.preventDefault();
     event.stopPropagation();
     if (!selectedIds.has(record.id)) selectOnly(record.id);
-    shapeDrag = {
-      mode: 'records',
-      moved: false,
-      solverActive: false,
-      pointerId: event.pointerId,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startWorld: screenToWorld(event.clientX, event.clientY),
-      items: dragRecordsForSelection().map((item) => ({ record: item, startEntity: cloneEntity(item.entity) })),
-    };
-    shapeDrag.variableIds = shapeDrag.items.flatMap(({ record: item }) => (
-      ['geometry', 'text', 'control', 'table'].includes(item.recordType)
-        ? solver.variableIdsForEntity(item.id)
-        : []
-    ));
+    beginRecordsDrag(event);
   }
 
   function startHandleDrag(event, record, handleIndex) {
-    if (isToolDragBlocked()) return;
+    if (isToolDragBlocked() || !isRecordInteractive(record)) return;
     if (featureCommandDelegate?.pointerDown?.(event)) return;
     if (smartDimensionDelegate?.pointerDown?.(event)) return;
     seamLineSystem.clearPropertyFeature();
@@ -2823,7 +3076,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function startDimensionLineDrag(event, record) {
-    if (isToolDragBlocked()) return;
+    if (isToolDragBlocked() || !isRecordInteractive(record)) return;
     event.preventDefault();
     event.stopPropagation();
     selectOnly(record.id);
@@ -3030,6 +3283,19 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     });
   }
 
+  function setSolverFailure(result = null) {
+    const offender = result?.offender || null;
+    records.forEach((record) => {
+      const offendingDimension = record.recordType === 'dimension'
+        && offender?.dimensionId
+        && record.entity.dimensionId === offender.dimensionId;
+      const offendingRecord = offender?.recordIds?.includes?.(record.id);
+      record.group?.classList?.toggle('solve-offender', Boolean(offendingDimension || offendingRecord));
+      record.handleGroup?.classList?.toggle('solve-offender', Boolean(offendingDimension || offendingRecord));
+    });
+    constraintOverlaySystem?.render?.();
+  }
+
   function setDimensionTextMode(mode) {
     if (!['expression', 'named-value', 'value'].includes(mode)) return;
     dimensionTextMode = mode;
@@ -3113,7 +3379,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function getPointFeature(recordId, index = 0, options = {}) {
-    if (recordId === CANVAS_ORIGIN_RECORD_ID) return canvasOriginPointFeature(originHandle);
     const table = records.find((record) => record.recordType === 'table' && record.id === recordId);
     if (table) {
       const cornerIndex = tableCornerIndexFromSolverIndex(index);
@@ -3247,6 +3512,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function beginRecordsDrag(event) {
     if (isToolDragBlocked()) return false;
+    const derivedItems = [...derivedSelectionProviders].flatMap((provider) => (
+      [...(provider.dragItems?.() || [])]
+    )).filter((item) => typeof item?.move === 'function');
+    const items = dragRecordsForSelection().map((item) => ({
+      record: item,
+      startEntity: cloneEntity(item.entity),
+    }));
+    if (!items.length && !derivedItems.length) return false;
     shapeDrag = {
       mode: 'records',
       moved: false,
@@ -3255,10 +3528,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       startClientX: event.clientX,
       startClientY: event.clientY,
       startWorld: screenToWorld(event.clientX, event.clientY),
-      items: dragRecordsForSelection().map((item) => ({ record: item, startEntity: cloneEntity(item.entity) })),
+      items,
+      derivedItems,
     };
     shapeDrag.variableIds = shapeDrag.items.flatMap(({ record: item }) => (
-      ['geometry', 'text', 'table'].includes(item.recordType)
+      ['geometry', 'text', 'control', 'table'].includes(item.recordType)
         ? solver.variableIdsForEntity(item.id)
         : []
     ));
@@ -3266,7 +3540,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function startRegionDrag(event, parentIds, { preservePropertyFeature = false } = {}) {
-    if (isToolDragBlocked() || event.button !== 0) return false;
+    if (
+      isToolDragBlocked()
+      || event.button !== 0
+      || !parentIds.every((id) => isRecordInteractive(recordById(id)))
+    ) return false;
     event.preventDefault();
     event.stopPropagation();
     if (!preservePropertyFeature) seamLineSystem.clearPropertyFeature();
@@ -3276,7 +3554,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function startObjectDrag(event, record, { preserveClickSequence = false } = {}) {
-    if (isToolDragBlocked() || event.button !== 0 || event.target.closest?.('.point-handle')) return false;
+    if (
+      isToolDragBlocked()
+      || !isRecordInteractive(record)
+      || event.button !== 0
+      || event.target.closest?.('.point-handle')
+    ) return false;
     if (!preserveClickSequence) event.preventDefault();
     event.stopPropagation();
     if (!selectedIds.has(record.id)) selectOnly(record.id);
@@ -3292,6 +3575,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   function startSegmentDrag(event, record, requestedSegmentIndex = null) {
     if (
       isToolDragBlocked()
+      || !isRecordInteractive(record)
       || event.button !== 0
       || !['line', 'rect', 'polyline', 'polygon'].includes(record.entity.type)
     ) return false;
@@ -3322,6 +3606,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     if (!shapeDrag.moved) {
       if (!canvasPointerDragReady(shapeDrag, event)) return;
       shapeDrag.moved = true;
+      shapeDrag.derivedItems?.forEach((item) => item.begin?.());
       solver.beginDrag(shapeDrag.variableIds || []);
       shapeDrag.solverActive = true;
       canvas.setPointerCapture(shapeDrag.pointerId);
@@ -3361,6 +3646,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
           updateRecordHandles(record);
         }
       });
+      shapeDrag.derivedItems?.forEach((item) => item.move(delta));
     }
     const geometrySolveEntries = solveEntries.filter(({ record }) => (
       ['geometry', 'text', 'control', 'table'].includes(record.recordType)
@@ -3511,6 +3797,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       windowSelect = null;
       return;
     }
+    derivedSelectionProviders.forEach((provider) => provider.clearSelection?.());
     selectedIds.clear();
     selectedSegment = null;
     selectedSegments.clear();
@@ -3531,19 +3818,58 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         selectedIds.add(record.id);
       }
     });
+    const matchesNode = (node) => {
+      const bounds = node?.getBoundingClientRect?.();
+      if (!bounds) return false;
+      return windowSelect.bottomUp
+        ? intersects(bounds, windowSelect.rect)
+        : containedBy(bounds, windowSelect.rect);
+    };
+    [...derivedSelectionProviders].forEach((provider) => {
+      const selection = provider.selectWindow?.({
+        rect: { ...windowSelect.rect },
+        bottomUp: windowSelect.bottomUp,
+        matchesNode,
+      });
+      (selection?.recordIds || []).forEach((recordId) => {
+        const record = records.find((candidate) => candidate.id === recordId);
+        if (record && (selection?.includeNonInteractiveRecords || isRecordInteractive(record))) {
+          selectedIds.add(recordId);
+        }
+      });
+    });
     windowSelect = null;
     suppressNextCanvasClick = true;
     syncState();
   }
 
+  function canvasHoverOwnership(event) {
+    const hoveredNode = document.elementsFromPoint(event.clientX, event.clientY)
+      .map((element) => element.closest?.(
+        '.canvas-record, .canvas-handle-group, .closed-constrained-region, [data-stack-id]',
+      ))
+      .find(Boolean) || null;
+    const recordId = hoveredNode?.dataset.recordId
+      || String(hoveredNode?.dataset.parentIds || '').split(',').filter(Boolean)[0]
+      || null;
+    const ownerRecord = recordId
+      ? records.find((record) => record.id === recordId)
+      : null;
+    return {
+      recordId,
+      stackId: hoveredNode?.dataset.stackId || ownerRecord?.entity?.stackId || null,
+    };
+  }
+
   function updateHover(event) {
     if (panStart || windowSelect || handleDrag || dimensionLineDrag || shapeDrag || imageTools.isDragging()) return;
     const previousHoveredId = hoveredId;
+    const previousHoveredOwnerStackId = hoveredOwnerStackId;
     const previouslyHoveredHandle = records.some((record) => interactiveHandlesForRecord(record)
       .some((handle) => handle.classList.contains('hovered')));
-    hoveredId = document.elementsFromPoint(event.clientX, event.clientY)
-      .map((element) => element.closest?.('.canvas-record') || element.closest?.('.canvas-handle-group'))
-      .find(Boolean)?.dataset.recordId || null;
+    const hoverOwnership = canvasHoverOwnership(event);
+    hoveredId = hoverOwnership.recordId;
+    hoveredOwnerStackId = hoverOwnership.stackId;
     records.forEach((record) => {
       const isVisible = hoveredId === record.id || selectedIds.has(record.id);
       interactiveHandlesForRecord(record).forEach((handle) => {
@@ -3557,6 +3883,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     });
     const hasHoveredHandle = records.some((record) => interactiveHandlesForRecord(record)
       .some((handle) => handle.classList.contains('hovered')));
+    if (previousHoveredOwnerStackId !== hoveredOwnerStackId) {
+      canvasHoverListeners.forEach((listener) => listener({
+        recordId: hoveredId,
+        stackId: hoveredOwnerStackId,
+      }));
+    }
     if (previousHoveredId !== hoveredId || previouslyHoveredHandle !== hasHoveredHandle || hasHoveredHandle) syncState();
   }
 
@@ -3666,6 +3998,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     updateHover(event);
   });
 
+  canvas.addEventListener('pointerleave', () => {
+    if (panStart || windowSelect || handleDrag || dimensionLineDrag || shapeDrag || imageTools.isDragging()) return;
+    const hadHover = Boolean(hoveredId || hoveredOwnerStackId);
+    hoveredId = null;
+    hoveredOwnerStackId = null;
+    records.forEach((record) => interactiveHandlesForRecord(record)
+      .forEach((handle) => handle.classList.remove('hovered')));
+    if (!hadHover) return;
+    canvasHoverListeners.forEach((listener) => listener({ recordId: null, stackId: null }));
+    syncState();
+  });
+
   canvas.addEventListener('pointerup', (event) => {
     if (imageTools.pointerUp()) {
       syncState();
@@ -3675,10 +4019,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     let geometryDragEnded = false;
     let notifyAfterGeometryDrag = false;
     if (shapeDrag) {
+      const derivedItems = shapeDrag.derivedItems || [];
       suppressRecordClick = shapeDrag.moved;
       if (shapeDrag.moved) suppressNextCanvasClick = true;
       notifyAfterGeometryDrag = shapeDrag.moved;
       geometryDragEnded = shapeDrag.solverActive;
+      if (shapeDrag.moved) derivedItems.forEach((item) => item.end?.());
       shapeDrag = null;
       syncState();
     }
@@ -3840,6 +4186,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       return [...editableStackOrder(), ...construction, ...notches, ...dimensions]
         .map((record) => record.id);
     },
+    nextObjectZIndex,
     syncGeometryStacking,
     getSeamLinePresentationNodes(sourceIds) {
       return seamLineSystem.presentationNodesForSourceIds(sourceIds);
@@ -3896,7 +4243,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       return [...selectedIds];
     },
     getStackState: stackSystem.getState,
+    getStackRuntimeState: stackSystem.getRuntimeState,
+    getEffectiveEnabledStackIds() {
+      return stackSystem.getState().stacks
+        .filter(({ id }) => stackSystem.isStackEffectivelyEnabled(id))
+        .map(({ id }) => id);
+    },
+    getStackSubtreeIds(stackId) {
+      return subtreeStackIds(stackSystem.getState(), stackId);
+    },
+    getSelectedStackId: stackSystem.selectedStackId,
     getActiveStackId: stackSystem.activeStackId,
+    getHoveredStackId: stackSystem.hoveredStackId,
     isStackVisible: stackSystem.isStackVisible,
     isStackActive: stackSystem.isStackActive,
     isRecordVisible(recordId) {
@@ -3917,20 +4275,54 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     getRecordStackId(recordId) {
       const record = records.find((candidate) => candidate.id === recordId);
-      return record?.entity?.stackId || 'stack-default';
+      return record?.entity?.stackId || stackSystem.activeStackId();
     },
+    setHoveredStackId: stackSystem.setHoveredStack,
     onStackChange: stackSystem.onStateChange,
-    addStack(name) {
+    addStack(options) {
       requestHistoryCheckpoint('stack-add');
-      return stackSystem.addStack(name);
+      return stackSystem.addStack(options);
+    },
+    addChildStack(parentStackId, name) {
+      requestHistoryCheckpoint('stack-add-child');
+      return stackSystem.addChildStack(parentStackId, name);
+    },
+    addSiblingStack(stackId, name) {
+      requestHistoryCheckpoint('stack-add-sibling');
+      return stackSystem.addSiblingStack(stackId, name);
     },
     renameStack(stackId, name) {
-      return stackSystem.renameStack(stackId, name);
+      const beforeStack = cloneEntity(stackSystem.stack(stackId));
+      if (!beforeStack) return false;
+      const beforeDrawing = drawingSnapshot();
+      requestHistoryCheckpoint('stack-rename');
+      if (!stackSystem.renameStack(stackId, name, { notify: false })) return false;
+      const afterStack = stackSystem.stack(stackId);
+      if (!afterStack || beforeStack.name === afterStack.name) return true;
+      const renames = (beforeDrawing.parameters || [])
+        .filter((parameter) => parameter.kind === 'dimension' && parameter.stackId === stackId)
+        .map((parameter) => ({
+          before: qualifiedDimensionName(parameter.name, beforeStack.name),
+          after: qualifiedDimensionName(parameter.name, afterStack.name),
+        }));
+      const rewritten = rewriteQualifiedDimensionReferences(beforeDrawing, renames);
+      rewritten.extensions = {
+        ...(rewritten.extensions || {}),
+        stacks: rewriteQualifiedDimensionReferences(stackSystem.getState(), renames),
+      };
+      loadDrawingData(rewritten, { zoomToFit: false, history: 'commit' });
+      stackSystem.setSelectedStack(stackId);
+      return true;
     },
     setActiveStack: stackSystem.setActiveStack,
+    setSelectedStack: stackSystem.setSelectedStack,
     setStackVisible(stackId, visible) {
       requestHistoryCheckpoint('stack-visibility');
       return stackSystem.setStackVisible(stackId, visible);
+    },
+    setStackEnabled(stackId, enabled) {
+      requestHistoryCheckpoint('stack-enabled');
+      return stackSystem.setStackEnabled(stackId, enabled);
     },
     moveStack(stackId, direction) {
       requestHistoryCheckpoint('stack-reorder');
@@ -3950,15 +4342,38 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getDrawingUnit() {
       return solver.drawingUnit || 'in';
     },
-    formatDrawingLength,
-    evaluateNumericExpression(expression) {
-      return solver.evaluateParameterExpression(expression);
+    reparentStack(stackId, parentStackId, siblingIndex) {
+      requestHistoryCheckpoint('stack-reparent');
+      return stackSystem.reparentStack(stackId, parentStackId, siblingIndex);
     },
-    evaluateLengthExpression(expression) {
-      return solver.evaluateDrawingLengthExpression(expression);
+    reorderStack(stackId, siblingIndex) {
+      requestHistoryCheckpoint('stack-reorder');
+      return stackSystem.reorderStack(stackId, siblingIndex);
+    },
+    setStackEnabledExpression(stackId, expression) {
+      requestHistoryCheckpoint('stack-enabled-expression');
+      return stackSystem.setStackEnabledExpression(stackId, expression);
+    },
+    refreshStackActivation,
+    getStackActivationDiagnostics: stackActivationSystem.activationDiagnostics,
+    getDimensionText(dimensionId, mode = 'named-value') {
+      return solver.getDimensionText(dimensionId, mode);
+    },
+    formatDrawingLength,
+    evaluateNumericExpression(expression, context = null) {
+      const stackId = typeof context === 'string' ? context : context?.stackId || stackSystem.activeStackId();
+      return solver.evaluateParameterExpression(expression, { stackId });
+    },
+    evaluateLengthExpression(expression, context = null) {
+      const stackId = typeof context === 'string' ? context : context?.stackId || stackSystem.activeStackId();
+      return solver.evaluateDrawingLengthExpression(expression, { stackId });
     },
     getParameters() {
       return solver.parameters();
+    },
+    getParameterExpressionSymbols(context = null, { includeLocalAliases = false } = {}) {
+      const stackId = typeof context === 'string' ? context : context?.stackId || stackSystem.activeStackId();
+      return solver.parameterExpressionSymbols({ stackId, includeLocalAliases });
     },
     getDocumentVariables() {
       return solver.documentVariables?.() || [];
@@ -4013,6 +4428,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       selectionChangeListeners.add(listener);
       listener(cloneEntity(selectionProperties()));
       return () => selectionChangeListeners.delete(listener);
+    },
+    onCanvasHover(listener) {
+      canvasHoverListeners.add(listener);
+      listener({ recordId: hoveredId, stackId: hoveredOwnerStackId });
+      return () => canvasHoverListeners.delete(listener);
     },
     getSelectionProperties: selectionProperties,
     clearSelection,
@@ -4077,7 +4497,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     setReferenceHighlight(recordIds = []) {
       const highlightedIds = new Set(
-        recordIds.filter((recordId) => recordId && recordId !== CANVAS_ORIGIN_RECORD_ID),
+        recordIds.filter(Boolean),
       );
       records.forEach((record) => {
         record.group.classList.toggle('reference-highlighted', highlightedIds.has(record.id));
@@ -4131,6 +4551,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         syncState();
       };
     },
+    registerDerivedSelectionProvider(provider) {
+      if (!provider || typeof provider !== 'object') return () => {};
+      derivedSelectionProviders.add(provider);
+      return () => {
+        provider.clearSelection?.();
+        derivedSelectionProviders.delete(provider);
+      };
+    },
+    beginSelectionDrag(event) {
+      if (event?.button !== 0) return false;
+      return beginRecordsDrag(event);
+    },
     notifyDerivedFeatureChange() {
       notchSystem.refresh();
       seamLineSystem.refresh();
@@ -4174,6 +4606,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getDimensionFeatureSet,
     applySolverSnapshot,
     updateDimensionParameterName,
+    setSolverFailure,
     setDimensionTextMode,
     refreshLinkedDimensions,
     syncState,

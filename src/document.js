@@ -1,6 +1,26 @@
 export const PARAMAGIC_DOCUMENT_EXTENSION = '.paramagic';
 export const PARAMAGIC_DOCUMENT_MIME_TYPE = 'application/vnd.paramagic+json';
 
+export {
+  IDENTITY_ARCHITECTURE_VERSION,
+  cloneDrawingIdentityGraph,
+  createDrawingIdentityIndex,
+  identityAudit,
+  migrateDrawingIdentities,
+  registeredIdentitySchemaKeys,
+  remapDrawingIdentityGraph,
+  validateDrawingIdentityGraph,
+} from './modules/DrawingIdentitySystem.js';
+export {
+  assertUuid,
+  createUuid,
+  createUuidAllocator,
+  deriveUuid,
+  deriveUuidForKey,
+  isUuid,
+  normalizeUuid,
+} from './modules/IdentitySystem.js';
+
 import {
   parseDrawingText,
   serializeDrawingJson,
@@ -15,6 +35,7 @@ export function serializeParamagicDocument(snapshot, name = 'Untitled Drawing') 
 }
 
 export {
+  createIndependentDrawingSave,
   DRAWING_CANVAS_BACKGROUND,
   createDrawingThumbnail,
   createDrawingThumbnailSvg,
@@ -37,7 +58,30 @@ export {
   PARAMAGIC_CLIPBOARD_FORMAT,
   PARAMAGIC_CLIPBOARD_VERSION,
   createClipboardPackage,
+  createDrawingContainerPackage,
   createDrawingClipboard,
+  createStackSubtreePackage,
   parseClipboardPackage,
   retargetClipboardDrawing,
 } from './modules/DrawingClipboard.js';
+export {
+  dimensionCollectionNameError,
+  dimensionDisplayName,
+  dimensionParameterIndex,
+  dimensionParameterNameError,
+  nextAvailableParameterName,
+  nextDimensionNameForStack,
+  nextIndexedParameterName,
+  normalizedNameWhitespace,
+  normalizedStackName,
+  parameterNameError,
+  parameterNameKey,
+  qualifiedDimensionName,
+  replaceExpressionSymbolReference,
+  rewriteExpressionSymbolReferences,
+  rewriteQualifiedDimensionReferences,
+  stackNameById,
+  stackNameError,
+  uniqueStackName,
+  userParameterNameError,
+} from './modules/NamingSystem.js';

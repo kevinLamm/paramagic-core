@@ -892,7 +892,7 @@ export function solveLevenbergMarquardt({
   let error = squaredNorm(evaluation.values);
   const changedEntityIds = () => [...new Set(allVariables
     .filter((variable, index) => Math.abs(variable.value - initialValues[index]) > 1e-10)
-    .map((variable) => variable.owner))];
+    .map((variable) => variable.ownerId))];
   const cancellationResult = (reason, iterations, currentError = error) => {
     if (resolvedMode === 'interactive') {
       const message = reason === 'time-budget'

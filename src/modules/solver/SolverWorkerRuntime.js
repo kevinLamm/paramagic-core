@@ -113,6 +113,15 @@ export class SolverWorkerRuntime {
         return this.controller.updateParameter(payload.parameterId, payload.patch || {});
       case 'set-dimension-enabled-states':
         return this.controller.setDimensionEnabledStates(payload.states || []);
+      case 'set-enabled-stack-ids':
+      {
+        const transition = this.controller.setEnabledStackIds(payload.stackIds);
+        return { status: 'completed', changedEntityIds: [], diagnostics: {
+          enabledStackIds: [...transition.enabledStackIds],
+          enabled: transition.enabled || [],
+          disabled: transition.disabled || [],
+        } };
+      }
       default:
         throw new TypeError(`Unsupported solver worker command: ${type}.`);
     }
@@ -124,7 +133,7 @@ export class SolverWorkerRuntime {
       request = validateSolverWorkerRequest(message);
     } catch (error) {
       const fallback = {
-        requestId: Number.isInteger(message?.requestId) ? message.requestId : 0,
+        requestToken: Number.isInteger(message?.requestToken) ? message.requestToken : 0,
         generation: Number.isInteger(message?.generation) ? message.generation : 0,
         type: String(message?.type || 'invalid'),
       };

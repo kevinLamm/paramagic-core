@@ -26,6 +26,8 @@ export {
   exportTextFileWithPicker,
   isFileSystemAccessBlocked,
   isFileSystemAccessCancellation,
+  saveFileAsWithPicker,
+  saveFormatForFileName,
   writeTextToFileHandle,
 } from './modules/DrawingFileSystem.js';
 export { DOCUMENT_VARIABLE_SPECS } from './modules/DocumentVariables.js';
@@ -41,19 +43,21 @@ export {
   positionHeaderToolMenu,
   rememberRepeatableTool,
 } from './modules/CanvasUIControls.js';
-export { createDrawingClipboard } from './modules/DrawingClipboard.js';
+export { createDrawingClipboard, retargetClipboardDrawing } from './modules/DrawingClipboard.js';
 export { serializePortablePackageJson } from './modules/ImageSystem.js';
-export { createStackPanel } from './modules/StackSystem.js';
+export { cloneDrawingIdentityGraph } from './modules/DrawingIdentitySystem.js';
+export { createStackTreePanel } from './modules/StackTreePanel.js';
 export { createClassTools } from './modules/ClassTools.js';
 export { bindDeferredColorPicker } from './modules/GeometryAppearanceSystem.js';
 export {
   CLASS_APPEARANCE_GROUPS,
   CLASS_STATE_VERSION,
-  DEFAULT_CLASS_ID,
+  DEFAULT_CLASS_ROLE,
   DEFAULT_CLASS_NAME,
   createClassSystem,
   createDefaultClass,
   createDefaultClassProperties,
+  defaultClassId,
   materializeDrawingClassAppearances,
   normalizeClassState,
   normalizeEntityClass,
@@ -102,6 +106,8 @@ export * as geometryAppearance from './modules/GeometryAppearanceSystem.js';
 export * as images from './modules/ImageSystem.js';
 export * as imageStrokes from './modules/ImageStrokeSystem.js';
 export * as imageTrace from './modules/ImageTrace.js';
+export * as identity from './modules/IdentitySystem.js';
+export * as drawingIdentity from './modules/DrawingIdentitySystem.js';
 export * as notches from './modules/NotchSystem.js';
 export * as swell from './modules/SwellTools.js';
 export * as objectVisibility from './modules/ObjectVisibility.js';

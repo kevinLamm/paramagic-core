@@ -1,4 +1,4 @@
-let textSerial = 0;
+import { createUuid } from './IdentitySystem.js';
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 export const TEXT_PIXELS_PER_INCH = 96;
@@ -19,7 +19,6 @@ const initialTextDefaults = {
   fontSize: DEFAULT_TEXT_FONT_SIZE,
   textHeight: textHeightInMillimetres({ fontSize: DEFAULT_TEXT_FONT_SIZE }),
   fontColor: '#202020',
-  scaleWithZoom: true,
   multiline: true,
   textAlign: 'left',
   textVerticalAlign: 'top',
@@ -39,9 +38,7 @@ const DEFAULT_TEXT_CLASS_OVERRIDES = Object.freeze(['fillOpacity', 'strokeOpacit
 let lastTextDefaults = clone(initialTextDefaults);
 
 function textId() {
-  if (globalThis.crypto?.randomUUID) return `text-${globalThis.crypto.randomUUID()}`;
-  textSerial += 1;
-  return `text-${Date.now().toString(36)}-${textSerial}`;
+  return createUuid();
 }
 
 function finitePositive(value, fallback) {
@@ -65,8 +62,14 @@ export function isTextEntity(entity) {
   return entity?.type === 'text';
 }
 
+export function isTextVisibilityRecord(record) {
+  return record?.recordType === 'text' && isTextEntity(record.entity);
+}
+
 export function normalizeTextEntity(input = {}) {
   const defaults = lastTextDefaults;
+  const normalizedInput = clone(input);
+  delete normalizedInput.scaleWithZoom;
   const fontSize = finitePositive(input.fontSize, defaults.fontSize || DEFAULT_TEXT_FONT_SIZE);
   const textHeight = textHeightInMillimetres(
     input.textHeight === undefined && input.fontSize === undefined
@@ -74,10 +77,10 @@ export function normalizeTextEntity(input = {}) {
       : { textHeight: input.textHeight, fontSize },
   );
   return {
-    ...clone(input),
+    ...normalizedInput,
     id: input.id || textId(),
     type: 'text',
-    stackId: String(input.stackId || 'stack-default'),
+    stackId: input.stackId ? String(input.stackId) : null,
     x: Number.isFinite(Number(input.x)) ? Number(input.x) : 0,
     y: Number.isFinite(Number(input.y)) ? Number(input.y) : 0,
     text: input.multiline === false ? singleLineText(input.text ?? 'Text') : String(input.text ?? 'Text'),
@@ -85,7 +88,6 @@ export function normalizeTextEntity(input = {}) {
     fontSize,
     textHeight,
     fontColor: /^#[0-9a-f]{6}$/i.test(input.fontColor || '') ? input.fontColor : defaults.fontColor,
-    scaleWithZoom: input.scaleWithZoom === undefined ? defaults.scaleWithZoom !== false : Boolean(input.scaleWithZoom),
     multiline: input.multiline === undefined ? defaults.multiline !== false : Boolean(input.multiline),
     textAlign: normalizeTextAlign(input.textAlign ?? defaults.textAlign),
     textVerticalAlign: normalizeTextVerticalAlign(input.textVerticalAlign ?? defaults.textVerticalAlign),
@@ -154,7 +156,10 @@ export function bindTextRecordInteractions(record, {
     else onSelect(record);
   };
 
-  const handleDoubleClick = (event) => editAtPointer(event);
+  const handleDoubleClick = (event) => {
+    if (!canInteract(event, record)) return;
+    editAtPointer(event);
+  };
   target.addEventListener('pointerdown', handlePointerDown);
   target.addEventListener('click', handleClick);
   target.addEventListener('dblclick', handleDoubleClick);
@@ -378,7 +383,6 @@ export function rememberTextDefaults(entity) {
     fontSize: normalized.fontSize,
     textHeight: normalized.textHeight,
     fontColor: normalized.fontColor,
-    scaleWithZoom: normalized.scaleWithZoom,
     multiline: normalized.multiline,
     textAlign: normalized.textAlign,
     textVerticalAlign: normalized.textVerticalAlign,
@@ -429,7 +433,12 @@ export function createTextSystem({
 
   function displayedText(record) {
     if (record === editingRecord) return record.entity.text;
-    return resolveTextFields(record.entity.text, getParameters(), formatParameter, evaluateExpression);
+    return resolveTextFields(
+      record.entity.text,
+      getParameters(record.entity),
+      formatParameter,
+      (expression) => evaluateExpression?.(expression, record.entity),
+    );
   }
 
   function dimensions(record, text, effectiveFontSize) {
@@ -448,13 +457,11 @@ export function createTextSystem({
 
   function updateRecord(record) {
     const entity = presentationEntity(record);
-    const scale = Math.max(0.0001, getScale());
-    const scaleFactor = record === editingRecord || !entity.scaleWithZoom ? scale : 1;
-    const effectiveFontSize = entity.fontSize / scaleFactor;
+    const effectiveFontSize = entity.fontSize;
     const text = displayedText(record);
     const size = dimensions(record, text, effectiveFontSize);
     const appearance = getAppearance(record.entity);
-    const borderWidth = appearance.strokeThickness / scaleFactor;
+    const borderWidth = appearance.strokeThickness;
     const verticalAlign = normalizeTextVerticalAlign(entity.textVerticalAlign);
     const frameY = entity.y + (verticalAlign === 'middle' ? -size.height / 2 : verticalAlign === 'bottom' ? -size.height : 0);
 
@@ -499,7 +506,7 @@ export function createTextSystem({
     const entity = presentationEntity(record);
     const lines = entity.multiline ? String(record.editor.value || '').split('\n') : [singleLineText(record.editor.value || '')];
     const scale = Math.max(0.0001, getScale());
-    const screenFontSize = record === editingRecord || !entity.scaleWithZoom ? entity.fontSize : entity.fontSize * scale;
+    const screenFontSize = entity.fontSize * scale;
     const rect = record.editor.getBoundingClientRect();
     const padding = TEXT_EDITOR_PADDING * scale;
     const lineHeight = screenFontSize * TEXT_LINE_HEIGHT;
@@ -666,7 +673,6 @@ export function createTextSystem({
       applied.textHeight = finitePositive(patch.textHeight, textHeightInMillimetres(current));
     }
     if (patch.fontColor !== undefined && /^#[0-9a-f]{6}$/i.test(patch.fontColor)) applied.fontColor = patch.fontColor;
-    if (patch.scaleWithZoom !== undefined) applied.scaleWithZoom = Boolean(patch.scaleWithZoom);
     if (patch.multiline !== undefined) {
       applied.multiline = Boolean(patch.multiline);
       if (!applied.multiline) next.text = singleLineText(next.text);

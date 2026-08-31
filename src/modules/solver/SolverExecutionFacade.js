@@ -1,7 +1,7 @@
 import { createSolverController } from './SolverController.js';
 import { SolverMutationJournal } from './SolverMutationJournal.js';
 import { createBrowserSolverWorkerClient } from './SolverWorkerClient.js';
-import { createStableId } from './SolverModel.js';
+import { createUuid } from '../IdentitySystem.js';
 
 const resyncMethods = new Set([
   'addDimension',
@@ -9,6 +9,8 @@ const resyncMethods = new Set([
   'createControlParameter',
   'createParameter',
   'removeDimension',
+  'removeStackData',
+  'removeStackDataMany',
   'removeParameter',
   'restoreFilletRadiusDimension',
   'reorderParameter',
@@ -18,6 +20,9 @@ const resyncMethods = new Set([
   'setDocumentContext',
   'setDocumentMetadata',
   'setDrawingProperties',
+  'setStackState',
+  'setExternalStackRelationships',
+  'refreshStackParticipation',
   'solve',
   'updateCurveControlPoints',
   'updateDimensionAnnotation',
@@ -336,7 +341,7 @@ export class SolverExecutionFacade {
     }
     const requestedConstraint = constraint.id
       ? constraint
-      : { ...constraint, id: createStableId('constraint') };
+      : { ...constraint, id: createUuid() };
     return this.performAuthoritativeConstraintAdd(requestedConstraint);
   }
 
@@ -491,6 +496,14 @@ export class SolverExecutionFacade {
     const serializedStates = [...states];
     const revision = this.recordWorkerCommand('set-dimension-enabled-states', { states: serializedStates });
     this.enqueueWorker(() => this.workerClient.setDimensionEnabledStates(states), (workerResult) => this.compareDelta(workerResult, result), revision);
+    return result;
+  }
+
+  setEnabledStackIds(stackIds = null) {
+    const serializedStackIds = stackIds === null ? null : [...stackIds];
+    const result = this.controller.setEnabledStackIds(serializedStackIds);
+    const revision = this.recordWorkerCommand('set-enabled-stack-ids', { stackIds: serializedStackIds });
+    this.enqueueWorker(() => this.workerClient.setEnabledStackIds(serializedStackIds), null, revision);
     return result;
   }
 

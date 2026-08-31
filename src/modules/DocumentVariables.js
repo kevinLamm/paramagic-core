@@ -171,7 +171,7 @@ export function buildDocumentVariables({
     applicationVersion: DOCUMENT_APPLICATION_VERSION,
   };
   return DOCUMENT_VARIABLE_SPECS.map((spec, order) => ({
-    id: `document:${spec.name}`,
+    symbolKey: `document:${spec.name}`,
     name: spec.name,
     label: spec.label,
     value: values[spec.key] ?? '',

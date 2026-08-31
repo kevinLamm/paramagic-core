@@ -1,23 +1,15 @@
 import { isCanvasOriginReference } from '../CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from '../ArcGeometry.js';
-
-// --- Solver Variable & Unique ID Allocator ---
-let fallbackId = 0;
-
-export function createStableId(prefix = 'id') {
-  if (globalThis.crypto?.randomUUID) return `${prefix}-${globalThis.crypto.randomUUID()}`;
-  fallbackId += 1;
-  return `${prefix}-${fallbackId}`;
-}
+import { createUuid } from '../IdentitySystem.js';
 
 export class Variable {
-  constructor({ id = createStableId('variable'), value = 0, fixed = false, owner = null, parameter = null } = {}) {
+  constructor({ id = createUuid(), value = 0, fixed = false, ownerId = null, parameterKey = null } = {}) {
     this.id = id;
     this.value = Number(value);
     this.fixed = Boolean(fixed);
     this.locked = false;
-    this.owner = owner;
-    this.parameter = parameter;
+    this.ownerId = ownerId;
+    this.parameterKey = parameterKey;
   }
 
   get active() {
@@ -81,12 +73,12 @@ function pointKeys(prefix, point) {
 export class GeometryBinding {
   constructor(inputEntity) {
     const entity = clone(inputEntity);
-    this.id = entity.id || createStableId('entity');
+    this.id = entity.id || createUuid();
     this.type = entity.type;
     this.hasStackId = Object.prototype.hasOwnProperty.call(entity, 'stackId');
-    this.stackId = String(entity.stackId || 'stack-default');
+    this.stackId = entity.stackId ? String(entity.stackId) : null;
     this.hasClassId = Object.prototype.hasOwnProperty.call(entity, 'classId');
-    this.classId = String(entity.classId || 'class-x');
+    this.classId = entity.classId ? String(entity.classId) : null;
     this.classPropertyOverrides = Array.isArray(entity.classPropertyOverrides)
       ? clone(entity.classPropertyOverrides)
       : [];
@@ -108,7 +100,7 @@ export class GeometryBinding {
   setVariable(name, value) {
     const current = this.variables.get(name);
     if (current) current.value = Number(value);
-    else this.variables.set(name, new Variable({ id: `${this.id}:${name}`, value, owner: this.id, parameter: name }));
+    else this.variables.set(name, new Variable({ id: createUuid(), value, ownerId: this.id, parameterKey: name }));
   }
 
   setPoints(points) {
@@ -126,11 +118,11 @@ export class GeometryBinding {
     this.type = entity.type;
     if (Object.prototype.hasOwnProperty.call(entity, 'stackId')) {
       this.hasStackId = true;
-      this.stackId = String(entity.stackId || 'stack-default');
+      this.stackId = entity.stackId ? String(entity.stackId) : null;
     }
     if (Object.prototype.hasOwnProperty.call(entity, 'classId')) {
       this.hasClassId = true;
-      this.classId = String(entity.classId || 'class-x');
+      this.classId = entity.classId ? String(entity.classId) : null;
       this.classPropertyOverrides = Array.isArray(entity.classPropertyOverrides)
         ? clone(entity.classPropertyOverrides)
         : [];
@@ -382,11 +374,11 @@ export class GeometryBinding {
   updateFromEntity(entity) {
     if (Object.prototype.hasOwnProperty.call(entity, 'stackId')) {
       this.hasStackId = true;
-      this.stackId = String(entity.stackId || 'stack-default');
+      this.stackId = entity.stackId ? String(entity.stackId) : null;
     }
     if (Object.prototype.hasOwnProperty.call(entity, 'classId')) {
       this.hasClassId = true;
-      this.classId = String(entity.classId || 'class-x');
+      this.classId = entity.classId ? String(entity.classId) : null;
       this.classPropertyOverrides = Array.isArray(entity.classPropertyOverrides)
         ? clone(entity.classPropertyOverrides)
         : [];
@@ -631,7 +623,7 @@ export class SketchModel {
 
   addConstraints(inputs = []) {
     const constraints = inputs.map((input) => {
-      const constraint = clone({ ...input, id: input.id || createStableId('constraint'), enabled: input.enabled !== false });
+      const constraint = clone({ ...input, id: input.id || createUuid(), enabled: input.enabled !== false });
       if (constraint.type === 'Fixed' && !constraint.fixedPoint) {
         const pointRef = constraint.featureRefs?.find((ref) => ref.kind === 'point' || ref.type === 'point');
         const point = pointRef && this.resolvePoint(pointRef);

@@ -10,7 +10,7 @@ export class SolverWorkerClient {
   constructor(worker) {
     if (!worker?.postMessage) throw new TypeError('SolverWorkerClient requires a Worker-compatible transport.');
     this.worker = worker;
-    this.nextRequestId = 1;
+    this.nextRequestToken = 1;
     this.nextGeneration = 1;
     this.latestInteractiveGeneration = 0;
     this.inFlight = null;
@@ -28,7 +28,7 @@ export class SolverWorkerClient {
     return new Promise((resolve, reject) => {
       const entry = {
         request: createSolverWorkerRequest({
-          requestId: this.nextRequestId++,
+          requestToken: this.nextRequestToken++,
           generation,
           type,
           payload,
@@ -48,7 +48,7 @@ export class SolverWorkerClient {
         this.queue[this.queue.length - 1] = entry;
         previous.resolve({
           version: previous.request.version,
-          requestId: previous.request.requestId,
+          requestToken: previous.request.requestToken,
           generation: previous.request.generation,
           type: 'result',
           commandType: previous.request.type,
@@ -84,7 +84,7 @@ export class SolverWorkerClient {
       this.pump();
       return;
     }
-    if (!this.inFlight || result.requestId !== this.inFlight.request.requestId) return;
+    if (!this.inFlight || result.requestToken !== this.inFlight.request.requestToken) return;
     const entry = this.inFlight;
     this.inFlight = null;
     const timedResult = {
@@ -177,6 +177,10 @@ export class SolverWorkerClient {
 
   setDimensionEnabledStates(states) {
     return this.request('set-dimension-enabled-states', { states: [...states] });
+  }
+
+  setEnabledStackIds(stackIds = null) {
+    return this.request('set-enabled-stack-ids', { stackIds: stackIds === null ? null : [...stackIds] });
   }
 
   terminate() {

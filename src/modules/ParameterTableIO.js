@@ -26,11 +26,14 @@ function typeLabel(entry) {
   return 'Parameter';
 }
 
-export function parameterTableExportRows(entries, { expressionForEntry = (entry) => entry?.expression ?? '' } = {}) {
+export function parameterTableExportRows(entries, {
+  expressionForEntry = (entry) => entry?.expression ?? '',
+  nameForEntry = (entry) => entry?.name ?? '',
+} = {}) {
   return [
     ['Name', 'Expression', 'Type'],
     ...Array.from(entries || []).map((entry) => [
-      cellText(entry?.name),
+      cellText(nameForEntry(entry)),
       cellText(expressionForEntry(entry)),
       typeLabel(entry),
     ]),
@@ -177,6 +180,10 @@ export function replaceParametersFromRows({ solver, rows, scope = 'user' } = {})
   const before = solver.parameters();
   const protectedEntries = before.filter((entry) => entry.kind === 'dimension' || entry.kind === 'control');
   const protectedByName = new Map(protectedEntries.map((entry) => [entry.name, entry]));
+  solver.parameterExpressionSymbols?.().forEach((symbol) => {
+    const entry = protectedEntries.find(({ id }) => id === symbol.parameterId);
+    if (entry) protectedByName.set(symbol.name, entry);
+  });
   before.filter((entry) => entry.kind !== 'dimension' && entry.kind !== 'control')
     .forEach((entry) => solver.removeParameter(entry.id));
 

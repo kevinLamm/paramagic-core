@@ -1,5 +1,11 @@
 import { replaceDrawingTextForeignObjects } from './TextTools.js';
+import { replaceTableCellForeignObjects } from './TableTools.js';
 import { prepareNotchValueOnlyPresentationClone } from './NotchSystem.js';
+import { prepareSubtractPresentationClone } from './SubtractSystem.js';
+import {
+  prepareDimensionPresentationClone,
+  setDimensionPresentationText,
+} from './DimensionSystem.js';
 
 export const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 
@@ -50,14 +56,14 @@ export function valueOnlyDimensionText(value) {
 
 export function isCanvasPresentationSourceNode(node, stackId = null) {
   if (!node) return false;
-  if (stackId && (node.getAttribute?.('data-stack-id') || 'stack-default') !== stackId) return false;
+  if (stackId && node.getAttribute?.('data-stack-id') !== stackId) return false;
   const supported = hasClass(node, 'canvas-record')
     || hasClass(node, 'array-group')
     || hasClass(node, 'linked-copy-group')
     || hasClass(node, 'symmetric-mirror-group');
   if (!supported || hasClass(node, 'closed-constrained-region')) return false;
   if (hasClass(node, 'object-visibility-hidden')) return false;
-  if (hasClass(node, 'dimension-driving')) return false;
+  if (hasClass(node, 'stack-disabled')) return false;
   if (hasClass(node, 'dimension-export-excluded')) return false;
   const derivedGroup = hasClass(node, 'array-group')
     || hasClass(node, 'linked-copy-group')
@@ -66,10 +72,14 @@ export function isCanvasPresentationSourceNode(node, stackId = null) {
   return true;
 }
 
-export function sanitizeCanvasPresentationClone(source) {
+export function sanitizeCanvasPresentationClone(source, {
+  resolveValueOnlyDimensionText = null,
+} = {}) {
   const cloneNode = source.cloneNode(true);
   replaceDrawingTextForeignObjects(source, cloneNode);
+  replaceTableCellForeignObjects(source, cloneNode);
   prepareNotchValueOnlyPresentationClone(cloneNode);
+  prepareSubtractPresentationClone(cloneNode);
   cloneNode.querySelectorAll?.(EDITING_UI_SELECTOR).forEach((node) => node.remove());
   cloneNode.querySelectorAll?.('.array-item-content, .linked-copy-content, .symmetric-mirror-copy').forEach((node) => {
     if (node.querySelector?.('.construction')) node.remove();
@@ -90,6 +100,14 @@ export function sanitizeCanvasPresentationClone(source) {
   cloneNode.querySelectorAll?.('.dimension-text').forEach((text) => {
     text.textContent = valueOnlyDimensionText(text.textContent);
   });
+  prepareDimensionPresentationClone(source, cloneNode);
+  const dimensionId = cloneNode.getAttribute?.('data-dimension-id');
+  const resolvedText = dimensionId && typeof resolveValueOnlyDimensionText === 'function'
+    ? resolveValueOnlyDimensionText(dimensionId)
+    : null;
+  if (resolvedText !== null && resolvedText !== undefined && String(resolvedText) !== '') {
+    setDimensionPresentationText(cloneNode, resolvedText);
+  }
   return cloneNode;
 }
 
@@ -205,9 +223,11 @@ function clonePresentationDefinitions(objectLayer, content, svg, documentRef) {
 export function createCanvasPresentationSvg({
   objectLayer,
   stackId = null,
+  stackIds = null,
   width = 240,
   height = 150,
   background = null,
+  resolveValueOnlyDimensionText = null,
   documentRef = globalThis.document,
 } = {}) {
   if (!objectLayer || !documentRef?.createElementNS) return null;
@@ -222,9 +242,13 @@ export function createCanvasPresentationSvg({
     'data-canvas-presentation-content': 'true',
     'aria-hidden': 'true',
   });
+  const includedStackIds = stackIds ? new Set(stackIds) : null;
   [...objectLayer.children]
-    .filter((node) => isCanvasPresentationSourceNode(node, stackId))
-    .forEach((node) => content.appendChild(sanitizeCanvasPresentationClone(node)));
+    .filter((node) => isCanvasPresentationSourceNode(node, stackId)
+      && (!includedStackIds || includedStackIds.has(node.getAttribute?.('data-stack-id'))))
+    .forEach((node) => content.appendChild(sanitizeCanvasPresentationClone(node, {
+      resolveValueOnlyDimensionText,
+    })));
   clonePresentationDefinitions(objectLayer, content, svg, documentRef);
   if (background !== null && background !== 'none' && background !== 'transparent') {
     svg.appendChild(createSvg(documentRef, 'rect', {

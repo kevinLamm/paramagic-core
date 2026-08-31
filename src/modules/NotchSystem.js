@@ -1,5 +1,9 @@
 import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { resolvedBoundaryForHost } from './BoundaryTopology.js';
+import { createUuid } from './IdentitySystem.js';
+import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+
+registerIdentitySchema('notchTools', { declarations: () => [] });
 
 // --- Notch Features & Constants ---
 const add = (a, b) => [a[0] + b[0], a[1] + b[1]];
@@ -24,8 +28,13 @@ export const vNotchHalfWidth = 3.175;
 export const uNotchHalfWidth = 1.5875;
 export const isNotchEntity = (entity) => entity?.type === 'notch' && entity.host?.recordId;
 
-export function prepareNotchValueOnlyPresentationClone(clone) {
+export function prepareNotchDerivativePresentationClone(clone) {
   clone?.querySelectorAll?.('.notch-dot, .notch-hit').forEach((node) => node.remove());
+  return clone;
+}
+
+export function prepareNotchValueOnlyPresentationClone(clone) {
+  prepareNotchDerivativePresentationClone(clone);
   clone?.querySelectorAll?.('.notch-line').forEach((node) => {
     node.setAttribute('stroke', '#000000');
     node.setAttribute('stroke-width', '1.5');
@@ -513,7 +522,7 @@ export function createNotchEntity(
   feature,
   pickedPoint,
   inwardTarget,
-  id = `notch-${crypto.randomUUID()}`,
+  id = createUuid(),
   notchType = DEFAULT_NOTCH_TYPE,
 ) {
   if (feature.kind === 'segment' || feature.kind === 'curve' || feature.kind === 'polyline') {

@@ -1,10 +1,17 @@
 import { evaluateFilletedGeometry } from './FilletSystem.js';
+import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
+import {
+  cloneDrawingIdentityGraph,
+  migrateDrawingIdentities,
+  remapDrawingIdentityGraph,
+  validateDrawingIdentityGraph,
+} from './DrawingIdentitySystem.js';
 import {
   DXF_BOUNDARY_ENTITY_TYPE,
   dxfBoundaryVertices,
 } from './DxfExportGeometry.js';
 import { notchDxfLayer, notchFillColor, notchGeometryPoints, notchGeometryPrimitives, notchSvgPath } from './NotchSystem.js';
-import { materializeSeamLineEntitiesForDrawing } from './SeamLineSystem.js';
+import { materializeSeamLineEntitiesForDrawing, normalizeSeamLineExtension } from './SeamLineSystem.js';
 import {
   arrayDependentVisualIds,
   evaluateArrayCountExpression,
@@ -43,10 +50,30 @@ import {
   resolveTextFields,
   textHeightInMillimetres,
 } from './TextTools.js';
-import { subtractBoundaryContours, subtractDrawingResults } from './SubtractSystem.js';
+import { migrateSubtractReferences, subtractBoundaryContours, subtractDrawingResults } from './SubtractSystem.js';
 import { resolveClosedBoundaries } from './BoundaryTopology.js';
-import { formatDrivenDimensionValue, formatUnitlessValue } from './solver/Units.js';
+import {
+  formatDxfDimensionValue,
+  formatUnitlessValue,
+  formatValueOnlyDimensionValue,
+} from './solver/Units.js';
 import { entityStackId, normalizeStackState } from './StackSystem.js';
+import {
+  DRAWING_NODE_KIND,
+  STACK_ARCHITECTURE_VERSION,
+  createStackId,
+  defaultStackId,
+  migrateStackArchitecture,
+  normalizeStackArchitectureState,
+} from './StackArchitecture.js';
+import {
+  nextAvailableParameterName,
+  parameterNameKey,
+  qualifiedDimensionName,
+  rewriteExpressionSymbolReferences,
+  rewriteQualifiedDimensionReferences,
+  uniqueStackName,
+} from './NamingSystem.js';
 import { filterVisibleResolvedEntities } from './ObjectVisibility.js';
 import { arcExtentPoints, arcSweepFromAngles } from './ArcGeometry.js';
 import {
@@ -56,8 +83,10 @@ import {
   swellBoundaryPath,
 } from './SwellGeometry.js';
 import { buildDocumentVariables, normalizeDocumentMetadata } from './DocumentVariables.js';
+import { reconcileDormantStackRelationships } from './StackRelationshipSystem.js';
+import { migrateCanvasOriginReferences } from './CanvasOrigin.js';
 import {
-  DEFAULT_CLASS_ID,
+  DEFAULT_CLASS_ROLE,
   isClassGeometryEntity,
   materializeDrawingClassAppearances,
   normalizeClassState,
@@ -74,16 +103,8 @@ const dxfUnits = {
   cm: { code: 5, factor: 10 },
   m: { code: 6, factor: 1000 },
 };
-let fallbackId = 0;
-
-function newId(prefix) {
-  if (globalThis.crypto?.randomUUID) return `${prefix}-${globalThis.crypto.randomUUID()}`;
-  fallbackId += 1;
-  return `${prefix}-import-${Date.now().toString(36)}-${fallbackId}`;
-}
-
-export function normalizeDrawingData(input = {}) {
-  const source = input.drawing || input;
+export function normalizeDrawingDataWithIdentityMap(input = {}) {
+  const source = migrateSubtractReferences(migrateCanvasOriginReferences(input.drawing || input));
   const parameters = source.parameters || source.dimensions || [];
   const classState = normalizeClassState(source);
   const entities = clone(source.entities || []).map((entity) => {
@@ -97,12 +118,16 @@ export function normalizeDrawingData(input = {}) {
   const extensions = source.extensions && typeof source.extensions === 'object' && !Array.isArray(source.extensions)
     ? clone(source.extensions)
     : null;
+  if (extensions?.seamLines) extensions.seamLines = normalizeSeamLineExtension(extensions.seamLines);
   const upgradedDimensions = upgradeLegacyParallelEdgeDimensions({
     entities,
     constraints: clone(source.constraints || []),
     dimensionAnnotations: clone(source.dimensionAnnotations || source.annotations || []),
   });
-  return {
+  const structured = migrateStackArchitecture({
+    drawingId: source.drawingId,
+    identityArchitectureVersion: source.identityArchitectureVersion,
+    stackArchitectureVersion: source.stackArchitectureVersion,
     drawingUnit: source.drawingUnit || 'in',
     dxfExportUnit: source.dxfExportUnit || source.drawingUnit || 'in',
     filletRadius: Number.isFinite(Number(source.filletRadius)) && Number(source.filletRadius) > 0
@@ -117,92 +142,48 @@ export function normalizeDrawingData(input = {}) {
     documentContext: {
       fileName: String(source.documentContext?.fileName ?? ''),
       filePath: String(source.documentContext?.filePath ?? ''),
+      contentKind: source.documentContext?.contentKind === 'stack-export' ? 'stack-export' : 'drawing',
+      displayName: String(source.documentContext?.displayName ?? source.name ?? ''),
     },
     classes: clone(classState.classes),
     activeClassId: classState.activeClassId,
     ...(extensions && Object.keys(extensions).length ? { extensions } : {}),
-  };
+  });
+  const migrated = migrateDrawingIdentities(structured);
+  if (migrated.errors.length) throw new Error(migrated.errors[0].message);
+  return migrated;
+}
+
+export function normalizeDrawingData(input = {}) {
+  return normalizeDrawingDataWithIdentityMap(input).drawing;
 }
 
 export function serializeDrawingJson(snapshot, name = 'Untitled Drawing') {
+  if (Number(snapshot?.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(snapshot);
   const drawing = normalizeDrawingData(snapshot);
+  validateDrawingIdentityGraph(drawing);
   delete drawing.dimensions;
   return JSON.stringify({
     format: 'ParaMagic Drawing',
-    version: 2,
+    version: 4,
     name,
     ...drawing,
   }, null, 2);
 }
 
-function replaceExpressionNames(expression, nameMap) {
-  const replacements = [...nameMap.entries()].filter(([before, after]) => before !== after);
-  if (!replacements.length) return String(expression ?? '');
-  const alternatives = replacements
-    .map(([name]) => name)
-    .sort((a, b) => b.length - a.length)
-    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('|');
-  return String(expression ?? '').replace(
-    new RegExp(`\\b(?:${alternatives})\\b`, 'g'),
-    (name) => nameMap.get(name) || name,
-  );
+export function createIndependentDrawingSave(snapshot, name = 'Untitled Drawing') {
+  const { drawing: remappedDrawing, idMap } = cloneDrawingIdentityGraph(snapshot);
+  const content = serializeDrawingJson(remappedDrawing, name);
+  const drawing = parseDrawingText(`${name}.paramagic`, content);
+  return { content, drawing, idMap };
 }
 
-function nextAvailableName(requested, kind, usedNames) {
-  if (!usedNames.has(requested)) return requested;
-  if (kind === 'dimension') {
-    let index = 1;
-    while (usedNames.has(`d${index}`)) index += 1;
-    return `d${index}`;
-  }
-  if (kind === 'control') {
-    let index = 1;
-    while (usedNames.has(`c${index}`)) index += 1;
-    return `c${index}`;
-  }
-  let index = 2;
-  while (usedNames.has(`${requested}_${index}`)) index += 1;
-  return `${requested}_${index}`;
-}
-
-function replaceMappedValues(value, idMap) {
-  if (Array.isArray(value)) return value.map((item) => replaceMappedValues(item, idMap));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceMappedValues(item, idMap)]));
-  if (typeof value !== 'string') return value;
-  if (idMap.has(value)) return idMap.get(value);
-  if (value.startsWith('cycle:')) {
-    const members = value.slice('cycle:'.length).split('|').filter(Boolean);
-    if (members.length && members.every((id) => idMap.has(id))) {
-      return `cycle:${members.map((id) => idMap.get(id)).sort().join('|')}`;
-    }
-  }
-  return value;
-}
-
-function collectExtensionIds(value, result = new Set()) {
-  if (Array.isArray(value)) {
-    value.forEach((item) => collectExtensionIds(item, result));
-    return result;
-  }
-  if (!value || typeof value !== 'object') return result;
-  Object.entries(value).forEach(([key, item]) => {
-    if (key === 'id' && typeof item === 'string' && item) result.add(item);
-    else collectExtensionIds(item, result);
-  });
-  return result;
-}
-
-function replaceExtensionExpressionNames(value, nameMap, key = '') {
-  if (Array.isArray(value)) return value.map((item) => replaceExtensionExpressionNames(item, nameMap, key));
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([childKey, item]) => [
-      childKey,
-      replaceExtensionExpressionNames(item, nameMap, childKey),
-    ]));
-  }
-  if (typeof value === 'string' && /Expression$/.test(key)) return replaceExpressionNames(value, nameMap);
-  return value;
+function replaceExpressionNames(expression, nameMap, { caseInsensitive = false } = {}) {
+  const renames = [...nameMap.entries()]
+    .filter(([before, after]) => before !== after)
+    .sort(([first], [second]) => second.length - first.length)
+    .map(([before, after]) => ({ before, after, caseInsensitive }));
+  return rewriteExpressionSymbolReferences(expression, renames);
 }
 
 function mergeExtensionValues(base = {}, inserted = {}) {
@@ -219,10 +200,132 @@ function mergeExtensionValues(base = {}, inserted = {}) {
   return result;
 }
 
-export function mergeDrawingDataWithMap(baseInput, insertedInput, { inheritControlParameters = true } = {}) {
+function mergedStackArchitecture(base, inserted, idMap, {
+  targetStackId = null,
+  insertParentStackId = null,
+  insertAsDrawing = false,
+  drawingContainerName = '',
+} = {}) {
+  const baseState = normalizeStackArchitectureState(base.extensions?.stacks);
+  const insertedState = normalizeStackArchitectureState(inserted.extensions?.stacks);
+  const stacks = clone(baseState.stacks);
+  const targetExists = !insertAsDrawing && targetStackId && stacks.some(({ id }) => id === targetStackId);
+  if (targetStackId && !targetExists) throw new Error(`Clipboard target Stack ${targetStackId} does not exist.`);
+  if (insertParentStackId && !stacks.some(({ id }) => id === insertParentStackId)) {
+    throw new Error(`Inserted subtree parent Stack ${insertParentStackId} does not exist.`);
+  }
+  if (insertAsDrawing && targetStackId) {
+    throw new Error('A full drawing cannot be inserted into a drawable Stack.');
+  }
+  const insertedRootNodeIds = [];
+  let drawingContainerId = null;
+  if (insertAsDrawing) {
+    drawingContainerId = createStackId();
+    const fallbackName = inserted.documentContext?.displayName
+      || inserted.documentContext?.fileName?.replace(/\.[^.]+$/, '')
+      || 'Drawing';
+    stacks.push({
+      id: drawingContainerId,
+      kind: DRAWING_NODE_KIND,
+      sourceStackId: null,
+      sourceDrawingId: inserted.drawingId || null,
+      parentStackId: insertParentStackId || null,
+      order: stacks.filter(({ parentStackId }) => (parentStackId || null) === (insertParentStackId || null)).length,
+      name: uniqueStackName(drawingContainerName || fallbackName, stacks, { fallback: 'Drawing' }),
+      visible: true,
+      enabled: true,
+      enabledExpression: '',
+      removable: true,
+    });
+    insertedRootNodeIds.push(drawingContainerId);
+  }
+  if (!targetExists) insertedState.stacks.forEach((stack) => idMap.set(stack.id, createStackId()));
+  insertedState.stacks.forEach((stack) => {
+    if (targetExists) {
+      idMap.set(stack.id, targetStackId);
+      return;
+    }
+    const id = idMap.get(stack.id);
+    const parentStackId = stack.parentStackId
+      ? idMap.get(stack.parentStackId)
+      : drawingContainerId || insertParentStackId || null;
+    if (!stack.parentStackId && !drawingContainerId) insertedRootNodeIds.push(id);
+    stacks.push({
+      ...clone(stack),
+      id,
+      sourceStackId: stack.sourceStackId || stack.id,
+      parentStackId,
+      name: uniqueStackName(stack.name, stacks),
+      systemRole: undefined,
+      removable: true,
+    });
+  });
+  return {
+    state: {
+      version: baseState.version,
+      activeStackId: baseState.activeStackId,
+      stacks,
+    },
+    insertedRootNodeIds,
+  };
+}
+
+function replaceExpressionFields(value, {
+  globalNameMap,
+  localNameMapsByStack,
+  qualifiedRenames,
+  contextStackId = null,
+  key = '',
+} = {}) {
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceExpressionFields(item, {
+      globalNameMap, localNameMapsByStack, qualifiedRenames, contextStackId, key,
+    }));
+  }
+  if (value && typeof value === 'object') {
+    const nextContext = value.stackId
+      || (Object.hasOwn(value, 'enabledExpression') ? value.id : null)
+      || contextStackId;
+    return Object.fromEntries(Object.entries(value).map(([childKey, item]) => [
+      childKey,
+      replaceExpressionFields(item, {
+        globalNameMap,
+        localNameMapsByStack,
+        qualifiedRenames,
+        contextStackId: nextContext,
+        key: childKey,
+      }),
+    ]));
+  }
+  const expressionBearing = key === 'expression' || /Expression$/.test(key) || key === 'text';
+  if (typeof value !== 'string' || !expressionBearing) return value;
+  let expression = replaceExpressionNames(value, globalNameMap);
+  expression = rewriteQualifiedDimensionReferences({ expression }, qualifiedRenames).expression;
+  const localNameMap = localNameMapsByStack.get(contextStackId);
+  if (localNameMap) expression = replaceExpressionNames(expression, localNameMap, { caseInsensitive: true });
+  return expression;
+}
+
+export function mergeDrawingDataWithMap(baseInput, insertedInput, {
+  inheritControlParameters = true,
+  targetStackId = null,
+  insertParentStackId = null,
+  insertAsDrawing = false,
+  drawingContainerName = '',
+} = {}) {
   const base = normalizeDrawingData(baseInput);
-  const inserted = normalizeDrawingData(insertedInput);
+  const insertedNormalization = normalizeDrawingDataWithIdentityMap(insertedInput);
+  const inserted = insertedNormalization.drawing;
   const idMap = new Map();
+  const stackMerge = mergedStackArchitecture(base, inserted, idMap, {
+    targetStackId,
+    insertParentStackId,
+    insertAsDrawing,
+    drawingContainerName,
+  });
+  let stackState = stackMerge.state;
+  const baseDefaultStackId = defaultStackId(base.extensions?.stacks);
+  const insertedDefaultStackId = defaultStackId(inserted.extensions?.stacks);
   const inheritedParameterIds = new Set();
   const activeNonDimensionParameters = new Map(
     base.parameters
@@ -230,10 +333,11 @@ export function mergeDrawingDataWithMap(baseInput, insertedInput, { inheritContr
       .map((parameter) => [parameter.name, parameter]),
   );
   const mergedClasses = clone(base.classes);
+  const baseDefaultClass = mergedClasses.find(({ systemRole }) => systemRole === DEFAULT_CLASS_ROLE) || mergedClasses[0];
   const baseClassByName = new Map(base.classes.map((item) => [item.name.toLocaleLowerCase(), item]));
   inserted.classes.forEach((item) => {
-    if (item.id === DEFAULT_CLASS_ID) {
-      idMap.set(item.id, DEFAULT_CLASS_ID);
+    if (item.systemRole === DEFAULT_CLASS_ROLE) {
+      idMap.set(item.id, baseDefaultClass.id);
       return;
     }
     const existing = baseClassByName.get(item.name.toLocaleLowerCase());
@@ -241,15 +345,12 @@ export function mergeDrawingDataWithMap(baseInput, insertedInput, { inheritContr
       idMap.set(item.id, existing.id);
       return;
     }
-    const id = newId('class');
+    const id = createUuid();
     idMap.set(item.id, id);
     const merged = { ...clone(item), id };
     mergedClasses.push(merged);
     baseClassByName.set(merged.name.toLocaleLowerCase(), merged);
   });
-  inserted.entities.forEach((entity) => idMap.set(entity.id, newId('entity')));
-  new Set(inserted.entities.map((entity) => entity.composite?.id).filter(Boolean))
-    .forEach((compositeId) => idMap.set(compositeId, newId('composite')));
   inserted.parameters.forEach((parameter) => {
     const inherited = parameter.kind !== 'dimension'
       ? activeNonDimensionParameters.get(parameter.name)
@@ -259,61 +360,117 @@ export function mergeDrawingDataWithMap(baseInput, insertedInput, { inheritContr
       inheritedParameterIds.add(parameter.id);
       return;
     }
-    idMap.set(parameter.id, newId(parameter.kind === 'dimension' ? 'dimension' : 'parameter'));
-  });
-  inserted.constraints.forEach((constraint) => idMap.set(constraint.id, newId('constraint')));
-  inserted.dimensionAnnotations.forEach((annotation) => idMap.set(annotation.id, newId('dimension-annotation')));
-  collectExtensionIds(inserted.extensions).forEach((id) => {
-    if (!idMap.has(id)) idMap.set(id, newId('extension'));
+    if (parameter.kind !== 'dimension') idMap.set(parameter.id, createUuid());
   });
 
-  const usedNames = new Set(base.parameters.map((parameter) => parameter.name));
+  const usedGlobalNames = new Set(base.parameters
+    .filter(({ kind }) => kind !== 'dimension')
+    .map((parameter) => parameter.name));
+  const usedDimensionNamesByStack = new Map();
+  base.parameters.filter(({ kind }) => kind === 'dimension').forEach((parameter) => {
+    const stackId = parameter.stackId || baseDefaultStackId;
+    if (!usedDimensionNamesByStack.has(stackId)) usedDimensionNamesByStack.set(stackId, new Set());
+    usedDimensionNamesByStack.get(stackId).add(parameterNameKey(parameter.name, 'dimension'));
+  });
   const nameMap = new Map();
+  const parameterNameById = new Map();
+  const globalNameMap = new Map();
+  const localNameMapsByStack = new Map();
+  const insertedStackNames = new Map(normalizeStackArchitectureState(inserted.extensions?.stacks).stacks
+    .map((stack) => [stack.id, stack.name]));
+  const mergedStackNames = new Map(stackState.stacks.map((stack) => [stack.id, stack.name]));
+  const qualifiedRenames = [];
   inserted.parameters.forEach((parameter) => {
     if (inheritedParameterIds.has(parameter.id)) {
+      parameterNameById.set(parameter.id, parameter.name);
       nameMap.set(parameter.name, parameter.name);
+      globalNameMap.set(parameter.name, parameter.name);
       return;
     }
-    const nextName = nextAvailableName(parameter.name, parameter.kind, usedNames);
-    usedNames.add(nextName);
+    const sourceStackId = parameter.stackId || insertedDefaultStackId;
+    const targetStackId = idMap.get(sourceStackId) || sourceStackId;
+    let nextName;
+    if (parameter.kind === 'dimension') {
+      if (!usedDimensionNamesByStack.has(targetStackId)) usedDimensionNamesByStack.set(targetStackId, new Set());
+      const usedNames = usedDimensionNamesByStack.get(targetStackId);
+      nextName = nextAvailableParameterName(parameter.name, parameter.kind, usedNames, {
+        sequentialDimension: true,
+      });
+      usedNames.add(parameterNameKey(nextName, 'dimension'));
+      if (!localNameMapsByStack.has(sourceStackId)) localNameMapsByStack.set(sourceStackId, new Map());
+      localNameMapsByStack.get(sourceStackId).set(parameter.name, nextName);
+      if (!localNameMapsByStack.has(targetStackId)) localNameMapsByStack.set(targetStackId, new Map());
+      localNameMapsByStack.get(targetStackId).set(parameter.name, nextName);
+      qualifiedRenames.push({
+        before: qualifiedDimensionName(
+          parameter.name,
+          insertedStackNames.get(sourceStackId) || sourceStackId,
+        ),
+        after: qualifiedDimensionName(
+          nextName,
+          mergedStackNames.get(targetStackId) || targetStackId,
+        ),
+      });
+    } else {
+      nextName = nextAvailableParameterName(parameter.name, parameter.kind, usedGlobalNames);
+      usedGlobalNames.add(nextName);
+      globalNameMap.set(parameter.name, nextName);
+    }
+    parameterNameById.set(parameter.id, nextName);
     nameMap.set(parameter.name, nextName);
   });
 
-  const remapped = replaceMappedValues(inserted, idMap);
+  stackState = replaceExpressionFields(stackState, {
+    globalNameMap,
+    localNameMapsByStack,
+    qualifiedRenames,
+  });
+
+  const remappedIdentity = remapDrawingIdentityGraph(inserted, {
+    identityMap: idMap,
+  });
+  let remapped = remappedIdentity.drawing;
+  remapped = replaceExpressionFields(remapped, {
+    globalNameMap,
+    localNameMapsByStack,
+    qualifiedRenames,
+  });
   remapped.parameters = remapped.parameters
-    .filter((_parameter, index) => !inheritedParameterIds.has(inserted.parameters[index].id))
-    .map((parameter, order) => ({
+    .map((parameter, index) => ({ parameter, source: inserted.parameters[index] }))
+    .filter(({ source }) => !inheritedParameterIds.has(source.id))
+    .map(({ parameter, source }, order) => ({
       ...parameter,
-      name: nameMap.get(parameter.name) || parameter.name,
-      expression: replaceExpressionNames(parameter.expression, nameMap),
+      name: parameterNameById.get(source.id) || parameter.name,
       order: base.parameters.length + order,
     }));
   remapped.dimensions = clone(remapped.parameters);
-  remapped.dimensionAnnotations = remapped.dimensionAnnotations.map((annotation) => ({
-    ...annotation,
-    dimensionName: nameMap.get(annotation.dimensionName) || annotation.dimensionName,
-  }));
+  const sourceAnnotationByMappedId = new Map(inserted.dimensionAnnotations
+    .map((annotation) => [idMap.get(annotation.id), annotation]));
+  remapped.dimensionAnnotations = remapped.dimensionAnnotations.map((annotation) => {
+    const sourceAnnotation = sourceAnnotationByMappedId.get(annotation.id);
+    return {
+      ...annotation,
+      dimensionName: parameterNameById.get(sourceAnnotation?.dimensionId) || annotation.dimensionName,
+    };
+  });
   remapped.entities = remapped.entities.map((rawEntity) => {
-    const entity = replaceExtensionExpressionNames(rawEntity, nameMap);
-    if (entity.type === 'text') return { ...entity, text: replaceExpressionNames(entity.text, nameMap) };
+    const entity = rawEntity;
     if (entity.type === 'control') {
       return {
         ...entity,
-        parameterName: nameMap.get(entity.parameterName) || entity.parameterName,
-        minExpression: replaceExpressionNames(entity.minExpression, nameMap),
-        maxExpression: replaceExpressionNames(entity.maxExpression, nameMap),
-        initialExpression: replaceExpressionNames(entity.initialExpression, nameMap),
+        parameterName: globalNameMap.get(entity.parameterName) || entity.parameterName,
       };
     }
     return entity;
   });
-  if (remapped.extensions) {
-    remapped.extensions = replaceExtensionExpressionNames(remapped.extensions, nameMap);
-  }
 
   const parameters = [...base.parameters, ...remapped.parameters];
   const extensions = mergeExtensionValues(base.extensions, remapped.extensions);
-  const drawing = {
+  extensions.stacks = stackState;
+  const drawing = reconcileDormantStackRelationships({
+    drawingId: base.drawingId,
+    identityArchitectureVersion: base.identityArchitectureVersion,
+    stackArchitectureVersion: STACK_ARCHITECTURE_VERSION,
     drawingUnit: base.drawingUnit,
     dxfExportUnit: base.dxfExportUnit,
     filletRadius: base.filletRadius,
@@ -327,8 +484,11 @@ export function mergeDrawingDataWithMap(baseInput, insertedInput, { inheritContr
     classes: mergedClasses,
     activeClassId: base.activeClassId,
     ...(Object.keys(extensions).length ? { extensions } : {}),
-  };
-  return { drawing, idMap, nameMap };
+  });
+  insertedNormalization.idMap.forEach((canonicalId, legacyId) => {
+    if (idMap.has(canonicalId)) idMap.set(legacyId, idMap.get(canonicalId));
+  });
+  return { drawing, idMap, nameMap, insertedRootNodeIds: stackMerge.insertedRootNodeIds };
 }
 
 export function mergeDrawingData(baseInput, insertedInput) {
@@ -441,8 +601,8 @@ export function parseDxf(text) {
     const fields = entityFields(pairs.slice(index + 1, end));
     const number = (code, occurrence = 0) => Number(fields.get(code)?.[occurrence] || 0) * factor;
     const point = (xCode, yCode, occurrence = 0) => [number(xCode, occurrence), -number(yCode, occurrence)];
-    if (type === 'LINE') entities.push({ id: newId('dxf-line'), type: 'line', start: point(10, 20), end: point(11, 21) });
-    if (type === 'CIRCLE') entities.push({ id: newId('dxf-circle'), type: 'circle', center: point(10, 20), radius: number(40) });
+    if (type === 'LINE') entities.push({ id: createUuid(), type: 'line', start: point(10, 20), end: point(11, 21) });
+    if (type === 'CIRCLE') entities.push({ id: createUuid(), type: 'circle', center: point(10, 20), radius: number(40) });
     if (type === 'ARC') {
       const center = point(10, 20);
       const radius = number(40);
@@ -450,7 +610,7 @@ export function parseDxf(text) {
       const endAngleRaw = Number(fields.get(51)?.[0] || 0) * Math.PI / 180;
       const endAngle = endAngleRaw < startAngle ? endAngleRaw + Math.PI * 2 : endAngleRaw;
       const at = (angle) => [center[0] + radius * Math.cos(angle), center[1] - radius * Math.sin(angle)];
-      entities.push({ id: newId('dxf-arc'), type: 'arc', start: at(startAngle), arcPoint: at((startAngle + endAngle) / 2), end: at(endAngle), center, radius, ccw: false });
+      entities.push({ id: createUuid(), type: 'arc', start: at(startAngle), arcPoint: at((startAngle + endAngle) / 2), end: at(endAngle), center, radius, ccw: false });
     }
     if (type === 'LWPOLYLINE') {
       const vertices = lwPolylineVertices(pairs.slice(index + 1, end), factor);
@@ -460,12 +620,12 @@ export function parseDxf(text) {
       const hasBulges = vertices.slice(0, segmentCount)
         .some(({ bulge }) => Math.abs(Number(bulge) || 0) > 1e-12);
       if (points.length >= 2 && !hasBulges) {
-        entities.push({ id: newId('dxf-polyline'), type: closed ? 'polygon' : 'polyline', points });
+        entities.push({ id: createUuid(), type: closed ? 'polygon' : 'polyline', points });
       } else if (segmentCount > 0) {
-        const compositeId = newId('dxf-polyline');
+        const compositeId = createUuid();
         for (let segment = 0; segment < segmentCount; segment += 1) {
           entities.push({
-            id: newId('dxf-edge'),
+            id: createUuid(),
             ...entityFromBulgedSegment(vertices[segment], vertices[(segment + 1) % vertices.length]),
             composite: {
               id: compositeId,
@@ -560,15 +720,7 @@ function dxfSingleLineContent(value) {
 
 export function serializeDxf(snapshot) {
   const drawing = materializeDrawingClassAppearances(normalizeDrawingData(snapshot));
-  const textVariables = [
-    ...drawing.parameters,
-    ...buildDocumentVariables({
-      metadata: drawing.documentMetadata,
-      context: drawing.documentContext,
-      drawingUnit: drawing.drawingUnit,
-      entities: drawing.entities,
-    }),
-  ];
+  const textEvaluators = drawingThumbnailEvaluators(drawing);
   const exportUnitName = dxfUnits[drawing.dxfExportUnit]
     ? drawing.dxfExportUnit
     : dxfUnits[drawing.drawingUnit] ? drawing.drawingUnit : 'in';
@@ -590,7 +742,8 @@ export function serializeDxf(snapshot) {
   const textStyles = dxfTextStyles(geometry);
   const textStyleByFont = new Map(textStyles.map((style) => [style.fontName, style.name]));
   const dimensionPlans = createDxfDimensionPlans(drawing, {
-    resolveValueText: drawingThumbnailEvaluators(drawing).dimensionValueText,
+    resolveValueText: drawingThumbnailEvaluators(drawing).dimensionDxfValueText,
+    precision: exportUnitName === 'in' ? 5 : 3,
   });
   const nativeDimensionPlans = dimensionPlans.filter(({ kind }) => kind === 'dimension');
   const hasDimensions = dimensionPlans.length > 0;
@@ -693,8 +846,9 @@ export function serializeDxf(snapshot) {
   };
   const resolvedText = (entity) => resolveTextFields(
     entity.text,
-    textVariables,
+    textEvaluators.expressionEntries(entity),
     (entry) => formatUnitlessValue(entry.value, drawing.drawingUnit),
+    (expression) => textEvaluators.evaluateExpression(expression, entity),
   );
   const textStyle = (entity) => textStyleByFont.get(String(entity.fontName || 'Arial'))
     || textStyles[0]?.name
@@ -821,12 +975,12 @@ export function serializeDxf(snapshot) {
     ));
     push(0, 'ENDTAB');
   };
-  const dimensionStyleValues = (name, postfix = '') => [
+  const dimensionStyleValues = (name, postfix = '', rounding = 0, precision = 3) => [
     2, name, 70, 0,
     3, postfix, 4, '<>%%d',
-    40, 1, 41, x(2.5), 42, x(1.25), 44, x(1.25),
+    40, 1, 41, x(2.5), 42, x(1.25), 44, x(1.25), 45, rounding,
     140, x(3.5), 144, 1, 147, x(0.625),
-    77, 1, 78, 0, 79, 0, 179, 3, 271, 3, 275, 0, 277, 2,
+    77, 1, 78, 0, 79, 0, 179, 3, 271, precision, 275, 0, 277, 2,
   ];
   const viewportRecords = [symbolRecord('AcDbViewportTableRecord', [
     2, '*ACTIVE', 70, 0,
@@ -866,7 +1020,12 @@ export function serializeDxf(snapshot) {
   const dimensionStyleRecords = [
     symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues('STANDARD')),
     ...(nativeDimensionPlans.length ? [
-      symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues(DXF_DIMENSION_STYLE, dimensionPostfix)),
+      symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues(
+        DXF_DIMENSION_STYLE,
+        dimensionPostfix,
+        exportUnitName === 'in' ? 0.03125 : 0,
+        exportUnitName === 'in' ? 5 : 3,
+      )),
     ] : []),
   ];
   const blockRecords = [...blockRecordHandles].map(([name, handle]) => {
@@ -1036,7 +1195,10 @@ export function serializeDxf(snapshot) {
 export function parseDrawingText(fileName, text) {
   if (/\.dxf$/i.test(fileName)) return parseDxf(text);
   const parsed = JSON.parse(text);
-  return normalizeDrawingData(parsed);
+  if (Number(parsed.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(parsed);
+  const drawing = normalizeDrawingData(parsed);
+  if (Number(parsed.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(drawing);
+  return drawing;
 }
 
 // --- Drawing Thumbnail Generation ---
@@ -1068,6 +1230,7 @@ function thumbnailImagePatternId(entity) {
 export function drawingThumbnailEvaluators(drawing = {}) {
   const drawingUnit = drawing.drawingUnit || 'in';
   const repository = new ParameterRepository();
+  repository.setStackState(drawing.stackState || drawing.extensions?.stacks, { rewriteExpressions: false, emit: false });
   repository.setDefaultLengthUnit(drawingUnit);
   const documentVariables = buildDocumentVariables({
     metadata: drawing.documentMetadata,
@@ -1078,21 +1241,35 @@ export function drawingThumbnailEvaluators(drawing = {}) {
   repository.setExternalVariables(documentVariables);
   repository.restore(drawing.parameters || drawing.dimensions || [], { emit: false });
   repository.evaluateAll({ strict: false, refreshComputed: false });
-  const evaluateLength = (expression) => repository.evaluateLengthExpression(expression);
+  const contextStackId = (context) => typeof context === 'string' ? context : context?.stackId || null;
+  const evaluateLength = (expression, context = null) => repository.evaluateLengthExpression(expression, {
+    stackId: contextStackId(context),
+  });
+  const dimensionText = (annotation, formatter) => {
+    const entry = repository.get(annotation?.dimensionId || annotation?.dimensionName);
+    const prefix = annotation?.type === 'multi-curve-length-dimension' ? 'PERIM ' : '';
+    if (entry && Number.isFinite(Number(entry.value))) {
+      return `${prefix}${formatter(entry.value, entry.unit)}`;
+    }
+    return `${prefix}${String(annotation?.text || '').replace(/^.*?=\s*/, '')}`;
+  };
   return {
     documentVariables,
-    evaluateExpression: (expression) => repository.evaluateExpression(expression),
+    expressionEntries: (context = null) => [
+      ...documentVariables,
+      ...repository.expressionEntries({
+        stackId: contextStackId(context),
+        includeLocalAliases: true,
+      }),
+    ],
+    evaluateExpression: (expression, context = null) => repository.evaluateExpression(expression, {
+      stackId: contextStackId(context),
+    }),
     evaluateLength,
-    dimensionValueText: (annotation) => {
-      const entry = repository.get(annotation?.dimensionId || annotation?.dimensionName);
-      const prefix = annotation?.type === 'multi-curve-length-dimension' ? 'PERIM ' : '';
-      if (entry && Number.isFinite(Number(entry.value))) {
-        return `${prefix}${formatDrivenDimensionValue(entry.value, entry.unit)}`;
-      }
-      return `${prefix}${String(annotation?.text || '').replace(/^.*?=\s*/, '')}`;
-    },
-    evaluateNumeric: (expression) => evaluateArrayCountExpression(expression, {
-      evaluateLength,
+    dimensionValueText: (annotation) => dimensionText(annotation, formatValueOnlyDimensionValue),
+    dimensionDxfValueText: (annotation) => dimensionText(annotation, formatDxfDimensionValue),
+    evaluateNumeric: (expression, context = null) => evaluateArrayCountExpression(expression, {
+      evaluateLength: (value) => evaluateLength(value, context),
       drawingUnit,
     }),
   };
@@ -1263,9 +1440,12 @@ function isOriginPlacement(definition, placement) {
 
 export function materializeDrawingInstances(drawing = {}, {
   stackId = null,
+  stackIds = null,
   evaluateNumeric = Number,
   evaluateLength = evaluateNumeric,
 } = {}) {
+  const fallbackStackId = defaultStackId(drawing.extensions?.stacks);
+  const includedStackIds = stackIds ? new Set(stackIds) : null;
   const rawEntities = Array.isArray(drawing.entities) ? drawing.entities : [];
   const rawById = new Map(rawEntities.filter(({ id }) => id).map((entity) => [entity.id, entity]));
   const evaluated = evaluatedEntities(drawing);
@@ -1282,13 +1462,20 @@ export function materializeDrawingInstances(drawing = {}, {
       .flatMap(({ pieces: derivedPieces }) => derivedPieces.map(({ entity }) => entity));
     return [...sources, ...pieces];
   };
-  const ownsTargetStack = (entity) => stackId === null || (entity.stackId || 'stack-default') === stackId;
+  const ownsTargetStack = (entity) => {
+    const ownerStackId = entity.stackId || fallbackStackId;
+    return (stackId === null || ownerStackId === stackId)
+      && (!includedStackIds || includedStackIds.has(ownerStackId));
+  };
+  const relationshipAvailable = (definition) => ownsTargetStack(definition)
+    && (!includedStackIds || (definition.participantStackIds || [])
+      .every((participantStackId) => includedStackIds.has(participantStackId)));
   const baseEntities = evaluated.filter(ownsTargetStack);
   const dimensionAnnotations = (drawing.dimensionAnnotations || []).filter(ownsTargetStack);
   const derived = [];
 
   (drawing.extensions?.linkedCopyTools?.copies || [])
-    .filter((definition) => stackId === null || (definition.stackId || 'stack-default') === stackId)
+    .filter(relationshipAvailable)
     .forEach((definition) => {
       const sourceIds = [...new Set((definition.sourceIds || []).filter(Boolean).map(String))];
       const directSources = sourceIds
@@ -1307,14 +1494,14 @@ export function materializeDrawingInstances(drawing = {}, {
         derived.push(derivedEntity(
           entity,
           matrix,
-          definition.stackId || 'stack-default',
-          `linked-copy:${definition.id}:${entity.id || index}`,
+          definition.stackId || fallbackStackId,
+          deriveUuidForKey('thumbnail-linked-copy', definition.id, entity.id || index),
         ));
       });
     });
 
   (drawing.extensions?.arrayTools?.arrays || [])
-    .filter((definition) => stackId === null || (definition.stackId || 'stack-default') === stackId)
+    .filter(relationshipAvailable)
     .forEach((definition) => {
       const dependentIds = arrayDependentVisualIds(rawById, definition.sourceIds || []);
       const sourceIds = [...new Set([...(definition.sourceIds || []), ...dependentIds])];
@@ -1325,8 +1512,8 @@ export function materializeDrawingInstances(drawing = {}, {
       const referencedCenter = pointFeature(centerEntity, Number(definition.centerRef?.index) || 0);
       const centerPoint = finitePoint(referencedCenter) ? referencedCenter : definition.centerPoint;
       const result = evaluateArrayDefinition(definition, {
-        evaluateNumeric,
-        evaluateLength,
+        evaluateNumeric: (expression) => evaluateNumeric(expression, definition),
+        evaluateLength: (expression) => evaluateLength(expression, definition),
         sourceBounds,
         centerPoint,
       });
@@ -1341,7 +1528,7 @@ export function materializeDrawingInstances(drawing = {}, {
             entity,
             matrix,
             result.definition.stackId,
-            `thumbnail-array:${result.definition.id}:${placementIndex}:${entity.id || entityIndex}`,
+            deriveUuidForKey('thumbnail-array', result.definition.id, placementIndex, entity.id || entityIndex),
           ));
         });
       });
@@ -1364,8 +1551,8 @@ export function materializeDrawingInstances(drawing = {}, {
         derived.push(derivedEntity(
           entity,
           matrix,
-          centerline.stackId || 'stack-default',
-          `thumbnail-symmetric:${centerline.id}:${entity.id || index}`,
+          centerline.stackId || fallbackStackId,
+          deriveUuidForKey('thumbnail-symmetric', centerline.id, entity.id || index),
         ));
       });
     });
@@ -1388,7 +1575,7 @@ function materializeSwellScenePresentation(drawing, entities, evaluateLength) {
     const instances = new Map();
     entities.forEach((entity) => {
       if (!owners.has(thumbnailSourceId(entity))) return;
-      const key = `${entity.stackId || 'stack-default'}:${thumbnailMatrixKey(entity._resolvedMatrix)}`;
+      const key = `${entity.stackId || ''}:${thumbnailMatrixKey(entity._resolvedMatrix)}`;
       if (!instances.has(key)) instances.set(key, entity);
     });
     return instances;
@@ -1400,7 +1587,7 @@ function materializeSwellScenePresentation(drawing, entities, evaluateLength) {
         && thumbnailMatrixKey(entity._resolvedMatrix) === thumbnailMatrixKey(anchor._resolvedMatrix)
       )) || anchor;
       results.push({
-        id: `swell-presentation:${boundary.id}:${key}`,
+        id: deriveUuidForKey('swell-thumbnail-boundary', boundary.id, key),
         type: 'resolved-boundary',
         stackId: anchor.stackId || boundary.stackId,
         d: swellBoundaryPath(boundary.features),
@@ -1423,8 +1610,8 @@ function materializeSwellScenePresentation(drawing, entities, evaluateLength) {
     instancesFor([ownerId]).forEach((anchor, key) => {
       result.pieces.forEach((piece, index) => results.push({
         ...clone(piece.entity),
-        id: `swell-presentation:${piece.id}:${key}:${index}`,
-        stackId: anchor.stackId || result.sourceEntity?.stackId || 'stack-default',
+        id: deriveUuidForKey('swell-thumbnail-piece', piece.id, key, index),
+        stackId: anchor.stackId || result.sourceEntity?.stackId || null,
         appearance: clone(anchor.appearance || {}),
         _resolvedMatrix: anchor._resolvedMatrix,
         _resolvedSourceId: ownerId,
@@ -1667,7 +1854,7 @@ function thumbnailPresentationOwnerId(entity) {
 function sharesThumbnailInstance(owner, presentation, ownerRecordId) {
   return thumbnailPresentationLayer(owner) === 0
     && thumbnailSourceIds(owner).has(ownerRecordId)
-    && (owner.stackId || 'stack-default') === (presentation.stackId || 'stack-default')
+    && (owner.stackId || null) === (presentation.stackId || null)
     && thumbnailMatrixKey(owner._resolvedMatrix) === thumbnailMatrixKey(presentation._resolvedMatrix);
 }
 
@@ -1751,7 +1938,7 @@ function applySubtractScenePresentation(drawing, entities, {
     });
     instances.forEach((anchor, key) => {
       resultEntities.push({
-        id: `${result.id}:${key}`,
+        id: deriveUuidForKey('thumbnail-subtract', result.id, key),
         type: 'subtract-result',
         stackId: anchor.stackId || result.stackId,
         d: result.d,
@@ -1808,7 +1995,7 @@ function applyResolvedBoundaryScenePresentation(drawing, entities) {
         && thumbnailMatrixKey(entity._resolvedMatrix) === thumbnailMatrixKey(anchor._resolvedMatrix)
       )) || anchor;
       results.push({
-        id: `thumbnail-resolved:${boundary.id}:${key}`,
+        id: deriveUuidForKey('thumbnail-resolved', boundary.id, key),
         type: 'resolved-boundary',
         stackId: anchor.stackId || boundary.stackId,
         d: boundary.d,
@@ -1831,6 +2018,7 @@ function applyResolvedBoundaryScenePresentation(drawing, entities) {
 
 export function resolveDrawingScene(drawing, {
   stackId = null,
+  stackIds = null,
   evaluateNumeric = null,
   evaluateLength = null,
   evaluateExpression = null,
@@ -1839,8 +2027,8 @@ export function resolveDrawingScene(drawing, {
   drawing = materializeDrawingClassAppearances(drawing);
   const storedEvaluators = drawingThumbnailEvaluators(drawing);
   const resolvedEvaluateLength = evaluateLength || storedEvaluators.evaluateLength;
-  const resolvedEvaluateNumeric = evaluateNumeric || ((expression) => evaluateArrayCountExpression(expression, {
-    evaluateLength: resolvedEvaluateLength,
+  const resolvedEvaluateNumeric = evaluateNumeric || ((expression, context = null) => evaluateArrayCountExpression(expression, {
+    evaluateLength: (value) => resolvedEvaluateLength(value, context),
     drawingUnit: drawing?.drawingUnit || 'in',
   }));
   const resolvedEvaluateExpression = evaluateExpression || storedEvaluators.evaluateExpression;
@@ -1861,6 +2049,7 @@ export function resolveDrawingScene(drawing, {
   };
   const materialized = materializeDrawingInstances(drawingWithSeams, {
     stackId,
+    stackIds,
     evaluateNumeric: resolvedEvaluateNumeric,
     evaluateLength: resolvedEvaluateLength,
   });
@@ -1869,6 +2058,7 @@ export function resolveDrawingScene(drawing, {
     Array.isArray(materialized.entities) ? materialized.entities : [],
     resolvedEvaluateLength,
   );
+  const includedStackIds = stackIds ? new Set(stackIds) : null;
   const entities = filterVisibleResolvedEntities(drawingWithSeams, applySubtractScenePresentation(
     drawingWithSeams,
     applyResolvedBoundaryScenePresentation(
@@ -1880,7 +2070,9 @@ export function resolveDrawingScene(drawing, {
       evaluateNumeric: resolvedEvaluateNumeric,
       evaluateLength: resolvedEvaluateLength,
     },
-  ), resolvedEvaluateExpression);
+  ), resolvedEvaluateExpression).filter((entity) => (
+    !includedStackIds || includedStackIds.has(entity.stackId || defaultStackId(drawingWithSeams.extensions?.stacks))
+  ));
   return {
     drawing: drawingWithSeams,
     entities,
@@ -1923,17 +2115,16 @@ export function createDrawingThumbnailSvg(drawing, {
   } = scene;
   const resolvedEvaluateNumeric = storedEvaluators.evaluateNumeric;
   const resolvedEvaluateExpression = storedEvaluators.evaluateExpression;
-  const resolvedEvaluateAppearance = (expression) => {
+  const resolvedEvaluateAppearance = (expression, context = null) => {
     try {
-      return resolvedEvaluateExpression(expression);
+      return resolvedEvaluateExpression(expression, context);
     } catch {
-      return resolvedEvaluateNumeric(expression);
+      return resolvedEvaluateNumeric(expression, context);
     }
   };
   const annotations = includeDimensions && Array.isArray(scene.dimensionAnnotations)
     ? scene.dimensionAnnotations
       .filter((annotation) => !dimensionExcludedFromExport(annotation))
-      .filter((annotation) => dimensionTextMode !== 'value' || annotation.dimensionMode !== 'driving')
       .map((annotation) => dimensionTextMode === 'value'
         ? { ...annotation, text: storedEvaluators.dimensionValueText(annotation) }
         : annotation)
@@ -1942,17 +2133,19 @@ export function createDrawingThumbnailSvg(drawing, {
     const withText = entity.type === 'text'
       ? {
         ...entity,
-        text: resolveTextFields(entity.text, [
-          ...(drawingWithSeams.parameters || []),
-          ...(storedEvaluators.documentVariables || []),
-        ], (entry) => formatUnitlessValue(entry.value, drawingWithSeams.drawingUnit)),
+        text: resolveTextFields(
+          entity.text,
+          storedEvaluators.expressionEntries(entity),
+          (entry) => formatUnitlessValue(entry.value, drawingWithSeams.drawingUnit),
+          (expression) => storedEvaluators.evaluateExpression(expression, entity),
+        ),
       }
       : entity;
     if (!withText.appearance) return withText;
     const resolved = resolveGeometryFillAppearance(
       withText.appearance,
-      resolvedEvaluateAppearance,
-      storedEvaluators.evaluateLength,
+      (expression) => resolvedEvaluateAppearance(expression, withText),
+      (expression) => storedEvaluators.evaluateLength(expression, withText),
     );
     return { ...withText, appearance: { ...withText.appearance, ...resolved } };
   });

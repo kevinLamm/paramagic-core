@@ -61,7 +61,7 @@ export function centralDifferenceJacobianBlock(block, {
       variable.value = original;
     }
     if (positive.length !== baseResiduals.length || negative.length !== baseResiduals.length) {
-      throw new Error(`Residual count changed while differentiating Jacobian block ${block.id}.`);
+      throw new Error(`Residual count changed while differentiating Jacobian block ${block.runtimeKey}.`);
     }
     for (let row = 0; row < baseResiduals.length; row += 1) {
       jacobian[row][column] = (positive[row] - negative[row]) / (2 * step);
@@ -111,13 +111,13 @@ export function assembleJacobianBlocks(contract, options = {}) {
     });
     diagnostics[evaluated.kind === 'analytical' ? 'analyticalBlocks' : 'fallbackBlocks'] += 1;
     if (evaluated.matrix.length !== block.equations.length) {
-      throw new Error(`Jacobian block ${block.id} row count does not match its equation metadata.`);
+      throw new Error(`Jacobian block ${block.runtimeKey} row count does not match its equation metadata.`);
     }
     evaluated.matrix.forEach((row, localRow) => {
       row.forEach((value, localColumn) => {
         const componentColumn = block.columnIndexes[localColumn];
         if (!Number.isInteger(componentColumn) || componentColumn < 0 || componentColumn >= contract.variables.length) {
-          throw new Error(`Jacobian block ${block.id} has an invalid component column.`);
+          throw new Error(`Jacobian block ${block.runtimeKey} has an invalid component column.`);
         }
         matrix[rowOffset + localRow][componentColumn] = value;
       });
@@ -143,7 +143,7 @@ export function createMatrixFreeJacobian(contract, options = {}) {
   const normalBlockByColumn = new Map();
   if (columnCount >= ENTITY_BLOCK_PRECONDITIONER_VARIABLE_THRESHOLD) {
     contract.variables.forEach((variable, column) => {
-      const owner = variable.owner || `variable:${column}`;
+      const owner = variable.ownerId || `variable:${column}`;
       if (!entityColumns.has(owner)) entityColumns.set(owner, []);
       entityColumns.get(owner).push(column);
     });
@@ -185,12 +185,12 @@ export function createMatrixFreeJacobian(contract, options = {}) {
     });
     diagnostics[evaluated.kind === 'analytical' ? 'analyticalBlocks' : 'fallbackBlocks'] += 1;
     if (evaluated.matrix.length !== block.equations.length) {
-      throw new Error(`Jacobian block ${block.id} row count does not match its equation metadata.`);
+      throw new Error(`Jacobian block ${block.runtimeKey} row count does not match its equation metadata.`);
     }
     const columnIndexes = Int32Array.from(block.columnIndexes);
     columnIndexes.forEach((componentColumn) => {
       if (!Number.isInteger(componentColumn) || componentColumn < 0 || componentColumn >= columnCount) {
-        throw new Error(`Jacobian block ${block.id} has an invalid component column.`);
+        throw new Error(`Jacobian block ${block.runtimeKey} has an invalid component column.`);
       }
     });
     const values = evaluated.matrix.map((row) => Float64Array.from(row));
@@ -274,12 +274,12 @@ export function verifyJacobianBlock(block, {
   ...differenceOptions
 } = {}) {
   if (typeof block.evaluateAnalyticalJacobian !== 'function') {
-    throw new Error(`Jacobian block ${block.id} does not provide analytical derivatives.`);
+    throw new Error(`Jacobian block ${block.runtimeKey} does not provide analytical derivatives.`);
   }
   const residuals = block.evaluateResiduals();
   const analytical = block.evaluateAnalyticalJacobian();
   if (analytical === null) {
-    throw new Error(`Jacobian block ${block.id} does not support analytical derivatives for its current features.`);
+    throw new Error(`Jacobian block ${block.runtimeKey} does not support analytical derivatives for its current features.`);
   }
   const numerical = centralDifferenceJacobianBlock(block, differenceOptions);
   assertMatrixShape(analytical, residuals.length, block.variables.length, 'Analytical Jacobian');

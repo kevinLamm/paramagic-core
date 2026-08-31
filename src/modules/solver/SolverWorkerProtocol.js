@@ -13,6 +13,7 @@ export const solverWorkerCommandTypes = new Set([
   'set-dimension',
   'update-parameter',
   'set-dimension-enabled-states',
+  'set-enabled-stack-ids',
 ]);
 
 export const interactiveSolverWorkerCommandTypes = new Set(['drag-update']);
@@ -47,6 +48,9 @@ function validatePayload(type, payload) {
   if (type === 'set-dimension-enabled-states' && !Array.isArray(payload.states)) {
     throw new TypeError('set-dimension-enabled-states requires a states array.');
   }
+  if (type === 'set-enabled-stack-ids' && payload.stackIds !== null && !Array.isArray(payload.stackIds)) {
+    throw new TypeError('set-enabled-stack-ids requires a stackIds array or null.');
+  }
 }
 
 export function validateSolverWorkerRequest(message) {
@@ -54,7 +58,7 @@ export function validateSolverWorkerRequest(message) {
   if (message.version !== SOLVER_WORKER_PROTOCOL_VERSION) {
     throw new TypeError(`Unsupported solver worker protocol version: ${message.version}.`);
   }
-  if (!isNonNegativeInteger(message.requestId)) throw new TypeError('Solver worker requestId must be a non-negative integer.');
+  if (!isNonNegativeInteger(message.requestToken)) throw new TypeError('Solver worker requestToken must be a non-negative integer.');
   if (!isNonNegativeInteger(message.generation)) throw new TypeError('Solver worker generation must be a non-negative integer.');
   if (!solverWorkerCommandTypes.has(message.type)) throw new TypeError(`Unsupported solver worker command: ${message.type}.`);
   if (!isRecord(message.payload)) throw new TypeError('Solver worker payload must be an object.');
@@ -62,10 +66,10 @@ export function validateSolverWorkerRequest(message) {
   return message;
 }
 
-export function createSolverWorkerRequest({ requestId, generation, type, payload = {} }) {
+export function createSolverWorkerRequest({ requestToken, generation, type, payload = {} }) {
   return validateSolverWorkerRequest({
     version: SOLVER_WORKER_PROTOCOL_VERSION,
-    requestId,
+    requestToken,
     generation,
     type,
     payload,
@@ -75,7 +79,7 @@ export function createSolverWorkerRequest({ requestId, generation, type, payload
 export function createSolverWorkerResult(request, result = {}) {
   return {
     version: SOLVER_WORKER_PROTOCOL_VERSION,
-    requestId: request.requestId,
+    requestToken: request.requestToken,
     generation: request.generation,
     type: 'result',
     commandType: request.type,
@@ -94,7 +98,7 @@ export function createSolverWorkerResult(request, result = {}) {
 export function validateSolverWorkerResult(message) {
   if (!isRecord(message) || message.type !== 'result') throw new TypeError('Solver worker result must be a result object.');
   if (message.version !== SOLVER_WORKER_PROTOCOL_VERSION) throw new TypeError('Unsupported solver worker result version.');
-  if (!isNonNegativeInteger(message.requestId) || !isNonNegativeInteger(message.generation)) {
+  if (!isNonNegativeInteger(message.requestToken) || !isNonNegativeInteger(message.generation)) {
     throw new TypeError('Solver worker result identifiers are invalid.');
   }
   if (typeof message.status !== 'string') throw new TypeError('Solver worker result status is required.');

@@ -1,8 +1,9 @@
-import { createStableId } from './solver/SolverModel.js';
+import { createUuid } from './IdentitySystem.js';
 
-export const DEFAULT_CLASS_ID = 'class-x';
 export const DEFAULT_CLASS_NAME = 'X';
+export const DEFAULT_CLASS_ROLE = 'default-class';
 export const CLASS_STATE_VERSION = 1;
+const LEGACY_DEFAULT_CLASS_ID = 'class-x';
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const normalizedName = (value) => String(value ?? '').trim();
@@ -53,7 +54,6 @@ export const CLASS_ENTITY_PROPERTY_GROUPS = Object.freeze({
   fontName: Object.freeze(['fontName']),
   fontSize: Object.freeze(['fontSize', 'textHeight']),
   fontColor: Object.freeze(['fontColor']),
-  scaleWithZoom: Object.freeze(['scaleWithZoom']),
   multiline: Object.freeze(['multiline']),
   textAlign: Object.freeze(['textAlign']),
   textVerticalAlign: Object.freeze(['textVerticalAlign']),
@@ -71,7 +71,7 @@ const CLASS_GEOMETRY_TYPES = new Set([
   'point', 'line', 'circle', 'rect', 'polygon', 'polyline', 'curve', 'arc', 'fillet', 'text',
 ]);
 const TEXT_CLASS_PROPERTY_GROUPS = new Set([
-  'fontName', 'fontSize', 'fontColor', 'scaleWithZoom', 'multiline', 'textAlign', 'textVerticalAlign',
+  'fontName', 'fontSize', 'fontColor', 'multiline', 'textAlign', 'textVerticalAlign',
 ]);
 
 export function isClassGeometryEntity(entity = {}) {
@@ -89,21 +89,28 @@ export function createDefaultClassProperties() {
     fontName: 'Arial',
     fontSize: 28,
     fontColor: '#202020',
-    scaleWithZoom: true,
     multiline: true,
     textAlign: 'left',
     textVerticalAlign: 'top',
   };
 }
 
-export function createDefaultClass() {
+export function createDefaultClass({ id = createUuid(), properties = null } = {}) {
   return {
-    id: DEFAULT_CLASS_ID,
+    id,
     name: DEFAULT_CLASS_NAME,
+    systemRole: DEFAULT_CLASS_ROLE,
     removable: false,
     duplicable: false,
-    properties: createDefaultClassProperties(),
+    properties: properties ? normalizeClassProperties(properties) : createDefaultClassProperties(),
   };
+}
+
+export function defaultClassId(stateInput = null) {
+  const classes = Array.isArray(stateInput?.classes) ? stateInput.classes : [];
+  return classes.find(({ systemRole }) => systemRole === DEFAULT_CLASS_ROLE)?.id
+    || classes.find(({ id }) => id === LEGACY_DEFAULT_CLASS_ID)?.id
+    || null;
 }
 
 export function normalizeClassProperties(value = {}) {
@@ -119,13 +126,13 @@ export function normalizeClassProperties(value = {}) {
     ? Math.min(40, Math.max(0.1, thickness))
     : 1.5;
   delete result.construction;
+  delete result.scaleWithZoom;
   result.fontName = String(result.fontName || 'Arial');
   const fontSize = Number(result.fontSize);
   result.fontSize = Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 28;
   result.fontColor = /^#[0-9a-f]{6}$/i.test(String(result.fontColor || ''))
     ? String(result.fontColor)
     : '#202020';
-  result.scaleWithZoom = result.scaleWithZoom !== false;
   result.multiline = result.multiline !== false;
   result.textAlign = ['left', 'center', 'right'].includes(result.textAlign) ? result.textAlign : 'left';
   result.textVerticalAlign = ['top', 'middle', 'bottom'].includes(result.textVerticalAlign)
@@ -140,14 +147,16 @@ export function normalizeClassState(value = null) {
   const classes = [];
   const seenIds = new Set();
   const seenNames = new Set();
-  let defaultProperties = null;
+  let defaultSource = null;
 
   sourceClasses.forEach((item, index) => {
     const requestedId = normalizedName(item?.id);
     const requestedName = normalizedName(item?.name);
-    const isDefault = requestedId === DEFAULT_CLASS_ID || nameKey(requestedName) === nameKey(DEFAULT_CLASS_NAME);
+    const isDefault = item?.systemRole === DEFAULT_CLASS_ROLE
+      || requestedId === LEGACY_DEFAULT_CLASS_ID
+      || nameKey(requestedName) === nameKey(DEFAULT_CLASS_NAME);
     if (isDefault) {
-      if (!defaultProperties) defaultProperties = normalizeClassProperties(item?.properties);
+      if (!defaultSource) defaultSource = item;
       return;
     }
     if (!requestedId || seenIds.has(requestedId) || !requestedName) return;
@@ -164,21 +173,23 @@ export function normalizeClassState(value = null) {
     });
   });
 
-  const defaultClass = createDefaultClass();
-  if (defaultProperties) defaultClass.properties = defaultProperties;
+  const defaultClass = createDefaultClass({
+    id: normalizedName(defaultSource?.id) || createUuid(),
+    properties: defaultSource?.properties,
+  });
   classes.unshift(defaultClass);
-  seenIds.add(DEFAULT_CLASS_ID);
+  seenIds.add(defaultClass.id);
   const requestedActiveId = normalizedName(input.activeClassId);
   const activeClassId = classes.some(({ id }) => id === requestedActiveId)
     ? requestedActiveId
-    : DEFAULT_CLASS_ID;
+    : defaultClass.id;
   return { version: CLASS_STATE_VERSION, activeClassId, classes };
 }
 
 function classState(value) {
   return value?.version === CLASS_STATE_VERSION
     && Array.isArray(value.classes)
-    && value.classes.some(({ id }) => id === DEFAULT_CLASS_ID)
+    && value.classes.some(({ systemRole }) => systemRole === DEFAULT_CLASS_ROLE)
     ? value
     : normalizeClassState(value);
 }
@@ -217,7 +228,7 @@ export function classOverrideGroupsForPatch(patch = {}) {
 export function classIdForEntity(entity = {}, stateInput = null) {
   const state = classState(stateInput);
   const requested = normalizedName(entity?.classId);
-  return state.classes.some(({ id }) => id === requested) ? requested : DEFAULT_CLASS_ID;
+  return state.classes.some(({ id }) => id === requested) ? requested : defaultClassId(state);
 }
 
 export function normalizeEntityClass(entity = {}, stateInput = null, { legacy = false } = {}) {
@@ -228,7 +239,7 @@ export function normalizeEntityClass(entity = {}, stateInput = null, { legacy = 
   result.classId = known
     ? requested
     : legacy || !requested
-      ? DEFAULT_CLASS_ID
+      ? defaultClassId(state)
       : state.activeClassId;
   result.classPropertyOverrides = result.classPropertyOverrides === undefined
     ? classOverrideGroupsForEntity(result)
@@ -373,13 +384,13 @@ export function createClassSystem({
 
   function assignEntity(entity = {}, requestedClassId = state.activeClassId, options = {}) {
     const result = clone(entity || {});
-    const targetId = definition(requestedClassId) ? requestedClassId : DEFAULT_CLASS_ID;
+    const targetId = definition(requestedClassId) ? requestedClassId : defaultClassId(state);
     result.classId = targetId;
     const fresh = options.fresh ?? (!normalizedName(entity?.classId) && !options.legacy);
     result.classPropertyOverrides = result.classPropertyOverrides === undefined
       ? fresh ? [] : classOverrideGroupsForEntity(result)
       : normalizedOverrideGroups(result.classPropertyOverrides);
-    if (options.legacy && !normalizedName(entity?.classId)) result.classId = DEFAULT_CLASS_ID;
+    if (options.legacy && !normalizedName(entity?.classId)) result.classId = defaultClassId(state);
     return { ...result, ...resolveClassEntityProperties(result, state) };
   }
 
@@ -432,7 +443,7 @@ export function createClassSystem({
     const validation = validateName(nextName);
     if (!validation.success) return validation;
     const item = {
-      id: createStableId('class'),
+      id: createUuid(),
       name: validation.name,
       removable: true,
       duplicable: true,
@@ -452,7 +463,7 @@ export function createClassSystem({
     const validation = validateName(requested);
     if (!validation.success) return validation;
     const item = {
-      id: createStableId('class'),
+      id: createUuid(),
       name: validation.name,
       removable: true,
       duplicable: true,
@@ -467,7 +478,7 @@ export function createClassSystem({
   function renameClass(classId, name) {
     const target = definition(classId);
     if (!target) return { success: false, error: 'Class was not found.' };
-    if (target.id === DEFAULT_CLASS_ID) return { success: false, error: 'Class X cannot be renamed.' };
+    if (target.systemRole === DEFAULT_CLASS_ROLE) return { success: false, error: 'Class X cannot be renamed.' };
     const validation = validateName(name, { exceptId: classId });
     if (!validation.success) return validation;
     if (target.name === validation.name) return { success: true, class: clone(target), error: null };
@@ -527,9 +538,9 @@ export function createClassSystem({
     const target = definition(classId);
     if (!target) return { success: false, error: 'Class was not found.' };
     if (!target.removable) return { success: false, error: 'Class X cannot be deleted.' };
-    const reassigned = setRecordClassIds(recordIdsForClass(classId), DEFAULT_CLASS_ID, { notify: false });
+    const reassigned = setRecordClassIds(recordIdsForClass(classId), defaultClassId(state), { notify: false });
     state.classes = state.classes.filter(({ id }) => id !== classId);
-    if (state.activeClassId === classId) state.activeClassId = DEFAULT_CLASS_ID;
+    if (state.activeClassId === classId) state.activeClassId = defaultClassId(state);
     emit('remove', { history: 'commit', recordIds: reassigned.recordIds });
     return { success: true, error: null, recordIds: reassigned.recordIds };
   }

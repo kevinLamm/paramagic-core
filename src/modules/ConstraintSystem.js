@@ -1,4 +1,4 @@
-import { CANVAS_ORIGIN_RECORD_ID } from './CanvasOrigin.js';
+import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE } from './ArcGeometry.js';
 import { isSelfCoincidentConstraint } from './solver/ConstraintValidation.js';
 
@@ -224,6 +224,13 @@ const supportedConstraints = [
 ];
 const MIN_CONSTRAINT_HELPER_ZOOM = 0.1;
 
+export function constraintHelpersVisible({ requested = true, scale = 1, activeStackId = null } = {}) {
+  return Boolean(requested)
+    && Boolean(activeStackId)
+    && Number.isFinite(Number(scale))
+    && Number(scale) >= MIN_CONSTRAINT_HELPER_ZOOM;
+}
+
 const constraintIconPaths = {
   Coincident: '<path d="M4 18l8-8 8 8"/><circle cx="12" cy="10" r="2" fill="currentColor"/>',
   Concentric: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/>',
@@ -323,6 +330,14 @@ function solverConstraintType(constraint, features) {
 }
 
 function featureRef(feature) {
+  if (isCanvasOriginReference(feature)) {
+    return {
+      kind: 'point',
+      referenceRole: 'canvas-origin',
+      entityType: 'canvas-origin',
+      pointRole: 'origin',
+    };
+  }
   return {
     kind: feature.kind,
     recordId: feature.recordId,
@@ -335,14 +350,14 @@ function featureRef(feature) {
 export function constraintReferencesVisible(constraint, isRecordVisible) {
   const recordIds = [...new Set((constraint?.featureRefs || [])
     .map((feature) => feature?.recordId)
-    .filter((recordId) => recordId && recordId !== CANVAS_ORIGIN_RECORD_ID))];
+    .filter(Boolean))];
   return recordIds.length === 0 || recordIds.every((recordId) => isRecordVisible(recordId));
 }
 
 export function constraintReferencesActiveStack(constraint, isRecordInActiveStack) {
   const recordIds = [...new Set((constraint?.featureRefs || [])
     .map((feature) => feature?.recordId)
-    .filter((recordId) => recordId && recordId !== CANVAS_ORIGIN_RECORD_ID))];
+    .filter(Boolean))];
   return recordIds.length === 0 || recordIds.some((recordId) => isRecordInActiveStack(recordId));
 }
 
@@ -461,6 +476,17 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
         constraintOperation: operation,
       }))
     ));
+    solver.setExternalStackRelationships?.(external.map((constraint) => {
+      const referencedStackIds = [...new Set((constraint.featureRefs || [])
+        .map(({ recordId }) => canvas.getRecordStackId?.(recordId))
+        .filter(Boolean))];
+      const stackId = constraint.stackId || referencedStackIds[0] || canvas.getActiveStackId?.();
+      return {
+        ...constraint,
+        stackId,
+        participantStackIds: referencedStackIds.filter((participantId) => participantId !== stackId),
+      };
+    }));
     const builtIn = changedRecordIds && solver.constraintsForRecordIds
       ? solver.constraintsForRecordIds(changedRecordIds)
       : solver.constraints();
@@ -532,6 +558,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'canvas-overlay-button constraint-helper-button';
+        button.classList.toggle('solve-offender', solver.lastResult?.offender?.constraintId === constraint.id);
         button.title = `${constraint.type} constraint`;
         button.setAttribute('aria-label', `Remove ${constraint.type} constraint`);
         button.dataset.constraintId = constraint.id;
@@ -589,7 +616,11 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
 
   function syncHelpersVisibility() {
     const scale = Number(canvas.getScale?.() ?? 1);
-    const visible = helpersRequestedVisible && Number.isFinite(scale) && scale >= MIN_CONSTRAINT_HELPER_ZOOM;
+    const visible = constraintHelpersVisible({
+      requested: helpersRequestedVisible,
+      scale,
+      activeStackId: canvas.getActiveStackId?.(),
+    });
     helperLayer.hidden = !visible;
     if (!visible) canvas.setReferenceHighlight?.([]);
   }
@@ -644,6 +675,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
         type,
         featureRefs: ordered.map(featureRef),
         source: 'geometric',
+        stackId: canvas.getActiveStackId?.(),
         ...(mode ? { tangentMode: mode } : {}),
       };
       let outcome;
@@ -653,12 +685,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
       }
       if (outcome === undefined) {
         outcome = solver.addConstraintAuthoritative
-          ? solver.addConstraintAuthoritative({
-          type,
-          featureRefs: request.featureRefs,
-          source: 'geometric',
-          ...(mode ? { tangentMode: mode } : {}),
-        })
+          ? solver.addConstraintAuthoritative(request)
           : solver.addConstraint(request);
       }
       const appliedConstraint = activeConstraint;
@@ -718,6 +745,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
     render: renderConstraintHelpers,
   });
   canvas.onObjectsChange?.(renderConstraintHelpers);
+  canvas.onStackChange?.(renderConstraintHelpers);
 
   window.addEventListener('paramagic:tool-activated', (event) => {
     if (event.detail?.source !== 'constraint') deactivate();
