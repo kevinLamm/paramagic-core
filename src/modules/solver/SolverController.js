@@ -21,9 +21,9 @@ import {
 } from '../DocumentVariables.js';
 import {
   STACK_ARCHITECTURE_VERSION,
+  collectRecordReferences,
   defaultStackId as resolveDefaultStackId,
   normalizeStackArchitectureState,
-  participantStackIds,
 } from '../StackArchitecture.js';
 import {
   aggregateStackSolveResults,
@@ -599,11 +599,36 @@ export class SolverController {
     return this.enabledStackIds.has(String(stackId || this.defaultStackId()));
   }
 
+  stackParticipationForValue(value, fallback = null) {
+    fallback ||= this.defaultStackId();
+    if (this.entityStackIds.size !== this.model.entities.size) this.rebuildEntityStackIndex();
+    const stackId = this.stackIdForValue(value, fallback);
+    const referencedIds = collectRecordReferences(value, this.entityStackIds);
+    const referencedStackIds = [...referencedIds]
+      .map((recordId) => this.entityStackIds.get(recordId))
+      .filter(Boolean);
+    const participantIds = referencedIds.size
+      ? referencedStackIds
+      : (value?.participantStackIds || []);
+    return {
+      stackId,
+      participantStackIds: [...new Set(participantIds.map(String))]
+        .filter((participantId) => participantId && participantId !== stackId),
+    };
+  }
+
+  relationshipStackIds(value, fallback = null) {
+    const participation = this.stackParticipationForValue(value, fallback);
+    return [...new Set([
+      participation.stackId,
+      ...(value?.participantStackIds || []).map(String),
+      ...participation.participantStackIds,
+    ].filter(Boolean))];
+  }
+
   relationshipIsEnabled(value) {
-    return [
-      value?.stackId || this.defaultStackId(),
-      ...(value?.participantStackIds || []),
-    ].every((stackId) => this.isStackEnabled(stackId));
+    return this.relationshipStackIds(value)
+      .every((stackId) => this.isStackEnabled(stackId));
   }
 
   setEnabledStackIds(stackIds = null) {
@@ -639,12 +664,10 @@ export class SolverController {
   }
 
   withStackParticipation(value, fallback = null) {
-    fallback ||= this.defaultStackId();
-    const stackId = this.stackIdForValue(value, fallback);
+    const participation = this.stackParticipationForValue(value, fallback);
     const result = {
       ...value,
-      stackId,
-      participantStackIds: participantStackIds(value, this.stackEntityRecords(), stackId),
+      ...participation,
     };
     this.invalidateStackParticipationGraph();
     return result;
@@ -712,13 +735,34 @@ export class SolverController {
 
   stackParticipationGraph() {
     if (this.stackParticipationGraphCache) return this.stackParticipationGraphCache;
+    const constraints = this.constraints().map((constraint) => ({
+      ...constraint,
+      ...this.stackParticipationForValue(constraint, constraint.stackId || this.defaultStackId()),
+    }));
+    const dimensions = this.dimensions.list()
+      .filter(({ kind }) => kind === 'dimension')
+      .map((entry) => {
+        const annotation = this.dimensionAnnotations.get(entry.id);
+        return annotation
+          ? { ...entry, ...this.stackParticipationForValue(annotation, entry.stackId || this.defaultStackId()) }
+          : entry;
+      });
+    const relationships = this.externalStackRelationships.map((relationship) => {
+      const stackIds = this.relationshipStackIds(relationship, relationship.stackId || this.defaultStackId());
+      const stackId = relationship.stackId || stackIds[0] || this.defaultStackId();
+      return {
+        ...relationship,
+        stackId,
+        participantStackIds: stackIds.filter((participantId) => participantId !== stackId),
+      };
+    });
     this.stackParticipationGraphCache = buildStackParticipationGraph({
       stackIds: this.stackState.stacks.map(({ id }) => id),
       enabledStackIds: this.enabledStackIds,
       entities: this.stackEntityRecords(),
-      constraints: this.constraints(),
-      dimensions: this.dimensions.list().filter(({ kind }) => kind === 'dimension'),
-      relationships: this.externalStackRelationships,
+      constraints,
+      dimensions,
+      relationships,
       defaultStackId: this.defaultStackId(),
     });
     return this.stackParticipationGraphCache;
@@ -730,14 +774,14 @@ export class SolverController {
     seedConstraintIds.forEach((constraintId) => {
       const constraint = this.model.constraints.get(constraintId);
       if (!constraint) return;
-      ids.add(constraint.stackId || this.defaultStackId());
-      constraint.participantStackIds?.forEach((stackId) => ids.add(stackId));
+      this.relationshipStackIds(constraint).forEach((stackId) => ids.add(stackId));
     });
     seedDimensionIds.forEach((dimensionId) => {
       const dimension = this.dimensions.get(dimensionId);
       if (!dimension) return;
-      ids.add(dimension.stackId || this.defaultStackId());
-      dimension.participantStackIds?.forEach((stackId) => ids.add(stackId));
+      const annotation = this.dimensionAnnotations.get(dimensionId);
+      this.relationshipStackIds(annotation || dimension, dimension.stackId)
+        .forEach((stackId) => ids.add(stackId));
     });
     return new Set([...ids].filter((stackId) => this.isStackEnabled(stackId)));
   }
@@ -764,12 +808,14 @@ export class SolverController {
     }
     const scopedModel = graph.scopedModel(scope);
     const scopedGraph = new ConstraintGraph(scopedModel);
+    const computedDependencyIds = this.dimensions.computedDependencyIds(scope.dimensionIds);
     const result = solveConstraintComponents({
       ...solveOptions,
       model: scopedModel,
       graph: scopedGraph,
-      computedDimensionIds: scope.dimensionIds,
+      computedDimensionIds: computedDependencyIds,
     });
+    this.refreshComputedDimensionsForStackIds(requested);
     result.solveScope = {
       mode: 'stack-set',
       stackIds: [...requested],
@@ -779,6 +825,24 @@ export class SolverController {
       entityCount: scope.entityIds.size,
     };
     return result;
+  }
+
+  refreshComputedDimensionsForStackIds(stackIds = []) {
+    const requested = new Set([...stackIds].filter((stackId) => this.isStackEnabled(stackId)));
+    if (!requested.size) return new Map();
+    const computedDimensionIds = new Set(this.dimensions.list()
+      .filter((entry) => (
+        entry.kind === 'dimension'
+        && entry.computed
+        && this.dimensions.isEntryAvailable(entry)
+        && requested.has(entry.stackId || this.defaultStackId())
+      ))
+      .map(({ id }) => id));
+    return this.dimensions.evaluateDirty({
+      strict: false,
+      refreshComputed: true,
+      refreshComputedIds: computedDimensionIds,
+    });
   }
 
   decorateStackFailure(result, stackIds) {
@@ -830,7 +894,11 @@ export class SolverController {
       'BoundingBoxHeight',
     ]);
     if (requestedIds === null || boundsAreReferenced) {
-      this.refreshDocumentVariables(requestedIds === null ? snapshot : this.model.snapshot());
+      this.refreshDocumentVariables(
+        requestedIds === null
+          ? this.enabledGeometrySnapshot(snapshot)
+          : this.enabledGeometrySnapshot(),
+      );
     }
     this.listeners.forEach((listener) => listener(snapshot, this.lastResult, {
       snapshotMode: requestedIds === null ? 'full' : 'delta',
@@ -867,6 +935,22 @@ export class SolverController {
   setDimensionAnnotation(dimensionId, annotation) {
     this.deleteDimensionAnnotation(dimensionId);
     const stored = this.withStackParticipation(clone(annotation), annotation?.stackId || this.defaultStackId());
+    const entry = this.dimensions.get(dimensionId);
+    const currentParticipants = [...(entry?.participantStackIds || [])].map(String).sort();
+    const nextParticipants = [...(stored.participantStackIds || [])].map(String).sort();
+    if (
+      entry?.kind === 'dimension'
+      && (
+        (entry.stackId || this.defaultStackId()) !== stored.stackId
+        || currentParticipants.join('\u0000') !== nextParticipants.join('\u0000')
+      )
+    ) {
+      this.dimensions.updateDimensionScope(dimensionId, {
+        stackId: stored.stackId,
+        participantStackIds: stored.participantStackIds,
+        emit: false,
+      });
+    }
     this.dimensionAnnotations.set(dimensionId, stored);
     const recordIds = referencedRecordIds(stored);
     this.recordsForDimension.set(dimensionId, recordIds);
@@ -1205,7 +1289,6 @@ export class SolverController {
       registry: this.registry,
       dimensions: this.dimensions,
       solveMode,
-      ...(scope ? { computedDimensionIds: scope.dimensionIds } : {}),
       ...(maxIterations === undefined ? {} : { maxIterations }),
       ...(timeBudgetMs === undefined ? {} : { timeBudgetMs }),
       ...(shouldCancel === undefined ? {} : { shouldCancel }),
@@ -1219,6 +1302,7 @@ export class SolverController {
         ...solveOptions,
         model: scopedModel,
         graph: new ConstraintGraph(scopedModel),
+        computedDimensionIds: this.dimensions.computedDependencyIds(scope.dimensionIds),
       });
       this.lastResult.solveScope = affectedStackIds?.size ? {
         mode: 'stack-set',
@@ -1235,6 +1319,7 @@ export class SolverController {
         entityCount: scope.entityIds.size,
       };
       this.lastResult = this.decorateStackFailure(this.lastResult, affectedStackIds || seededStackIds);
+      this.refreshComputedDimensionsForStackIds(affectedStackIds || seededStackIds);
     } else if (fullSolve || !hasSeeds) {
       const results = stackParticipationGroups(participantGraph).map((stackIds) => ({
         stackIds,
@@ -1278,13 +1363,6 @@ export class SolverController {
         solveScope: { mode: 'none' },
       };
     }
-    // Refresh displayed measurements after driving constraints have moved
-    // their own target geometry.
-    this.dimensions.evaluateDirty({
-      strict: false,
-      refreshComputed: true,
-      refreshComputedIds: scope?.dimensionIds || null,
-    });
     return this.lastResult;
   }
 
@@ -1950,7 +2028,10 @@ export class SolverController {
     requested.forEach((enabledValue, dimensionId) => {
       const entry = this.dimensions.get(dimensionId);
       if (entry?.kind !== 'dimension') return;
-      const enabled = Boolean(enabledValue);
+      const annotation = this.dimensionAnnotations.get(dimensionId);
+      const enabled = Boolean(enabledValue)
+        && this.dimensions.isEntryAvailable(entry)
+        && this.relationshipIsEnabled(annotation || entry);
       if ((entry.enabled !== false) !== enabled) {
         this.dimensions.setEnabled(dimensionId, enabled, { evaluate: false, emit: false });
         changed = true;
@@ -2191,7 +2272,20 @@ export class SolverController {
     return this.dimensions.list();
   }
 
-  refreshDocumentVariables(entities = this.model.snapshot()) {
+  enabledGeometrySnapshot(snapshot = null) {
+    if (snapshot) {
+      if (!this.activationFiltering) return snapshot;
+      return snapshot.filter((entity) => this.isStackEnabled(
+        entity.stackId || this.entityStackIds.get(entity.id) || this.defaultStackId(),
+      ));
+    }
+    if (!this.activationFiltering) return this.model.snapshot();
+    if (this.entityStackIds.size !== this.model.entities.size) this.rebuildEntityStackIndex();
+    return this.getGeometrySnapshot([...this.enabledStackIds]
+      .flatMap((stackId) => [...(this.entityIdsByStack.get(stackId) || [])]));
+  }
+
+  refreshDocumentVariables(entities = this.enabledGeometrySnapshot()) {
     const variables = buildDocumentVariables({
       metadata: this.documentMetadata,
       context: this.documentContext,
@@ -2207,7 +2301,7 @@ export class SolverController {
       metadata: this.documentMetadata,
       context: this.documentContext,
       drawingUnit: this.drawingUnit,
-      entities: this.model.snapshot(),
+      entities: this.enabledGeometrySnapshot(),
     });
   }
 

@@ -30,6 +30,7 @@ export const STACK_HOVERED_CLASS = 'stack-hovered';
 export const STACK_HOVER_OVERLAY_CLASS = 'stack-hover-overlay-record';
 export const STACK_HOVER_OVERLAY_GRAPHIC_CLASS = 'stack-hover-overlay-graphic';
 export const STACK_DISABLED_CLASS = 'stack-disabled';
+export const STACK_INACTIVE_HIT_TEST_BLOCKED_CLASS = 'inactive-stack-hit-test-blocked';
 export const INITIAL_USER_STACK_NAME = 'Stack 1';
 
 const STACK_HOVER_GRAPHIC_SELECTOR = [
@@ -99,6 +100,23 @@ export function inactiveStackInteractionAllowed(canvasElement) {
   ));
 }
 
+export function shouldBlockInactiveStackHitTesting({
+  drawingMode = false,
+  featureCommandDelegate = null,
+  smartDimensionDelegate = null,
+  explicitBlockerCount = 0,
+} = {}) {
+  if (drawingMode || explicitBlockerCount > 0) return true;
+  const delegate = featureCommandDelegate || smartDimensionDelegate;
+  return Boolean(delegate && delegate.allowInactiveStackInteraction !== true);
+}
+
+export function syncInactiveStackHitTesting(canvasElement, state = {}) {
+  const blocked = shouldBlockInactiveStackHitTesting(state);
+  canvasElement?.classList?.toggle?.(STACK_INACTIVE_HIT_TEST_BLOCKED_CLASS, blocked);
+  return blocked;
+}
+
 export function stackIdForCanvasInteractionTarget(target, canvasElement = null) {
   const owner = target?.closest?.('[data-stack-id]');
   if (!owner || (canvasElement?.contains && !canvasElement.contains(owner))) return null;
@@ -117,6 +135,8 @@ export function bindCanvasStackInteractions({
   if (!canvasElement?.addEventListener) return () => {};
   let pendingPointerDown = null;
 
+  const toolOwnsCanvasInteraction = () => Boolean(isToolInteractionActive());
+
   const isRepeatedStackPress = (event, stackId) => {
     if (!pendingPointerDown || pendingPointerDown.stackId !== stackId) return false;
     const elapsed = Number(event.timeStamp) - pendingPointerDown.timeStamp;
@@ -127,10 +147,13 @@ export function bindCanvasStackInteractions({
     return elapsed >= 0 && elapsed <= 500 && distance <= 6;
   };
 
-  const handle = (event, action, resolvedStackId = resolveInteractionStackId(event)) => {
-    const stackId = String(resolvedStackId || '').trim() || null;
+  const handle = (event, action, resolvedStackId = undefined) => {
+    if (toolOwnsCanvasInteraction()) return;
+    const requestedStackId = resolvedStackId === undefined
+      ? resolveInteractionStackId(event)
+      : resolvedStackId;
+    const stackId = String(requestedStackId || '').trim() || null;
     if (!stackId || !hasStack(stackId) || stackId === getActiveStackId()) return;
-    if (getActiveStackId() && isToolInteractionActive()) return;
     const handled = action(stackId);
     if (handled === false) return;
     event.preventDefault?.();
@@ -138,12 +161,15 @@ export function bindCanvasStackInteractions({
   };
   const handlePointerDown = (event) => {
     if (Number(event.button) !== 0) return;
+    if (toolOwnsCanvasInteraction()) {
+      pendingPointerDown = null;
+      return;
+    }
     const stackId = String(resolveInteractionStackId(event) || '').trim() || null;
     if (
       !stackId
       || !hasStack(stackId)
       || stackId === getActiveStackId()
-      || (getActiveStackId() && isToolInteractionActive())
     ) {
       pendingPointerDown = null;
       return;
@@ -158,6 +184,7 @@ export function bindCanvasStackInteractions({
     if (repeated) handle(event, activateStack, stackId);
   };
   const handleClick = (event) => {
+    if (toolOwnsCanvasInteraction()) return;
     const stackId = String(resolveInteractionStackId(event) || '').trim() || null;
     const activate = Number(event.detail) >= 2;
     handle(event, activate ? activateStack : selectStack, stackId);
@@ -262,6 +289,8 @@ export function createStackSystem({
   canvasElement = null,
   hoverOverlayLayer = null,
   resolveCanvasInteractionStackId = null,
+  resolveRelationshipStackIds = null,
+  isCanvasToolActive = null,
   onRecordDisabled = () => {},
   onChange = () => {},
   onPresentationChange = () => {},
@@ -423,9 +452,22 @@ export function createStackSystem({
     return isStackActive(entityStackId(entity, stackIds(), defaultStackId(state)));
   }
 
+  function isEntityRelationshipEnabled(entity) {
+    const ownerStackId = entityStackId(entity, stackIds(), defaultStackId(state));
+    const resolvedStackIds = typeof resolveRelationshipStackIds === 'function'
+      ? resolveRelationshipStackIds(entity)
+      : [];
+    const relationshipStackIds = [...new Set([
+      ownerStackId,
+      ...(entity?.participantStackIds || []),
+      ...(resolvedStackIds || []),
+    ].filter(Boolean))];
+    return relationshipStackIds.every(isStackEffectivelyEnabled);
+  }
+
   function isEntityEnabled(entity) {
     const id = entityStackId(entity, stackIds(), defaultStackId(state));
-    return isStackEffectivelyEnabled(id)
+    return isEntityRelationshipEnabled(entity)
       && isEntityVisible(entity)
       && (
         isEntityActive(entity)
@@ -451,9 +493,13 @@ export function createStackSystem({
     const known = stackIds();
     const interactionOverride = inactiveStackInteractionAllowed(canvasElement);
     const hasActiveStack = Boolean(state.activeStackId);
-    const syncNode = (node, id, { visible, active, hovered = id === hoveredStackId }) => {
+    const syncNode = (node, id, {
+      visible,
+      active,
+      hovered = id === hoveredStackId,
+      effectiveEnabled = id === null || isStackEffectivelyEnabled(id),
+    }) => {
       if (!node) return;
-      const effectiveEnabled = id === null || isStackEffectivelyEnabled(id);
       const inactive = hasActiveStack && !active;
       const presentationKey = `${id ?? ''}:${visible ? 1 : 0}:${active ? 1 : 0}:${inactive ? 1 : 0}:${hovered ? 1 : 0}:${effectiveEnabled ? 1 : 0}`;
       if (nodePresentation.get(node) === presentationKey) return;
@@ -469,11 +515,12 @@ export function createStackSystem({
       const id = entityStackId(record.entity, known, defaultStackId(state));
       const visible = isStackEffectivelyVisible(id);
       const active = isStackActive(id);
-      const enabled = isStackEffectivelyEnabled(id)
+      const relationshipEnabled = isEntityRelationshipEnabled(record.entity);
+      const enabled = relationshipEnabled
         && visible
         && (active || (hasActiveStack && interactionOverride));
-      syncNode(record.group, id, { visible, active });
-      syncNode(record.handleGroup, id, { visible, active });
+      syncNode(record.group, id, { visible, active, effectiveEnabled: relationshipEnabled });
+      syncNode(record.handleGroup, id, { visible, active, effectiveEnabled: relationshipEnabled });
       if (!enabled && recordEnabledState.get(record) !== false) {
         selectedIds?.delete(record.id);
         onRecordDisabled(record);
@@ -739,7 +786,8 @@ export function createStackSystem({
     hasStack: (stackId) => Boolean(stack(stackId)),
     selectStack: setSelectedStack,
     activateStack: setActiveStack,
-    isToolInteractionActive: () => inactiveStackInteractionAllowed(canvasElement),
+    isToolInteractionActive: isCanvasToolActive
+      || (() => inactiveStackInteractionAllowed(canvasElement)),
     resolveInteractionStackId: resolveCanvasInteractionStackId
       || ((event) => stackIdForCanvasInteractionTarget(event?.target, canvasElement)),
   });

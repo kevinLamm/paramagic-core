@@ -690,6 +690,7 @@ export function createFilletSystem({
   removeObject,
   assignClass = (entity) => entity,
   assignStack = (entity) => entity,
+  isRecordProcessingEnabled = () => true,
 }) {
   function syncFilletClasses(record) {
     const isConstruction = record?.entity?.construction === true;
@@ -708,7 +709,7 @@ export function createFilletSystem({
 
   function sourceGeometryMap() {
     return new Map(records
-      .filter((record) => record.recordType === 'geometry')
+      .filter((record) => record.recordType === 'geometry' && isRecordProcessingEnabled(record))
       .map((record) => [record.id, record.entity]));
   }
 
@@ -735,11 +736,14 @@ export function createFilletSystem({
     const affectedIds = filletPresentationRecordIds(records, changedRecordIds);
     records.filter((record) => (
       affectedIds.has(record.id)
+      && isRecordProcessingEnabled(record)
       && record.recordType === 'geometry'
       && ['line', 'arc', 'curve'].includes(record.entity.type)
     )).forEach(updateGeometryNode);
     records.filter((record) => (
-      affectedIds.has(record.id) && record.recordType === 'fillet'
+      affectedIds.has(record.id)
+      && isRecordProcessingEnabled(record)
+      && record.recordType === 'fillet'
     )).forEach(updateRecord);
     if (renderRegions) renderClosedRegions();
     if (!changedRecordIds) syncGeometryStacking();
@@ -921,6 +925,7 @@ export function createFilletSystem({
     const migrated = [];
     records
       .filter((record) => record.recordType === 'dimension'
+        && isRecordProcessingEnabled(record)
         && record.entity.dimensionMode === 'driving'
         && record.entity.type === 'radius-dimension'
         && record.entity.externalDrivingTarget?.type === 'fillet-radius'
@@ -944,7 +949,7 @@ export function createFilletSystem({
     if (migrated.length) {
       const byId = new Map((solver.getGeometrySnapshot?.() || []).map((entity) => [entity.id, entity]));
       records.forEach((record) => {
-        if (record.recordType !== 'geometry') return;
+        if (record.recordType !== 'geometry' || !isRecordProcessingEnabled(record)) return;
         const entity = byId.get(record.id);
         if (entity) record.entity = clone(entity);
       });

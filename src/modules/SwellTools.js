@@ -449,7 +449,9 @@ export function createSwellTools({
   }
 
   function snapshot() {
-    return canvas.getDrawingData?.() || { entities: [], constraints: [] };
+    return canvas.getProcessingDrawingData?.()
+      || canvas.getDrawingData?.()
+      || { entities: [], constraints: [] };
   }
 
   function sourceAppearance(recordId) {
@@ -809,7 +811,9 @@ export function createSwellTools({
       }
       return { constraint: clone(constraint) };
     },
-    constraints: () => externalConstraints.map(clone),
+    constraints: () => externalConstraints
+      .filter((constraint) => canvas.isStackRelationshipAvailable?.(constraint) !== false)
+      .map(clone),
     resolveFeature: (request) => derivedDimensionProvider.resolveFeature(request),
     dependsOn(constraint, changedRecordIds) {
       return Boolean(changedRecordIds?.has(constraint.externalTarget?.sourceId)

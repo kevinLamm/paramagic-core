@@ -52,7 +52,8 @@ import { createTableSystem, normalizeTableEntity, tableCornerPoints, tableCorner
 import { deleteCurveControlPoint, insertCurveControlPoint } from './DrawingTools.js';
 import { createSeamLineSystem } from './SeamLineSystem.js';
 import { isSubtractableEntity, createSubtractSystem } from './SubtractSystem.js';
-import { createStackSystem } from './StackSystem.js';
+import { createStackSystem, syncInactiveStackHitTesting } from './StackSystem.js';
+import { createStackProcessingScope } from './StackProcessingScope.js';
 import { subtreeStackIds } from './StackArchitecture.js';
 import {
   createStackActivationCoordinator,
@@ -115,6 +116,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const derivedSelectionProviders = new Set();
   const subtractOperandProviders = new Set();
   const selectionPropertyProviders = new Set();
+  const inactiveStackHitTestBlockers = new Set();
   let loadedDrawingExtensions = {};
   let lastSelectionFingerprint = '';
   const ns = 'http://www.w3.org/2000/svg';
@@ -143,6 +145,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     canvasElement: canvas,
     hoverOverlayLayer: stackHoverLayer,
     resolveCanvasInteractionStackId: () => hoveredOwnerStackId,
+    resolveRelationshipStackIds: (relationship) => solver.relationshipStackIds?.(relationship) || [],
+    isCanvasToolActive: canvasToolInteractionActive,
     onRecordDisabled(record) {
       selectedSegments.delete(record.id);
       if (selectedSegment?.recordId === record.id) selectedSegment = null;
@@ -165,6 +169,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     onPresentationChange: () => {
       syncStackPresentation();
     },
+  });
+  const stackProcessingScope = createStackProcessingScope({
+    isStackEnabled: stackSystem.isStackEffectivelyEnabled,
+    defaultStackId: () => stackSystem.stackIds()[0] || null,
+    resolveRelationshipStackIds: (relationship) => solver.relationshipStackIds?.(relationship) || [],
   });
   stackActivationSystem = createStackActivationSystem({
     getStackState: stackSystem.getState,
@@ -556,7 +565,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function currentDerivedPaintPlan() {
     return organizeDerivedPaintNodes(
-      objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]'),
+      [...objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]')]
+        .filter((node) => stackProcessingScope.stackEnabled(node.dataset?.stackId)),
     );
   }
 
@@ -565,7 +575,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return records
       .map((record, originalIndex) => ({ record, originalIndex }))
       .filter(({ record }) => (
-        ['geometry', 'image', 'fillet', 'text', 'table', 'control'].includes(record.recordType)
+        stackProcessingScope.recordEnabled(record)
+        && ['geometry', 'image', 'fillet', 'text', 'table', 'control'].includes(record.recordType)
         && (!record.entity.construction || anchorRecordIds.has(record.id))
       ))
       .sort((a, b) => {
@@ -656,7 +667,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function syncGeometryStacking() {
-    const derivedNodes = [...objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]')];
+    const derivedNodes = [...objectLayer.querySelectorAll(':scope > [data-paint-derived="true"]')]
+      .filter((node) => stackProcessingScope.stackEnabled(node.dataset?.stackId));
     const {
       beforeByRecordId,
       afterByRecordId,
@@ -669,12 +681,17 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const remainingUnanchored = unanchored.filter((node) => !orderedDerived.has(node));
     const editable = editablePaintOrder();
     const construction = records.filter((record) => (
-      ['geometry', 'image', 'fillet', 'table'].includes(record.recordType)
+      stackProcessingScope.recordEnabled(record)
+      && ['geometry', 'image', 'fillet', 'table'].includes(record.recordType)
       && record.entity.construction
       && !anchorRecordIds.has(record.id)
     ));
-    const notches = records.filter((record) => record.recordType === 'notch');
-    const dimensions = records.filter((record) => record.recordType === 'dimension');
+    const notches = records.filter((record) => (
+      record.recordType === 'notch' && stackProcessingScope.recordEnabled(record)
+    ));
+    const dimensions = records.filter((record) => (
+      record.recordType === 'dimension' && stackProcessingScope.recordEnabled(record)
+    ));
     const appendRecord = (record) => {
       (beforeByRecordId.get(record.id) || []).forEach((node) => objectLayer.appendChild(node));
       beforeByRecordId.delete(record.id);
@@ -820,14 +837,17 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     };
     records.forEach((record) => {
       if (record.recordType !== 'dimension') return;
-      const state = dimensionParentStates(record.entity, {
-        isVisible: (recordId) => parentState(recordId, false),
-        isEnabled: (recordId) => parentState(recordId, true),
-      });
+      const relationshipEnabled = stackProcessingScope.relationshipEnabled(record.entity);
+      const state = relationshipEnabled
+        ? dimensionParentStates(record.entity, {
+          isVisible: (recordId) => parentState(recordId, false),
+          isEnabled: (recordId) => parentState(recordId, true),
+        })
+        : { visible: false, enabled: false };
       record.dimensionParentsVisible = state.visible;
       syncDimensionPresentation(record);
       if (record.entity.dimensionId) {
-        enabledByDimensionId.set(record.entity.dimensionId, state.enabled);
+        enabledByDimensionId.set(record.entity.dimensionId, relationshipEnabled && state.enabled);
       }
     });
     const outcome = solver.setDimensionEnabledStates(enabledByDimensionId);
@@ -999,7 +1019,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     hoveredRegion = null;
     resolvedBoundaryVisualNodes.forEach((node) => node.remove());
     resolvedBoundaryVisualNodes.clear();
-    records.filter((record) => ['geometry', 'fillet'].includes(record.recordType))
+    stackProcessingScope.records(records)
+      .filter((record) => ['geometry', 'fillet'].includes(record.recordType))
       .forEach((record) => {
         record.group.classList.remove('closed-region-source-record');
         if (record.recordType === 'geometry') geometryAppearanceSystem.apply(record);
@@ -1789,8 +1810,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function notifyObjectChange({ history = 'coalesce' } = {}) {
     refreshStackActivation();
-    records.filter((record) => record.recordType === 'geometry').forEach(geometryAppearanceSystem.apply);
-    records.filter((record) => record.recordType === 'text').forEach(textTools.updateRecord);
+    stackProcessingScope.records(records)
+      .filter((record) => record.recordType === 'geometry')
+      .forEach(geometryAppearanceSystem.apply);
+    stackProcessingScope.records(records)
+      .filter((record) => record.recordType === 'text')
+      .forEach(textTools.updateRecord);
     subtractSystem.refreshPresentation();
     renderClosedRegions();
     notchSystem.refresh();
@@ -1871,24 +1896,25 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     assignClass: classSystem.assignEntity,
     assignStack: stackSystem.assignEntity,
+    isRecordProcessingEnabled: stackProcessingScope.recordEnabled,
   });
 
   function currentClosedCycles() {
-    const topologyEntities = closedGeometryTopologyEntities(records
+    const topologyEntities = closedGeometryTopologyEntities(stackProcessingScope.records(records)
       .filter((record) => record.recordType === 'geometry' || record.recordType === 'fillet')
       .map((record) => record.entity));
     const fillets = topologyEntities.filter((entity) => entity.type === 'fillet' && entity.construction !== true);
     return findClosedGeometryCycles(
       evaluateFilletedGeometry(topologyEntities),
-      filletTopologyConstraints(solver.constraints(), fillets),
+      filletTopologyConstraints(stackProcessingScope.relationships(solver.constraints()), fillets),
     );
   }
 
   function currentResolvedBoundaries() {
-    const topologyEntities = closedGeometryTopologyEntities(records
+    const topologyEntities = closedGeometryTopologyEntities(stackProcessingScope.records(records)
       .filter((record) => record.recordType === 'geometry' || record.recordType === 'fillet')
       .map((record) => record.entity));
-    return resolveClosedBoundaries(topologyEntities, solver.constraints());
+    return resolveClosedBoundaries(topologyEntities, stackProcessingScope.relationships(solver.constraints()));
   }
 
   subtractSystem = createSubtractSystem({
@@ -1915,6 +1941,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       status.hidden = false;
       status.textContent = message;
     },
+    isRecordProcessingEnabled: stackProcessingScope.recordEnabled,
   });
   objectVisibilitySystem = createObjectVisibilitySystem({
     records,
@@ -1923,6 +1950,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     owners: subtractSystem.owners,
     ownerForRecord: subtractSystem.ownerForRecord,
     additionalVisibilityRecord: isTextVisibilityRecord,
+    isRecordProcessingEnabled: stackProcessingScope.recordEnabled,
     evaluateExpression: (expression, entity = null) => solver.evaluateParameterExpression(expression, { stackId: entity?.stackId || stackSystem.activeStackId() }),
     resolveEntityAppearance: (entity) => (
       isClassGeometryEntity(entity) ? classSystem.resolveAppearance(entity) : entity?.appearance || {}
@@ -1985,6 +2013,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     reapplySolverSnapshot: applySolverSnapshot,
     getScale: () => camera.scale,
     assignStack: stackSystem.assignEntity,
+    isRecordProcessingEnabled: stackProcessingScope.recordEnabled,
   });
 
   seamLineSystem = createSeamLineSystem({
@@ -1998,7 +2027,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     notifyObjectChange,
     syncGeometryStacking,
     getScale: () => camera.scale,
-    getDrawingSnapshot: () => drawingSnapshot(),
+    getDrawingSnapshot: () => processingDrawingSnapshot(),
     evaluateLength: (expression, entity = null) => solver.evaluateDrawingLengthExpression(expression, {
       stackId: entity?.stackId || stackSystem.activeStackId(),
     }),
@@ -2016,12 +2045,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     isStackVisible: stackSystem.isStackVisible,
     isStackActive: stackSystem.isStackActive,
     getActiveStackId: stackSystem.activeStackId,
-    isStackRelationshipAvailable(relationship) {
-      return [
-        relationship?.stackId || stackSystem.activeStackId(),
-        ...(relationship?.participantStackIds || []),
-      ].every((stackId) => stackId && stackSystem.isStackEffectivelyEnabled(stackId));
-    },
   });
   registerDrawingExtension('seamLines', seamLineSystem.extensionProvider);
 
@@ -2142,8 +2165,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const stateRecords = changedRecordIds
       ? [...changedRecordIds].map((recordId) => (
         records.find((record) => record.id === recordId)
-      )).filter(Boolean)
-      : records;
+      )).filter((record) => record && stackProcessingScope.recordEnabled(record))
+      : stackProcessingScope.records(records);
     stateRecords.forEach((record) => {
       const isSelected = selectedIds.has(record.id);
       const recordSelectedSegments = selectedSegments.get(record.id);
@@ -2990,6 +3013,21 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return drawing;
   }
 
+  function processingDrawingSnapshot() {
+    const processingRecords = stackProcessingScope.records(records);
+    return {
+      drawingUnit: solver.drawingUnit || 'in',
+      stackState: stackSystem.getState(),
+      entities: processingRecords
+        .filter((record) => ['geometry', 'image', 'fillet', 'notch', 'text', 'table'].includes(record.recordType))
+        .map((record) => cloneEntity(record.entity)),
+      constraints: stackProcessingScope.relationships(solver.constraints()),
+      dimensionAnnotations: processingRecords
+        .filter((record) => record.recordType === 'dimension')
+        .map((record) => cloneEntity(record.entity)),
+    };
+  }
+
   function solveDrawing(options = {}) {
     flushScheduledSolve();
     const result = solver.solve(options);
@@ -3216,18 +3254,24 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getScale: () => camera.scale,
     resolveDerivedFeature: resolveDerivedDimensionFeature,
     derivedFeatureDependsOn: derivedDimensionFeatureDependsOn,
+    isRecordProcessingEnabled: stackProcessingScope.recordEnabled,
   });
 
-  function applySolverSnapshot(snapshot = solver.getGeometrySnapshot(), { incremental = false } = {}) {
-    const byId = new Map(snapshot.map((entity) => [entity.id, entity]));
+  function applySolverSnapshot(snapshot = null, { incremental = false } = {}) {
+    const resolvedSnapshot = snapshot || solver.getGeometrySnapshot(
+      stackProcessingScope.records(records).map(({ id }) => id),
+    );
+    const byId = new Map(resolvedSnapshot.map((entity) => [entity.id, entity]));
     const changedIds = new Set();
     const geometryDragPreview = Boolean(
       shapeDrag
       || (handleDrag && handleDrag.record?.recordType === 'geometry'),
     );
     const snapshotRecords = incremental
-      ? snapshot.map((entity) => recordById(entity.id)).filter(Boolean)
-      : records;
+      ? resolvedSnapshot.map((entity) => recordById(entity.id)).filter((record) => (
+        record && stackProcessingScope.recordEnabled(record)
+      ))
+      : stackProcessingScope.records(records);
     snapshotRecords.forEach((record) => {
       const next = byId.get(record.id);
       if (!next) return;
@@ -3265,7 +3309,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       notchSystem.refresh();
       seamLineSystem.refresh();
       refreshLinkedDimensions();
-      records.filter((record) => record.recordType === 'text').forEach(textTools.updateRecord);
+      records.filter((record) => (
+        record.recordType === 'text' && stackProcessingScope.recordEnabled(record)
+      )).forEach(textTools.updateRecord);
       constraintOverlaySystem?.render?.();
       syncState();
     }
@@ -3497,6 +3543,26 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function isToolDragBlocked() {
     return Boolean(featureCommandDelegate || smartDimensionDelegate);
+  }
+
+  function canvasToolInteractionActive() {
+    return Boolean(drawingMode || featureCommandDelegate || smartDimensionDelegate);
+  }
+
+  function syncCanvasToolHitTesting() {
+    return syncInactiveStackHitTesting(canvas, {
+      drawingMode,
+      featureCommandDelegate,
+      smartDimensionDelegate,
+      explicitBlockerCount: inactiveStackHitTestBlockers.size,
+    });
+  }
+
+  function emitCanvasHover() {
+    const hover = canvasToolInteractionActive()
+      ? { recordId: null, stackId: null }
+      : { recordId: hoveredId, stackId: hoveredOwnerStackId };
+    canvasHoverListeners.forEach((listener) => listener(hover));
   }
 
   function dragRecordsForSelection() {
@@ -3861,6 +3927,22 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     };
   }
 
+  function clearCanvasHover() {
+    const hadHover = Boolean(hoveredId || hoveredRegion || hoveredOwnerStackId)
+      || records.some((record) => interactiveHandlesForRecord(record)
+        .some((handle) => handle.classList.contains('hovered')));
+    hoveredId = null;
+    hoveredOwnerStackId = null;
+    hoveredRegion = null;
+    hoverLayer.replaceChildren();
+    records.forEach((record) => interactiveHandlesForRecord(record)
+      .forEach((handle) => handle.classList.remove('hovered')));
+    if (hadHover) {
+      canvasHoverListeners.forEach((listener) => listener({ recordId: null, stackId: null }));
+      syncState();
+    }
+  }
+
   function updateHover(event) {
     if (panStart || windowSelect || handleDrag || dimensionLineDrag || shapeDrag || imageTools.isDragging()) return;
     const previousHoveredId = hoveredId;
@@ -3884,10 +3966,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const hasHoveredHandle = records.some((record) => interactiveHandlesForRecord(record)
       .some((handle) => handle.classList.contains('hovered')));
     if (previousHoveredOwnerStackId !== hoveredOwnerStackId) {
-      canvasHoverListeners.forEach((listener) => listener({
-        recordId: hoveredId,
-        stackId: hoveredOwnerStackId,
-      }));
+      emitCanvasHover();
     }
     if (previousHoveredId !== hoveredId || previouslyHoveredHandle !== hasHoveredHandle || hasHoveredHandle) syncState();
   }
@@ -4000,14 +4079,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   canvas.addEventListener('pointerleave', () => {
     if (panStart || windowSelect || handleDrag || dimensionLineDrag || shapeDrag || imageTools.isDragging()) return;
-    const hadHover = Boolean(hoveredId || hoveredOwnerStackId);
-    hoveredId = null;
-    hoveredOwnerStackId = null;
-    records.forEach((record) => interactiveHandlesForRecord(record)
-      .forEach((handle) => handle.classList.remove('hovered')));
-    if (!hadHover) return;
-    canvasHoverListeners.forEach((listener) => listener({ recordId: null, stackId: null }));
-    syncState();
+    clearCanvasHover();
   });
 
   canvas.addEventListener('pointerup', (event) => {
@@ -4157,6 +4229,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     addDimension,
     clearDrawing,
     getDrawingData: drawingSnapshot,
+    getProcessingDrawingData: processingDrawingSnapshot,
     solveDrawing,
     loadDrawingData,
     insertDrawingData,
@@ -4177,12 +4250,17 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     getObjectPaintOrder() {
       const { anchorRecordIds } = currentDerivedPaintPlan();
       const construction = records.filter((record) => (
-        ['geometry', 'image', 'fillet'].includes(record.recordType)
+        stackProcessingScope.recordEnabled(record)
+        && ['geometry', 'image', 'fillet'].includes(record.recordType)
         && record.entity.construction
         && !anchorRecordIds.has(record.id)
       ));
-      const notches = records.filter((record) => record.recordType === 'notch');
-      const dimensions = records.filter((record) => record.recordType === 'dimension');
+      const notches = records.filter((record) => (
+        record.recordType === 'notch' && stackProcessingScope.recordEnabled(record)
+      ));
+      const dimensions = records.filter((record) => (
+        record.recordType === 'dimension' && stackProcessingScope.recordEnabled(record)
+      ));
       return [...editableStackOrder(), ...construction, ...notches, ...dimensions]
         .map((record) => record.id);
     },
@@ -4212,6 +4290,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     getObjectCount() {
       return records.length;
+    },
+    isStackEnabled(stackId) {
+      return stackProcessingScope.stackEnabled(stackId);
+    },
+    isStackRelationshipAvailable(relationship) {
+      return stackProcessingScope.relationshipEnabled(relationship);
     },
     getSelectedRecordIds() {
       return [...selectedIds];
@@ -4431,7 +4515,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     },
     onCanvasHover(listener) {
       canvasHoverListeners.add(listener);
-      listener({ recordId: hoveredId, stackId: hoveredOwnerStackId });
+      listener(canvasToolInteractionActive()
+        ? { recordId: null, stackId: null }
+        : { recordId: hoveredId, stackId: hoveredOwnerStackId });
       return () => canvasHoverListeners.delete(listener);
     },
     getSelectionProperties: selectionProperties,
@@ -4471,7 +4557,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     setSelectedConstruction,
     arrangeSelectedGeometry,
     setDrawingMode(value) {
-      drawingMode = value;
+      drawingMode = Boolean(value);
+      syncCanvasToolHitTesting();
+      emitCanvasHover();
       if (!drawingMode) clearPreview();
     },
     setDrawingToolDelegate(delegate) {
@@ -4483,10 +4571,20 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     setFeatureCommandDelegate(delegate) {
       featureCommandDelegate = delegate;
       objectLayer.classList.toggle('feature-command-active', Boolean(featureCommandDelegate));
+      syncCanvasToolHitTesting();
+      emitCanvasHover();
       if (!featureCommandDelegate) {
         setSmartDimensionFeatureSelection([]);
       }
       syncState();
+    },
+    setInactiveStackHitTestingBlocked(owner, blocked) {
+      const key = String(owner || '').trim();
+      if (!key) return false;
+      if (blocked) inactiveStackHitTestBlockers.add(key);
+      else inactiveStackHitTestBlockers.delete(key);
+      syncCanvasToolHitTesting();
+      return true;
     },
     setOriginPointEnabled(enabled) {
       originPoint.classList.toggle('enabled', Boolean(enabled));
@@ -4512,6 +4610,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     setDimensionPreview,
     setSmartDimensionDelegate(delegate) {
       smartDimensionDelegate = delegate;
+      syncCanvasToolHitTesting();
+      emitCanvasHover();
       if (!smartDimensionDelegate) {
         setSmartDimensionFeatureSelection([]);
         clearPreview();

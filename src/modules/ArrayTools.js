@@ -663,8 +663,13 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function entityMap() {
-    return new Map((canvas.getDrawingData().entities || []).map((entity) => [entity.id, entity]));
+    const drawing = canvas.getProcessingDrawingData?.() || canvas.getDrawingData();
+    return new Map((drawing.entities || []).map((entity) => [entity.id, entity]));
   }
+
+  const definitionProcessingEnabled = (definition) => (
+    canvas.isStackEnabled?.(definition?.stackId) !== false
+  );
 
   function evaluateDefinition(definition, bounds) {
     const resolvedBounds = bounds === undefined ? sourceBounds(definition.sourceIds) : bounds;
@@ -759,7 +764,7 @@ export function createArrayTools({ toolbar, canvas }) {
 
   const subtractOperandProvider = {
     owners(baseOwners = []) {
-      return arrays.flatMap((definition) => {
+      return arrays.filter(definitionProcessingEnabled).flatMap((definition) => {
         const bounds = sourceBounds(definition.sourceIds);
         const evaluated = evaluateDefinition(definition, bounds);
         if (!evaluated.valid) return [];
@@ -898,6 +903,7 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function renderDefinition(definition, entities) {
+    if (!definitionProcessingEnabled(definition)) return;
     const stackId = definition.stackId;
     const stackVisible = canvas.isStackVisible?.(stackId) !== false;
     const stackActive = !canvas.getActiveStackId?.() || canvas.isStackActive?.(stackId) !== false;
@@ -940,14 +946,16 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function definitionsForRender() {
-    if (!editingDraft) return [...arrays];
+    if (!editingDraft) return arrays.filter(definitionProcessingEnabled);
     const existing = arrays.some(({ id }) => id === editingDraft.id);
     const evaluated = evaluateDefinition(editingDraft, editingSourceBounds);
     const draftIsRenderable = evaluated.valid
       && (editingDraft.arrayType !== 'circular' || Boolean(resolveCenter(editingDraft)));
-    if (!draftIsRenderable) return [...arrays];
-    if (!existing) return [...arrays, editingDraft];
-    return arrays.map((definition) => definition.id === editingDraft.id ? editingDraft : definition);
+    if (!draftIsRenderable) return arrays.filter(definitionProcessingEnabled);
+    if (!existing) return [...arrays, editingDraft].filter(definitionProcessingEnabled);
+    return arrays
+      .map((definition) => definition.id === editingDraft.id ? editingDraft : definition)
+      .filter(definitionProcessingEnabled);
   }
 
   function syncCenterHandle() {
@@ -1220,6 +1228,7 @@ export function createArrayTools({ toolbar, canvas }) {
 
   function updateButton() {
     const active = !popup.hidden;
+    canvas.setInactiveStackHitTestingBlocked?.('array-tools', active);
     button?.classList.toggle('active', active);
     button?.setAttribute('aria-pressed', String(active));
   }
@@ -1418,6 +1427,7 @@ export function createArrayTools({ toolbar, canvas }) {
       editingSourceBounds = null;
       popup.hidden = true;
       mode = 'idle';
+      updateButton();
     }
     renderNow();
     canvas.notifyObjectChange({ history: history ? 'commit' : 'none' });
@@ -1479,6 +1489,7 @@ export function createArrayTools({ toolbar, canvas }) {
       editingSourceBounds = null;
       popup.hidden = true;
       mode = 'idle';
+      updateButton();
     }
     renderNow();
     return true;
@@ -1739,7 +1750,7 @@ export function createArrayTools({ toolbar, canvas }) {
     commitDraft();
   });
   canvas.onObjectsChange(() => {
-    arrays.forEach((definition) => {
+    arrays.filter(definitionProcessingEnabled).forEach((definition) => {
       const center = definition.arrayType === 'circular' ? resolveCenter(definition) : null;
       if (center) definition.centerPoint = [...center];
     });
@@ -1770,6 +1781,7 @@ export function createArrayTools({ toolbar, canvas }) {
       editingSourceBounds = null;
       popup.hidden = true;
       mode = 'idle';
+      updateButton();
       render();
     },
     clear() {
@@ -1779,6 +1791,7 @@ export function createArrayTools({ toolbar, canvas }) {
       editingSourceBounds = null;
       popup.hidden = true;
       mode = 'idle';
+      updateButton();
       objectLayer.querySelectorAll('.array-group').forEach((node) => node.remove());
     },
   });

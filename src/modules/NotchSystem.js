@@ -1223,6 +1223,7 @@ export function createNotchSystem({
   reapplySolverSnapshot,
   getScale = () => 1,
   assignStack = (entity) => entity,
+  isRecordProcessingEnabled = () => true,
 }) {
   let valueOnly = false;
   const inwardResolver = (host, context = null) => (point, tangent) => inwardTargetForHost(host, point, tangent, context);
@@ -1381,6 +1382,7 @@ export function createNotchSystem({
     const dimensionedNotchIds = new Set();
     records.filter((record) => (
       record.recordType === 'dimension'
+      && isRecordProcessingEnabled(record)
       && record.entity.dimensionMode === 'driving'
       && record.entity.externalDrivingTarget?.type === 'notch-distance'
       && (!changedRecordIds || (() => {
@@ -1393,6 +1395,7 @@ export function createNotchSystem({
     )).forEach((record) => {
       const notch = records.find((candidate) => (
         candidate.recordType === 'notch'
+        && isRecordProcessingEnabled(candidate)
         && candidate.id === record.entity.externalDrivingTarget.recordId
       ));
       const feature = notch && featureForHost(notch.entity.host, notch.entity);
@@ -1430,6 +1433,7 @@ export function createNotchSystem({
     });
     records.filter((record) => (
       record.recordType === 'notch'
+      && isRecordProcessingEnabled(record)
       && record.entity.locationMemory
       && notchDependsOnRecordIds(record.entity, changedRecordIds)
     ))
@@ -1562,18 +1566,19 @@ export function createNotchSystem({
   function refresh(changedRecordIds = null) {
     records.filter((record) => (
       record.recordType === 'notch'
+      && isRecordProcessingEnabled(record)
       && notchDependsOnRecordIds(record.entity, changedRecordIds)
     )).forEach(updateRecord);
   }
 
   function setValueOnly(value) {
     valueOnly = Boolean(value);
-    records.filter((record) => record.recordType === 'notch')
+    records.filter((record) => record.recordType === 'notch' && isRecordProcessingEnabled(record))
       .forEach((record) => record.group.classList.toggle('value-only', valueOnly));
   }
 
   function syncScreenScale(scale) {
-    records.filter((record) => record.recordType === 'notch')
+    records.filter((record) => record.recordType === 'notch' && isRecordProcessingEnabled(record))
       .forEach((record) => record.dot.setAttribute('r', notchDotRadiusForScale(scale)));
   }
 

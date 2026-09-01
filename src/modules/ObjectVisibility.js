@@ -145,6 +145,7 @@ export function createObjectVisibilitySystem({
   owners = () => [],
   ownerForRecord = () => null,
   additionalVisibilityRecord = () => false,
+  isRecordProcessingEnabled = () => true,
   evaluateExpression = null,
   resolveEntityAppearance = (entity) => entity?.appearance || {},
   applyEntityAppearanceOverrides = (entity, appearance) => ({ ...entity, appearance }),
@@ -169,14 +170,17 @@ export function createObjectVisibilitySystem({
     );
   }
 
-  function visibilityOwners() {
+  function visibilityOwners({ processingOnly = false } = {}) {
     const result = new Map();
     (owners() || []).forEach((owner) => {
       if (owner?.id) result.set(owner.id, owner);
     });
     const coveredRecordIds = new Set([...result.values()]
       .flatMap((owner) => owner.recordIds || []));
-    records.filter(isStandaloneVisibilityRecord).forEach((record) => {
+    records.filter((record) => (
+      isStandaloneVisibilityRecord(record)
+      && (!processingOnly || isRecordProcessingEnabled(record))
+    )).forEach((record) => {
       if (!coveredRecordIds.has(record.id)) {
         result.set(record.id, singleRecordVisibilityOwner(record));
       }
@@ -296,16 +300,18 @@ export function createObjectVisibilitySystem({
   }
 
   function syncPresentation(regionNodes = []) {
-    const next = new Map(records.map((record) => [record.id, true]));
-    visibilityOwners().forEach((owner) => {
+    const processingRecords = records.filter(isRecordProcessingEnabled);
+    const next = new Map(processingRecords.map((record) => [record.id, true]));
+    visibilityOwners({ processingOnly: true }).forEach((owner) => {
       const state = stateForOwner(owner);
       (owner.recordIds || []).forEach((recordId) => {
+        if (!next.has(recordId)) return;
         next.set(recordId, state.value);
         const record = records.find((candidate) => candidate.id === recordId);
         if (record) record.visibilityError = state.error;
       });
     });
-    records.forEach((record) => {
+    processingRecords.forEach((record) => {
       const entity = record.entity;
       if (entity?.composite?.kind === 'finish-size-offset') {
         const sourceIds = unique((entity.composite.sourceFeatures || []).map(({ recordId }) => recordId));
@@ -315,7 +321,7 @@ export function createObjectVisibilitySystem({
       }
     });
     visibleByRecordId = next;
-    records.forEach((record) => {
+    processingRecords.forEach((record) => {
       const visible = next.get(record.id) !== false;
       record.group?.classList?.toggle(OBJECT_VISIBILITY_HIDDEN_CLASS, !visible);
       record.group?.setAttribute?.('data-object-visible', String(visible));

@@ -277,24 +277,56 @@ export class ParameterRepository {
   }
 
   isEntryAvailable(entry) {
+    return this.isEntryAvailableForStackIds(entry, this.enabledStackIds);
+  }
+
+  isEntryAvailableForStackIds(entry, enabledStackIds) {
     return entry?.kind !== 'dimension'
-      || this.enabledStackIds === null
-      || this.enabledStackIds.has(entry.stackId || this.defaultStackId());
+      || enabledStackIds === null
+      || [
+        entry.stackId || this.defaultStackId(),
+        ...(entry.participantStackIds || []),
+      ].every((stackId) => enabledStackIds.has(stackId));
+  }
+
+  unavailableStackId(entry) {
+    if (entry?.kind !== 'dimension' || this.enabledStackIds === null) return null;
+    return [
+      entry.stackId || this.defaultStackId(),
+      ...(entry.participantStackIds || []),
+    ].find((stackId) => !this.enabledStackIds.has(stackId)) || null;
+  }
+
+  computedDependencyIds(entryIds = []) {
+    const result = new Set();
+    const visited = new Set();
+    const pending = [...new Set(entryIds || [])];
+    while (pending.length) {
+      const id = pending.pop();
+      if (!id || visited.has(id)) continue;
+      visited.add(id);
+      const entry = this.entries.get(id);
+      if (entry?.computed && this.isEntryAvailable(entry)) result.add(id);
+      this.dependencies.get(id)?.forEach((dependencyId) => {
+        if (this.entries.has(dependencyId)) pending.push(dependencyId);
+      });
+    }
+    return result;
   }
 
   assertEntryAvailable(entry, referencedName = entry?.name) {
     if (this.isEntryAvailable(entry)) return;
-    const stackId = entry.stackId || this.defaultStackId();
+    const stackId = this.unavailableStackId(entry) || entry.stackId || this.defaultStackId();
     const stackName = this.stackNamesById.get(stackId) || stackId;
     throw new Error(`Dimension ${this.qualifiedName(entry) || referencedName} is unavailable because Stack "${stackName}" is disabled.`);
   }
 
   setEnabledStackIds(stackIds = null, { emit = true } = {}) {
     const next = stackIds === null ? null : new Set([...stackIds].map(String));
-    const changed = [...this.entries.values()].some((entry) => entry.kind === 'dimension' && (
-      this.enabledStackIds === null
-        ? !next?.has(entry.stackId || this.defaultStackId())
-        : next === null || this.enabledStackIds.has(entry.stackId || this.defaultStackId()) !== next.has(entry.stackId || this.defaultStackId())
+    const changed = [...this.entries.values()].some((entry) => (
+      entry.kind === 'dimension'
+      && this.isEntryAvailableForStackIds(entry, this.enabledStackIds)
+        !== this.isEntryAvailableForStackIds(entry, next)
     ));
     this.enabledStackIds = next;
     if (!changed) return false;
@@ -835,12 +867,16 @@ export class ParameterRepository {
   }
 
   evaluateDirty({ strict = true, refreshComputed = true, refreshComputedIds = null } = {}) {
+    const requestedComputedIds = refreshComputedIds === null
+      ? null
+      : new Set(refreshComputedIds);
     if (refreshComputed) {
       this.entries.forEach((entry, id) => {
         if (
           entry.computed
+          && this.isEntryAvailable(entry)
           && this.computedResolvers.has(id)
-          && (!refreshComputedIds || refreshComputedIds.has(id))
+          && (requestedComputedIds === null || requestedComputedIds.has(id))
         ) this.markDirty(id);
       });
     }
@@ -940,6 +976,10 @@ export class ParameterRepository {
     for (const id of [...this.dirtyEntries]) {
       const entry = this.entries.get(id);
       if (!entry) continue;
+      if (!this.isEntryAvailable(entry)) {
+        this.dirtyEntries.delete(id);
+        continue;
+      }
       try {
         evaluate(id);
       } catch (error) {
@@ -952,7 +992,7 @@ export class ParameterRepository {
 
   setComputedValue(id, value, unit = null) {
     const entry = this.entries.get(id);
-    if (!entry?.computed) return false;
+    if (!entry?.computed || !this.isEntryAvailable(entry)) return false;
     entry.value = Number(value);
     if (unit) entry.unit = unit;
     entry.expression = this.formatValue(entry.value, entry.unit);

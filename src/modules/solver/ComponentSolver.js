@@ -155,6 +155,7 @@ export function solveConstraintComponents({
   graph,
   registry,
   dimensions,
+  computedDimensionIds = null,
   maxIterations,
   tolerance,
   solveMode = 'final',
@@ -181,7 +182,11 @@ export function solveConstraintComponents({
 
   const evaluateParameters = dimensions?.evaluateDirty?.bind(dimensions)
     || dimensions?.evaluateAll?.bind(dimensions);
-  evaluateParameters?.({ strict: false, refreshComputed: true });
+  evaluateParameters?.({
+    strict: false,
+    refreshComputed: true,
+    ...(computedDimensionIds === null ? {} : { refreshComputedIds: computedDimensionIds }),
+  });
 
   for (const component of components) {
     const elapsedMs = now() - startedAt;

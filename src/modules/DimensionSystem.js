@@ -913,6 +913,7 @@ export function createDimensionLinkManager({
   getScale,
   resolveDerivedFeature = () => null,
   derivedFeatureDependsOn = () => false,
+  isRecordProcessingEnabled = () => true,
 }) {
   function resolveRecordEntity(record, rendered = false) {
     return (rendered ? renderedEntityForRecord(record) : null) || record?.entity || null;
@@ -1345,7 +1346,11 @@ export function createDimensionLinkManager({
 
   function refreshLinkedDimensions(changedRecordIds = null) {
     records.forEach((record) => {
-      if (record.recordType !== 'dimension' || !record.entity.anchors) return;
+      if (
+        record.recordType !== 'dimension'
+        || !isRecordProcessingEnabled(record)
+        || !record.entity.anchors
+      ) return;
       const anchorIds = dimensionAnchorRecordIds(record.entity);
       if (changedRecordIds && ![...anchorIds].some((id) => (
         changedRecordIds.has(id) || derivedFeatureDependsOn(id, changedRecordIds)
@@ -2064,6 +2069,7 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
   }
 
   const delegate = {
+    allowInactiveStackInteraction: true,
     get mode() {
       return activeMode;
     },

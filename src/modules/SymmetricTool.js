@@ -428,7 +428,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
 
   if (!objectLayer) return { activate: () => false, cancel: () => false, render: () => {}, definitions: () => [], selectedDefinition: () => null, derivedDimensionProvider: {}, constraintOperation: {} };
 
-  const snapshot = () => canvas.getDrawingData();
+  const snapshot = () => canvas.getProcessingDrawingData?.() || canvas.getDrawingData();
   const entityMap = () => new Map((snapshot().entities || []).map((entity) => [entity.id, entity]));
   const escaped = (value) => globalThis.CSS?.escape ? CSS.escape(String(value)) : String(value).replace(/["\\]/g, '\\$&');
   const recordNode = (id) => svg.querySelector(`.canvas-record[data-record-id="${escaped(id)}"]`);
@@ -582,6 +582,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
   }
 
   function renderDefinition(definition, entities) {
+    if (canvas.isStackEnabled?.(definition?.stackId) === false) return;
     const matrix = definitionMatrix(definition);
     const template = matrix && templateFor(definition, entities);
     if (!template?.childNodes.length) return;
@@ -628,7 +629,9 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     renderFrame = null;
     objectLayer.querySelectorAll('.linked-copy-group').forEach((node) => node.remove());
     const entities = entityMap();
-    definitions.forEach((definition) => renderDefinition(definition, entities));
+    definitions
+      .filter((definition) => canvas.isStackEnabled?.(definition?.stackId) !== false)
+      .forEach((definition) => renderDefinition(definition, entities));
     syncSourceHighlights();
     canvas.syncGeometryStacking?.();
   }
@@ -862,6 +865,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     linkedPositionAnnotations().forEach((annotation) => {
       const target = annotation.externalDrivingTarget;
       if (appliedCopyIds.has(target.copyId)) return;
+      if (canvas.isStackRelationshipAvailable?.(annotation) === false) return;
       const entry = parameterMap.get(annotation.dimensionId);
       if (!entry || entry.enabled === false) return;
       const applied = applyLinkedPositionTarget(target, entry.value);
@@ -932,7 +936,9 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       renderNow();
       return { constraint: clone(constraint) };
     },
-    constraints: () => positionConstraints.map(clone),
+    constraints: () => positionConstraints
+      .filter((constraint) => canvas.isStackRelationshipAvailable?.(constraint) !== false)
+      .map(clone),
     resolveFeature: (request) => derivedDimensionProvider.resolveFeature(request),
     dependsOn(constraint, changedRecordIds) {
       return (constraint?.featureRefs || []).some(({ recordId }) => (

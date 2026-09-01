@@ -1254,6 +1254,7 @@ export function createSubtractSystem({
   notifyObjectChange = () => {},
   syncState = () => {},
   showStatusMessage = () => {},
+  isRecordProcessingEnabled = () => true,
 }) {
   let presentationDependencyRecordIds = new Set();
   const subtractResultNodes = new Map();
@@ -1386,6 +1387,7 @@ export function createSubtractSystem({
     const group = records
       .filter((candidate) => (
         candidate.recordType === 'geometry'
+        && isRecordProcessingEnabled(candidate)
         && candidate.entity.composite?.closed === true
         && candidate.entity.composite.id === composite.id
         && !candidate.entity.construction
@@ -1400,7 +1402,10 @@ export function createSubtractSystem({
   function resolvedBoundaries() {
     if (typeof getResolvedBoundaries === 'function') return getResolvedBoundaries();
     const drawable = records
-      .filter((record) => record.recordType === 'geometry' || record.recordType === 'fillet')
+      .filter((record) => (
+        isRecordProcessingEnabled(record)
+        && (record.recordType === 'geometry' || record.recordType === 'fillet')
+      ))
       .map((record) => record.entity);
     return resolveClosedBoundaries(drawable, solver.constraints?.() || []);
   }
@@ -1447,7 +1452,7 @@ export function createSubtractSystem({
 
   function ownerForRecord(recordId, boundaries = null) {
     const record = records.find((candidate) => candidate.id === recordId && candidate.recordType === 'geometry');
-    if (!record) return null;
+    if (!record || !isRecordProcessingEnabled(record)) return null;
     const currentBoundaries = boundaries || resolvedBoundaries();
     if (isSubtractableEntity(record.entity)) {
       const owner = { id: record.id, entity: record.entity, recordIds: [record.id], kind: 'primitive' };
@@ -1494,7 +1499,9 @@ export function createSubtractSystem({
   function owners() {
     const result = new Map();
     const boundaries = resolvedBoundaries();
-    records.filter((record) => record.recordType === 'geometry').forEach((record) => {
+    records.filter((record) => (
+      record.recordType === 'geometry' && isRecordProcessingEnabled(record)
+    )).forEach((record) => {
       const owner = ownerForRecord(record.id, boundaries);
       if (owner && !result.has(owner.id)) result.set(owner.id, owner);
     });
@@ -1764,8 +1771,12 @@ export function createSubtractSystem({
       markSourceOwner(owner);
       createResultPresentation(owner, plan);
     });
-    records.filter((record) => record.recordType === 'geometry').forEach(applyGeometryAppearance);
-    records.filter((record) => record.recordType === 'geometry').forEach(applySourcePresentation);
+    records.filter((record) => (
+      record.recordType === 'geometry' && isRecordProcessingEnabled(record)
+    )).forEach(applyGeometryAppearance);
+    records.filter((record) => (
+      record.recordType === 'geometry' && isRecordProcessingEnabled(record)
+    )).forEach(applySourcePresentation);
     applyRegionPresentation();
     const currentOwners = owners();
     const baseCutters = currentOwners.filter((owner) => isSubtractCutterEntity(owner.entity));

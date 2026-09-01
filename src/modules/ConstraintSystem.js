@@ -494,6 +494,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
       constraint.source !== 'dimension'
       && constraint.featureRefs?.length
       && constraintIconPaths[constraint.type]
+      && canvas.isStackRelationshipAvailable?.(constraint) !== false
       && constraintReferencesActiveStack(
         constraint,
         (recordId) => canvas.isRecordInActiveStack?.(recordId) !== false,
@@ -714,6 +715,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
   }
 
   const delegate = {
+    allowInactiveStackInteraction: true,
     pointerDown(event) {
       if (!activeConstraint || event.button !== 0) return false;
       const feature = constraintFeatureFromEvent(canvas, event);
