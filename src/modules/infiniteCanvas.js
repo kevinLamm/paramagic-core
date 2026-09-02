@@ -1,5 +1,6 @@
 import {
   createDimensionLinkManager,
+  createDimensionEditPanel,
   createDimensionRecord,
   createDimensionValueOnlyPersistence,
   dimensionAnchorRecordIds,
@@ -138,7 +139,17 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   let stackActivationSystem = null;
   let stackActivationCoordinator = null;
   const selectionBox = document.createElement('div');
-  const dimensionEditPanel = document.createElement('div');
+  const dimensionEditController = createDimensionEditPanel({
+    onSubmit: () => submitDimensionEditPanel(),
+    onCancel: () => closeDimensionEditPanel(),
+  });
+  const {
+    panel: dimensionEditPanel,
+    input: dimensionEditInput,
+    labelText: dimensionEditLabelText,
+    options: dimensionEditOptions,
+    error: dimensionEditError,
+  } = dimensionEditController;
   const stackSystem = createStackSystem({
     records,
     selectedIds,
@@ -236,16 +247,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
 
   selectionBox.className = 'selection-window';
-  dimensionEditPanel.className = 'dimension-edit-panel';
-  dimensionEditPanel.hidden = true;
-  dimensionEditPanel.innerHTML = `
-    <label class="dimension-edit-label">
-      <span>Dimension</span>
-      <input class="dimension-edit-input" list="dimensionEditParameterNames" autocomplete="off" spellcheck="false" />
-    </label>
-    <datalist id="dimensionEditParameterNames"></datalist>
-    <p class="dimension-edit-error" role="alert" aria-live="polite"></p>
-  `;
   canvas.append(selectionBox, dimensionEditPanel);
   stackHoverLayer.setAttribute('class', 'canvas-stack-hover-layer');
   hoverLayer.setAttribute('class', 'canvas-hover-layer');
@@ -352,10 +353,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     notifyObjectChange,
   });
 
-  const dimensionEditInput = dimensionEditPanel.querySelector('.dimension-edit-input');
-  const dimensionEditLabelText = dimensionEditPanel.querySelector('.dimension-edit-label > span');
-  const dimensionEditOptions = dimensionEditPanel.querySelector('#dimensionEditParameterNames');
-  const dimensionEditError = dimensionEditPanel.querySelector('.dimension-edit-error');
   const persistDimensionValueOnly = createDimensionValueOnlyPersistence({
     solver,
     onChange: () => notifyObjectChange({ history: 'commit' }),
@@ -471,21 +468,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
   selectionPropertyProviders.add({
     selectionProperties: () => tableTools.selectionProperties(selectedIds),
-  });
-
-  dimensionEditPanel.addEventListener('pointerdown', (event) => event.stopPropagation());
-  dimensionEditPanel.addEventListener('click', (event) => event.stopPropagation());
-  dimensionEditPanel.addEventListener('dblclick', (event) => event.stopPropagation());
-  dimensionEditPanel.addEventListener('keydown', (event) => event.stopPropagation());
-  dimensionEditInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      submitDimensionEditPanel();
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeDimensionEditPanel();
-    }
   });
 
   function add(parent, tag, attrs) {
@@ -2285,6 +2267,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     dimensionEditError.textContent = '';
     dimensionEditPanel.classList.remove('invalid');
     dimensionEditPanel.hidden = false;
+    dimensionEditController.resizeInput();
     positionDimensionEditPanel();
     requestAnimationFrame(() => {
       positionDimensionEditPanel();

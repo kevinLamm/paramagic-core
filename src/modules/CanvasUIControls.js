@@ -11,6 +11,7 @@ registerIdentitySchema('controls', {
 
 // --- Floating Panel Positioning & Drag Utilities ---
 const FLOATING_PANEL_MIN_TOP_PROPERTY = '--floating-panel-min-top';
+const FLOATING_PANEL_MIN_LEFT_PROPERTY = '--floating-panel-min-left';
 const FLOATING_PANEL_MAX_RIGHT_PROPERTY = '--floating-panel-max-right';
 const FLOATING_PANEL_BOUNDARY_EVENT = 'paramagic:floating-panel-boundary-change';
 const TOOLBAR_CONTENT_RESIZE_EVENT = 'paramagic:toolbar-content-resize';
@@ -20,8 +21,30 @@ const TOOL_HEADER_DENSITIES = Object.freeze([
   { size: 32, iconBox: 30, iconSize: 24, toolGap: 2, sectionGap: 4 },
 ]);
 
+export function setActiveStackToolAvailability(root, activeStackId) {
+  const available = Boolean(activeStackId);
+  const controls = [...(root?.querySelectorAll?.(
+    '[data-drawing-tool], [data-requires-active-stack]',
+  ) || [])];
+  controls.forEach((control) => {
+    control.disabled = !available;
+    if (!available && control.hasAttribute?.('aria-expanded')) {
+      control.setAttribute('aria-expanded', 'false');
+    }
+  });
+  if (!available) {
+    [...(root?.querySelectorAll?.('.menu-tool.open, .constraint-menu.open') || [])]
+      .forEach((menu) => menu.classList.remove('open'));
+  }
+  return { available, controls };
+}
+
 export function floatingPanelMinimumTop(rect = {}, { gap = 8 } = {}) {
   return Math.max(0, Number(rect.bottom) || 0) + Math.max(0, Number(gap) || 0);
+}
+
+export function floatingPanelMinimumLeft(rect = {}, { gap = 8 } = {}) {
+  return Math.max(0, Number(rect.right) || 0) + Math.max(0, Number(gap) || 0);
 }
 
 export function floatingPanelMaximumRight(rect = {}, { gap = 8, viewportWidth = 0 } = {}) {
@@ -40,6 +63,13 @@ function configuredPanelMinTop(fallback = 8) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function configuredPanelMinLeft(fallback = 8) {
+  if (!globalThis.document || !globalThis.getComputedStyle) return fallback;
+  const value = Number.parseFloat(getComputedStyle(document.documentElement)
+    .getPropertyValue(FLOATING_PANEL_MIN_LEFT_PROPERTY));
+  return Number.isFinite(value) ? value : fallback;
+}
+
 function configuredPanelMaxRight(fallback = globalThis.window?.innerWidth || 0) {
   if (!globalThis.document || !globalThis.getComputedStyle) return fallback;
   const value = Number.parseFloat(getComputedStyle(document.documentElement)
@@ -51,6 +81,12 @@ function resolvedPanelMinTop(minTop, fallback) {
   if (typeof minTop === 'function') return Number(minTop()) || fallback;
   if (minTop !== null && minTop !== undefined) return Number(minTop) || fallback;
   return configuredPanelMinTop(fallback);
+}
+
+function resolvedPanelMinLeft(minLeft, fallback) {
+  if (typeof minLeft === 'function') return Number(minLeft()) || fallback;
+  if (minLeft !== null && minLeft !== undefined) return Number(minLeft) || fallback;
+  return configuredPanelMinLeft(fallback);
 }
 
 function resolvedPanelMaxRight(maxRight, fallback) {
@@ -247,11 +283,16 @@ export function positionHeaderToolMenu(trigger, menu, options = {}) {
 export function bindFloatingPanelBoundary(element, {
   gap = 8,
   root = globalThis.document?.documentElement,
+  leftSidebar = null,
   rightRail = null,
 } = {}) {
   if (!element || !root || !globalThis.window) return { update() {}, destroy() {} };
   const update = () => {
     const minTop = floatingPanelMinimumTop(element.getBoundingClientRect(), { gap });
+    const sidebarRect = leftSidebar && !leftSidebar.hidden
+      ? leftSidebar.getBoundingClientRect()
+      : {};
+    const minLeft = floatingPanelMinimumLeft(sidebarRect, { gap });
     const railRect = rightRail && !rightRail.hidden
       ? rightRail.getBoundingClientRect()
       : {};
@@ -260,12 +301,14 @@ export function bindFloatingPanelBoundary(element, {
       viewportWidth: window.innerWidth,
     });
     root.style.setProperty(FLOATING_PANEL_MIN_TOP_PROPERTY, `${Math.ceil(minTop)}px`);
+    root.style.setProperty(FLOATING_PANEL_MIN_LEFT_PROPERTY, `${Math.ceil(minLeft)}px`);
     root.style.setProperty(FLOATING_PANEL_MAX_RIGHT_PROPERTY, `${Math.floor(maxRight)}px`);
     window.dispatchEvent(new Event(FLOATING_PANEL_BOUNDARY_EVENT));
-    return { minTop, maxRight };
+    return { minTop, minLeft, maxRight };
   };
   const observer = globalThis.ResizeObserver ? new ResizeObserver(update) : null;
   observer?.observe(element);
+  if (leftSidebar) observer?.observe(leftSidebar);
   if (rightRail) observer?.observe(rightRail);
   window.addEventListener('resize', update);
   update();
@@ -282,6 +325,7 @@ export function clampPanelPosition({ left, top, width, height }, {
   viewportWidth,
   viewportHeight,
   margin = 8,
+  minLeft = margin,
   minTop = margin,
   maxRight = viewportWidth - margin,
 } = {}) {
@@ -290,26 +334,36 @@ export function clampPanelPosition({ left, top, width, height }, {
   const safeWidth = Math.max(0, Number(width) || 0);
   const safeHeight = Math.max(0, Number(height) || 0);
   const safeMargin = Math.max(0, Number(margin) || 0);
+  const safeMinLeft = Math.max(safeMargin, Math.min(
+    safeViewportWidth - safeMargin,
+    Number(minLeft) || safeMargin,
+  ));
   const safeMinTop = Math.max(0, Number(minTop) || 0);
-  const safeMaxRight = Math.max(safeMargin, Math.min(
+  const safeMaxRight = Math.max(safeMinLeft, Math.min(
     safeViewportWidth - safeMargin,
     Number(maxRight) || safeViewportWidth - safeMargin,
   ));
-  const maxLeft = Math.max(safeMargin, safeMaxRight - safeWidth);
+  const maxLeft = Math.max(safeMinLeft, safeMaxRight - safeWidth);
   const maxTop = Math.max(safeMinTop, safeViewportHeight - safeHeight - safeMargin);
   return {
-    left: Math.max(safeMargin, Math.min(maxLeft, Number(left) || 0)),
+    left: Math.max(safeMinLeft, Math.min(maxLeft, Number(left) || 0)),
     top: Math.max(safeMinTop, Math.min(maxTop, Number(top) || 0)),
   };
 }
 
-export function clampPanelToViewport(panel, { margin = 8, minTop = null, maxRight = null } = {}) {
+export function clampPanelToViewport(panel, {
+  margin = 8,
+  minLeft = null,
+  minTop = null,
+  maxRight = null,
+} = {}) {
   if (!panel || panel.hidden) return null;
   const rect = panel.getBoundingClientRect();
   const position = clampPanelPosition(rect, {
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
     margin,
+    minLeft: resolvedPanelMinLeft(minLeft, margin),
     minTop: resolvedPanelMinTop(minTop, margin),
     maxRight: resolvedPanelMaxRight(maxRight, window.innerWidth - margin),
   });
@@ -321,12 +375,18 @@ export function clampPanelToViewport(panel, { margin = 8, minTop = null, maxRigh
 export function bindFloatingPanelDrag(panel, {
   ignoreSelector = 'button, input, select, textarea, label, [contenteditable="true"]',
   margin = 8,
+  minLeft = null,
   minTop = null,
   maxRight = null,
 } = {}) {
   let drag = null;
 
-  const clamp = () => clampPanelToViewport(panel, { margin, minTop, maxRight });
+  const clamp = () => clampPanelToViewport(panel, {
+    margin,
+    minLeft,
+    minTop,
+    maxRight,
+  });
   const pointerDown = (event) => {
     if (event.button !== 0 || event.target.closest?.(ignoreSelector)) return;
     const rect = panel.getBoundingClientRect();
@@ -351,6 +411,7 @@ export function bindFloatingPanelDrag(panel, {
       viewportWidth: window.innerWidth,
       viewportHeight: window.innerHeight,
       margin,
+      minLeft: resolvedPanelMinLeft(minLeft, margin),
       minTop: resolvedPanelMinTop(minTop, margin),
       maxRight: resolvedPanelMaxRight(maxRight, window.innerWidth - margin),
     });
@@ -385,12 +446,18 @@ export function bindFloatingPanelDrag(panel, {
 
 export function clampTranslatedPanelOffset(panel, offset, options = {}) {
   const rect = panel.getBoundingClientRect();
-  const { minTop = null, maxRight = null, ...clampOptions } = options;
+  const {
+    minLeft = null,
+    minTop = null,
+    maxRight = null,
+    ...clampOptions
+  } = options;
   const margin = clampOptions.margin ?? 8;
   const position = clampPanelPosition(rect, {
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
     ...clampOptions,
+    minLeft: resolvedPanelMinLeft(minLeft, margin),
     minTop: resolvedPanelMinTop(minTop, margin),
     maxRight: resolvedPanelMaxRight(maxRight, window.innerWidth - margin),
   });

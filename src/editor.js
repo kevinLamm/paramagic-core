@@ -42,6 +42,7 @@ export {
   installToolRepeatShortcut,
   positionHeaderToolMenu,
   rememberRepeatableTool,
+  setActiveStackToolAvailability,
 } from './modules/CanvasUIControls.js';
 export { createDrawingClipboard, retargetClipboardDrawing } from './modules/DrawingClipboard.js';
 export { serializePortablePackageJson } from './modules/ImageSystem.js';

@@ -3,6 +3,75 @@ import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from './ArcGeometry.js';
 
+export const DIMENSION_EDIT_INPUT_MINIMUM_HEIGHT = 54;
+export const DIMENSION_EDIT_INPUT_MAXIMUM_HEIGHT = 180;
+
+export function dimensionEditPanelMarkup() {
+  return `
+    <label class="dimension-edit-label">
+      <span>Dimension</span>
+      <textarea class="dimension-edit-input" list="dimensionEditParameterNames" rows="2" wrap="soft" autocomplete="off" spellcheck="false"
+        title="Enter to apply; Shift+Enter for a new line; Escape to cancel"></textarea>
+    </label>
+    <datalist id="dimensionEditParameterNames"></datalist>
+    <p class="dimension-edit-error" role="alert" aria-live="polite"></p>
+  `;
+}
+
+export function dimensionEditInputHeight(
+  scrollHeight,
+  minimumHeight = DIMENSION_EDIT_INPUT_MINIMUM_HEIGHT,
+  maximumHeight = DIMENSION_EDIT_INPUT_MAXIMUM_HEIGHT,
+) {
+  const measuredHeight = Number(scrollHeight);
+  return Math.min(
+    maximumHeight,
+    Math.max(minimumHeight, Number.isFinite(measuredHeight) ? measuredHeight : minimumHeight),
+  );
+}
+
+export function dimensionEditKeyAction({ key, shiftKey = false } = {}) {
+  if (key === 'Escape') return 'cancel';
+  if (key === 'Enter' && !shiftKey) return 'submit';
+  return null;
+}
+
+export function createDimensionEditPanel({
+  documentRef = document,
+  onSubmit = () => {},
+  onCancel = () => {},
+} = {}) {
+  const panel = documentRef.createElement('div');
+  panel.className = 'dimension-edit-panel';
+  panel.hidden = true;
+  panel.innerHTML = dimensionEditPanelMarkup();
+  const input = panel.querySelector('.dimension-edit-input');
+  const labelText = panel.querySelector('.dimension-edit-label > span');
+  const options = panel.querySelector('#dimensionEditParameterNames');
+  const error = panel.querySelector('.dimension-edit-error');
+
+  const resizeInput = () => {
+    input.style.height = 'auto';
+    const height = dimensionEditInputHeight(input.scrollHeight);
+    input.style.height = `${height}px`;
+    input.style.overflowY = input.scrollHeight > DIMENSION_EDIT_INPUT_MAXIMUM_HEIGHT ? 'auto' : 'hidden';
+  };
+
+  ['pointerdown', 'click', 'dblclick', 'keydown'].forEach((name) => {
+    panel.addEventListener(name, (event) => event.stopPropagation());
+  });
+  input.addEventListener('input', resizeInput);
+  input.addEventListener('keydown', (event) => {
+    const action = dimensionEditKeyAction(event);
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'submit') onSubmit();
+    else onCancel();
+  });
+
+  return { panel, input, labelText, options, error, resizeInput };
+}
+
 // --- Dimension Feature Geometry ---
 const dimensionPresentationRecords = new WeakMap();
 

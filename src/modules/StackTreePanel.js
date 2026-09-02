@@ -16,12 +16,12 @@ const icons = {
   eye: icon('<path d="M2.5 12c2.5-4 6-6 9.5-6s7 2 9.5 6c-2.5 4-6 6-9.5 6s-7-2-9.5-6z"/><circle cx="12" cy="12" r="2.5"/>'),
   hidden: icon('<path d="M4 4l16 16M9.2 6.5A10.7 10.7 0 0112 6c6 0 9.5 6 9.5 6a15 15 0 01-2.4 3.1M6.4 8.1C3.9 9.8 2.5 12 2.5 12s3.5 6 9.5 6a10 10 0 003-.5"/>'),
   addChild: icon('<path d="M12 5v14M5 12h14"/>'),
-  rename: icon('<path d="M3 15.5L7.5 4l4.5 11.5M4.8 11h5.4"/><path d="M10.5 20l2.1-5.2 6.7-6.7 3.1 3.1-6.7 6.7-5.2 2.1zM17.8 9.6l3.1 3.1"/>'),
   save: icon('<path d="M5 4h12l3 3v13H5z"/><path d="M8 4v6h8V4M8 20v-7h9v7"/><path d="M18 11h4M20 9v4"/>'),
   delete: icon('<path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/>'),
 };
 
 export const STACK_ENABLE_EXPRESSION_PLACEHOLDER = 'FALSE';
+export const STACK_EXPRESSION_INPUT_MINIMUM_WIDTH = 220;
 
 export function stackVisibilityAvailable(stack) {
   return stack?.effectiveEnabled !== false;
@@ -37,6 +37,27 @@ export function stackDisclosureLabel(expanded, stackName) {
 
 export function stackToolbarAvailable({ active = false, drawingContainer = false } = {}) {
   return active || drawingContainer;
+}
+
+export function stackActivationTarget(stackId, activeStackId) {
+  const requestedStackId = String(stackId || '').trim();
+  if (!requestedStackId) return null;
+  return requestedStackId === activeStackId ? null : requestedStackId;
+}
+
+export function stackToolbarLeft({ rowRight = 0, sidebarRight = rowRight, gap = 4 } = {}) {
+  return Math.round(Math.min(rowRight, sidebarRight) + gap);
+}
+
+export function stackExpressionInputWidth(
+  scrollWidth,
+  minimumWidth = STACK_EXPRESSION_INPUT_MINIMUM_WIDTH,
+) {
+  const measuredWidth = Number(scrollWidth);
+  return Math.max(
+    minimumWidth,
+    Number.isFinite(measuredWidth) ? Math.ceil(measuredWidth + 2) : minimumWidth,
+  );
 }
 
 export function stackIdForCanvasHover(hover = {}, getRecordStackId = () => null, activeStackId = null) {
@@ -137,6 +158,16 @@ export function createStackTreePanel({
     return createStackTreeIndex(runtimeState);
   }
 
+  function resizeExpressionInput(input) {
+    if (!input) return;
+    input.style.width = '';
+    const minimumWidth = Math.max(
+      STACK_EXPRESSION_INPUT_MINIMUM_WIDTH,
+      input.getBoundingClientRect().width,
+    );
+    input.style.width = `${stackExpressionInputWidth(input.scrollWidth, minimumWidth)}px`;
+  }
+
   function createRow(stackId) {
     const row = document.createElement('div');
     row.className = 'stack-tree-row';
@@ -152,7 +183,6 @@ export function createStackTreePanel({
       <button type="button" class="stack-tree-visibility" data-stack-visibility></button>
       <div class="stack-tree-item-toolbar" role="toolbar" aria-label="Stack tools" data-stack-toolbar>
         <button type="button" data-stack-add-child title="Add Child Stack" aria-label="Add Child Stack">${icons.addChild}</button>
-        <button type="button" data-stack-rename title="Rename Stack" aria-label="Rename Stack">${icons.rename}</button>
         <button type="button" class="stack-tree-enabled-switch" role="switch" data-stack-enable aria-checked="false"><span class="stack-tree-switch-track" aria-hidden="true"><span class="stack-tree-switch-thumb"></span></span></button>
         <label class="stack-tree-toolbar-expression" data-stack-expression-container hidden><span class="sr-only">Enabled expression</span><input type="text" data-stack-expression aria-label="Stack enabled expression" list="stackEnableExpressionSymbols" autocomplete="off" spellcheck="false" placeholder="${STACK_ENABLE_EXPRESSION_PLACEHOLDER}" /></label>
         <button type="button" data-stack-save-as title="Save Stack As" aria-label="Save Stack As">${icons.save}</button>
@@ -204,12 +234,9 @@ export function createStackTreePanel({
     const toolbar = row.querySelector('[data-stack-toolbar]');
     toolbar.setAttribute('aria-label', `${stack.name} tools`);
     row.querySelector('[data-stack-add-child]').hidden = drawingContainer;
-    const rename = row.querySelector('[data-stack-rename]');
     const saveAs = row.querySelector('[data-stack-save-as]');
     const remove = row.querySelector('[data-stack-delete]');
     const nodeType = drawingContainer ? 'Drawing' : 'Stack';
-    rename.setAttribute('aria-label', `Rename ${nodeType}`);
-    rename.title = `Rename ${nodeType}`;
     saveAs.setAttribute('aria-label', `Save ${nodeType} As`);
     saveAs.title = `Save ${nodeType} As`;
     remove.setAttribute('aria-label', `Delete ${nodeType}`);
@@ -230,6 +257,7 @@ export function createStackTreePanel({
     }
     expression.setAttribute('aria-invalid', String(Boolean(activationError)));
     expression.title = activationError || 'Blank evaluates to false';
+    resizeExpressionInput(expression);
     const visibility = row.querySelector('[data-stack-visibility]');
     visibility.hidden = !stackVisibilityAvailable(stack);
     visibility.innerHTML = stack.visible === false ? icons.hidden : icons.eye;
@@ -336,7 +364,10 @@ export function createStackTreePanel({
     const toolbar = row?.querySelector('[data-stack-toolbar]');
     if (!toolbar) return;
     const bounds = row.getBoundingClientRect();
-    toolbar.style.left = `${Math.round(bounds.right + 4)}px`;
+    toolbar.style.left = `${stackToolbarLeft({
+      rowRight: bounds.right,
+      sidebarRight: host.getBoundingClientRect().right,
+    })}px`;
     toolbar.style.top = `${Math.round(bounds.top + (bounds.height - (toolbar.offsetHeight || 40)) / 2)}px`;
   }
 
@@ -418,8 +449,6 @@ export function createStackTreePanel({
         });
       } else if (event.target.closest('[data-stack-add-child]') && stack.kind !== DRAWING_NODE_KIND) {
         canvas.addChildStack(stackId);
-      } else if (event.target.closest('[data-stack-rename]')) {
-        focusNameInput(stackId);
       } else if (event.target.closest('[data-stack-save-as]')) {
         onSaveAs(stackId);
       } else if (event.target.closest('[data-stack-delete]')) {
@@ -427,15 +456,19 @@ export function createStackTreePanel({
       }
       return;
     }
-    select(stackId);
+    if (event.target.closest('[data-stack-name-input]') || !select(stackId)) return;
+    const stack = runtimeState.stacks.find(({ id }) => id === stackId);
+    if (stack?.kind !== DRAWING_NODE_KIND) {
+      const activeStackId = stackActivationTarget(stackId, runtimeState.activeStackId);
+      canvas.setActiveStack?.(activeStackId);
+      if (activeStackId) positionItemToolbar(row);
+    }
   });
   tree.addEventListener('dblclick', (event) => {
     const row = event.target.closest?.('[data-stack-id]');
     if (!row || event.target.closest('[data-stack-expand], [data-stack-name-input], [data-stack-visibility], [data-stack-toolbar]')) return;
-    const stackId = row.dataset.stackId;
-    const stack = runtimeState.stacks.find(({ id }) => id === stackId);
-    if (stack?.kind === DRAWING_NODE_KIND) return;
-    if (select(stackId)) canvas.setActiveStack?.(runtimeState.activeStackId === stackId ? null : stackId);
+    event.preventDefault();
+    focusNameInput(row.dataset.stackId);
   });
   tree.addEventListener('keydown', (event) => {
     const row = event.target.closest?.('[data-stack-id]');
@@ -523,6 +556,7 @@ export function createStackTreePanel({
     input.setAttribute('aria-invalid', 'false');
     input.title = 'Press Enter or leave the field to apply this expression';
     row.querySelector('[data-stack-status]').textContent = '';
+    resizeExpressionInput(input);
   });
   tree.addEventListener('change', (event) => {
     const row = event.target.closest?.('[data-stack-id]');

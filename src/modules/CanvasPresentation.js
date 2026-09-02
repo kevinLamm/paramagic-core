@@ -54,7 +54,9 @@ export function valueOnlyDimensionText(value) {
   return String(value ?? '').replace(/^.*?=\s*/, '');
 }
 
-export function isCanvasPresentationSourceNode(node, stackId = null) {
+export function isCanvasPresentationSourceNode(node, stackId = null, {
+  dimensionTextMode = 'value',
+} = {}) {
   if (!node) return false;
   if (stackId && node.getAttribute?.('data-stack-id') !== stackId) return false;
   const supported = hasClass(node, 'canvas-record')
@@ -64,26 +66,33 @@ export function isCanvasPresentationSourceNode(node, stackId = null) {
   if (!supported || hasClass(node, 'closed-constrained-region')) return false;
   if (hasClass(node, 'object-visibility-hidden')) return false;
   if (hasClass(node, 'stack-disabled')) return false;
-  if (hasClass(node, 'dimension-export-excluded')) return false;
+  const valueOnly = dimensionTextMode === 'value';
+  if (valueOnly && hasClass(node, 'dimension-export-excluded')) return false;
   const derivedGroup = hasClass(node, 'array-group')
     || hasClass(node, 'linked-copy-group')
     || hasClass(node, 'symmetric-mirror-group');
-  if (!derivedGroup && node.querySelector?.('.construction')) return false;
+  if (valueOnly && !derivedGroup && node.querySelector?.('.construction')) return false;
   return true;
 }
 
 export function sanitizeCanvasPresentationClone(source, {
+  dimensionTextMode = 'value',
+  resolveDimensionText = null,
   resolveValueOnlyDimensionText = null,
 } = {}) {
+  const valueOnly = dimensionTextMode === 'value';
   const cloneNode = source.cloneNode(true);
   replaceDrawingTextForeignObjects(source, cloneNode);
   replaceTableCellForeignObjects(source, cloneNode);
-  prepareNotchValueOnlyPresentationClone(cloneNode);
+  if (valueOnly) prepareNotchValueOnlyPresentationClone(cloneNode);
+  else cloneNode.classList?.remove?.('value-only');
   prepareSubtractPresentationClone(cloneNode);
   cloneNode.querySelectorAll?.(EDITING_UI_SELECTOR).forEach((node) => node.remove());
-  cloneNode.querySelectorAll?.('.array-item-content, .linked-copy-content, .symmetric-mirror-copy').forEach((node) => {
-    if (node.querySelector?.('.construction')) node.remove();
-  });
+  if (valueOnly) {
+    cloneNode.querySelectorAll?.('.array-item-content, .linked-copy-content, .symmetric-mirror-copy').forEach((node) => {
+      if (node.querySelector?.('.construction')) node.remove();
+    });
+  }
   const nodes = [cloneNode, ...(cloneNode.querySelectorAll?.('*') || [])];
   nodes.forEach((node) => {
     TRANSIENT_CLASSES.forEach((name) => node.classList?.remove?.(name));
@@ -97,13 +106,20 @@ export function sanitizeCanvasPresentationClone(source, {
   });
   cloneNode.style?.removeProperty?.('display');
   cloneNode.style?.removeProperty?.('visibility');
-  cloneNode.querySelectorAll?.('.dimension-text').forEach((text) => {
-    text.textContent = valueOnlyDimensionText(text.textContent);
-  });
+  if (valueOnly) {
+    cloneNode.querySelectorAll?.('.dimension-text').forEach((text) => {
+      text.textContent = valueOnlyDimensionText(text.textContent);
+    });
+  }
   prepareDimensionPresentationClone(source, cloneNode);
   const dimensionId = cloneNode.getAttribute?.('data-dimension-id');
-  const resolvedText = dimensionId && typeof resolveValueOnlyDimensionText === 'function'
-    ? resolveValueOnlyDimensionText(dimensionId)
+  const resolver = typeof resolveDimensionText === 'function'
+    ? resolveDimensionText
+    : valueOnly && typeof resolveValueOnlyDimensionText === 'function'
+      ? resolveValueOnlyDimensionText
+      : null;
+  const resolvedText = dimensionId && resolver
+    ? resolver(dimensionId, dimensionTextMode)
     : null;
   if (resolvedText !== null && resolvedText !== undefined && String(resolvedText) !== '') {
     setDimensionPresentationText(cloneNode, resolvedText);
@@ -227,6 +243,8 @@ export function createCanvasPresentationSvg({
   width = 240,
   height = 150,
   background = null,
+  dimensionTextMode = 'value',
+  resolveDimensionText = null,
   resolveValueOnlyDimensionText = null,
   documentRef = globalThis.document,
 } = {}) {
@@ -244,9 +262,11 @@ export function createCanvasPresentationSvg({
   });
   const includedStackIds = stackIds ? new Set(stackIds) : null;
   [...objectLayer.children]
-    .filter((node) => isCanvasPresentationSourceNode(node, stackId)
+    .filter((node) => isCanvasPresentationSourceNode(node, stackId, { dimensionTextMode })
       && (!includedStackIds || includedStackIds.has(node.getAttribute?.('data-stack-id'))))
     .forEach((node) => content.appendChild(sanitizeCanvasPresentationClone(node, {
+      dimensionTextMode,
+      resolveDimensionText,
       resolveValueOnlyDimensionText,
     })));
   clonePresentationDefinitions(objectLayer, content, svg, documentRef);

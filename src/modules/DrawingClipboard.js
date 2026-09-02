@@ -546,6 +546,7 @@ export function createDrawingClipboard({
   }
 
   async function copy() {
+    if (copyButton?.disabled) return false;
     const tableCells = canvas.copySelectedTableCells?.();
     if (tableCells) {
       await writeText(tableCells.text);
@@ -563,6 +564,7 @@ export function createDrawingClipboard({
   }
 
   async function cut() {
+    if (cutButton?.disabled) return false;
     const tableCells = canvas.cutSelectedTableCells?.();
     if (tableCells) {
       await writeText(tableCells.text);
@@ -678,6 +680,7 @@ export function createDrawingClipboard({
     if (event.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
     const key = event.key.toLowerCase();
     if (!['x', 'c', 'v'].includes(key)) return;
+    if ((key === 'x' && cutButton?.disabled) || (key === 'c' && copyButton?.disabled)) return;
     event.preventDefault();
     if (key === 'x') cut();
     else if (key === 'c') copy();

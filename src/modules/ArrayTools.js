@@ -1537,7 +1537,10 @@ export function createArrayTools({ toolbar, canvas }) {
 
   function showMenu() {
     clearTimeout(closeTimer);
-    if (!menu || !button) return;
+    if (!menu || !button || button.disabled) {
+      hideMenu();
+      return;
+    }
     tool?.classList.add('open');
     menu.classList.add('open');
     positionHeaderToolMenu(button, menu);
