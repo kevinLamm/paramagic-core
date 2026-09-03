@@ -146,12 +146,14 @@ function ownerBoundaryPolygon(owner) {
   return [];
 }
 
-function transformArrayBoundaryFeature(feature, transform, derivedOwnerId) {
+function transformArrayBoundaryFeature(feature, transform, derivedOwnerId, arrayId, arrayPlacementIndex) {
   const transformed = {
     ...clone(feature),
     recordId: derivedOwnerId,
     targetId: derivedOwnerId,
     sourceId: derivedOwnerId,
+    arrayId,
+    arrayPlacementIndex,
     arraySourceId: feature.sourceId,
     arraySourceStableKey: feature.stableKey,
     stableKey: `${derivedOwnerId}:${feature.kind}:${Number(feature.sourceFeatureIndex ?? feature.index) || 0}`,
@@ -231,7 +233,13 @@ export function materializeArraySubtractOwners(definition, evaluated, baseOwners
         kind: 'array-derived',
         ...(supportsAnalyticBoundary ? {
           boundary: {
-            features: sourceFeatures.map((feature) => transformArrayBoundaryFeature(feature, transform, id)),
+            features: sourceFeatures.map((feature) => transformArrayBoundaryFeature(
+              feature,
+              transform,
+              id,
+              normalized.id,
+              placementIndex,
+            )),
             polygon: owner.boundary.polygon.map(transform),
           },
         } : {}),
@@ -293,6 +301,9 @@ export function normalizeArrayDefinition(input = {}) {
     parentVisibleExpression: input.parentVisibleExpression == null
       ? null
       : String(input.parentVisibleExpression),
+    parentVisibleManuallyEnabled: input.parentVisibleManuallyEnabled == null
+      ? null
+      : input.parentVisibleManuallyEnabled !== false,
   };
 }
 
@@ -301,15 +312,21 @@ export function arraySelectionPropertyPatch(
   visibilityProperties = {},
 ) {
   if (!definition?.id) return null;
+  const visible = definition.parentVisibleManuallyEnabled == null
+    ? visibilityProperties.visible ?? null
+    : definition.parentVisibleManuallyEnabled;
+  const visibleExpression = definition.parentVisibleExpression == null
+    ? visibilityProperties.visibleExpression ?? null
+    : definition.parentVisibleExpression;
   return {
     selectionCount: 1,
     recordIds: [],
     ids: [definition.id],
     arrayCount: 1,
     canEditVisible: visibilityProperties.canEditVisible === true,
-    visible: visibilityProperties.visible ?? null,
+    visible,
     mixedVisible: visibilityProperties.mixedVisible === true,
-    visibleExpression: visibilityProperties.visibleExpression ?? null,
+    visibleExpression,
     errors: {
       visible: visibilityProperties.errors?.visible || null,
     },
@@ -415,7 +432,8 @@ export function arrayPlacementCount(evaluated) {
 
 export function arrayParentVisibilityExpression(definition, parentExpression = 'TRUE') {
   const normalized = normalizeArrayDefinition(definition);
-  const base = String(parentExpression || 'TRUE').trim() || 'TRUE';
+  const requestedBase = String(parentExpression ?? '').trim();
+  const base = requestedBase || 'FALSE';
   const gate = normalized.arrayType === 'rectangular'
     ? `((${normalized.rowCountExpression}) > 0 && (${normalized.columnCountExpression}) > 0)`
     : `((${normalized.countExpression}) > 0)`;
@@ -690,26 +708,45 @@ export function createArrayTools({ toolbar, canvas }) {
     return left.length === right.length && left.every((id) => right.includes(id));
   }
 
-  function captureParentVisibleExpression(definition) {
-    if (definition.parentVisibleExpression !== null) return definition.parentVisibleExpression;
+  function captureParentVisibility(definition) {
+    if (
+      definition.parentVisibleExpression !== null
+      && definition.parentVisibleManuallyEnabled !== null
+    ) {
+      return {
+        expression: definition.parentVisibleExpression,
+        manuallyEnabled: definition.parentVisibleManuallyEnabled,
+      };
+    }
     const properties = canvas.getVisibilityProperties?.(definition.sourceIds);
     definition.parentVisibleExpression = properties?.visibleExpression
-      ?? (properties?.visible === false ? 'FALSE' : 'TRUE');
-    return definition.parentVisibleExpression;
+      ?? '';
+    definition.parentVisibleManuallyEnabled = properties?.visible !== false;
+    return {
+      expression: definition.parentVisibleExpression,
+      manuallyEnabled: definition.parentVisibleManuallyEnabled,
+    };
   }
 
   function applyArrayParentVisibility(definition, { restore = false } = {}) {
     if (!definition?.sourceIds?.length) return false;
     const properties = canvas.getVisibilityProperties?.(definition.sourceIds);
     if (properties?.canEditVisible !== true) return false;
-    const parentExpression = captureParentVisibleExpression(definition);
+    const parent = captureParentVisibility(definition);
+    const visibleManuallyEnabled = restore ? parent.manuallyEnabled : false;
     const visibleExpression = restore
-      ? parentExpression
-      : arrayParentVisibilityExpression(definition, parentExpression);
-    if (properties.visibleExpression === visibleExpression) return true;
+      ? parent.expression
+      : arrayParentVisibilityExpression(
+        definition,
+        parent.manuallyEnabled ? 'TRUE' : parent.expression,
+      );
+    if (
+      properties.visible === visibleManuallyEnabled
+      && properties.visibleExpression === visibleExpression
+    ) return true;
     return canvas.setRecordVisibility?.(
       definition.sourceIds,
-      { visibleExpression },
+      { visible: visibleManuallyEnabled, visibleExpression },
       { history: false, notify: false },
     )?.success === true;
   }
@@ -796,16 +833,20 @@ export function createArrayTools({ toolbar, canvas }) {
     setSelectedVisibility(patch = {}) {
       const definition = selectedDefinitionValue();
       if (!definition) return { success: false, error: 'No array selected.' };
-      const parentVisibleExpression = patch.visibleExpression !== undefined
-        ? String(patch.visibleExpression || 'TRUE')
-        : (patch.visible === false ? 'FALSE' : 'TRUE');
-      const result = canvas.setRecordVisibility?.(definition.sourceIds, {
-        visibleExpression: arrayParentVisibilityExpression(definition, parentVisibleExpression),
-      }) || { success: false, error: 'The array source objects could not be updated.' };
+      captureParentVisibility(definition);
+      if (patch.visibleExpression !== undefined) {
+        definition.parentVisibleExpression = String(patch.visibleExpression ?? '').trim();
+      }
+      if (typeof patch.visible === 'boolean') {
+        definition.parentVisibleManuallyEnabled = patch.visible;
+      }
+      const result = applyArrayParentVisibility(definition)
+        ? { success: true, error: null }
+        : { success: false, error: 'The array source objects could not be updated.' };
       if (result.success) {
-        definition.parentVisibleExpression = parentVisibleExpression;
         if (editingDraft?.id === definition.id) {
-          editingDraft.parentVisibleExpression = parentVisibleExpression;
+          editingDraft.parentVisibleExpression = definition.parentVisibleExpression;
+          editingDraft.parentVisibleManuallyEnabled = definition.parentVisibleManuallyEnabled;
         }
       }
       return result;
@@ -1368,8 +1409,9 @@ export function createArrayTools({ toolbar, canvas }) {
     if (previous && !sameSourceIds(previous.sourceIds, committed.sourceIds)) {
       applyArrayParentVisibility(previous, { restore: true });
       committed.parentVisibleExpression = null;
+      committed.parentVisibleManuallyEnabled = null;
     }
-    captureParentVisibleExpression(committed);
+    captureParentVisibility(committed);
     applyArrayParentVisibility(committed);
     if (index >= 0) arrays[index] = committed;
     else arrays.push(committed);
@@ -1776,7 +1818,7 @@ export function createArrayTools({ toolbar, canvas }) {
       arrays.splice(0, arrays.length, ...(value?.arrays || []).map((definition) => migrateArrayDefinition(definition, version)));
       arrays.forEach(reconcileCenterControl);
       arrays.forEach((definition) => {
-        captureParentVisibleExpression(definition);
+        captureParentVisibility(definition);
         applyArrayParentVisibility(definition);
       });
       selectedArrayId = null;

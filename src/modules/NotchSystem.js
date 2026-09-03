@@ -579,9 +579,19 @@ export function createNotchEntity(
 }
 
 function hostMetadataForFeature(feature, parameter) {
-  const host = { recordId: feature.recordId, kind: feature.kind, index: feature.index ?? 0 };
-  if (feature.sourceId) host.sourceId = feature.sourceId;
-  if (feature.targetId) host.targetId = feature.targetId;
+  const derivedBoundaryType = feature.derivedBoundaryType
+    || (feature.swellDerived ? 'swell' : null);
+  const recordId = derivedBoundaryType === 'swell'
+    ? feature.swellSourceId || feature.sourceId || feature.recordId
+    : feature.recordId;
+  const sourceId = feature.arrayId && feature.arraySourceId
+    ? feature.arraySourceId
+    : feature.sourceId;
+  const host = { recordId, kind: feature.kind, index: feature.index ?? 0 };
+  if (sourceId && sourceId !== recordId) host.sourceId = sourceId;
+  if (derivedBoundaryType) host.derivedBoundaryType = derivedBoundaryType;
+  if (feature.arrayId) host.arrayId = feature.arrayId;
+  if (feature.arrayPlacementIndex !== undefined) host.arrayPlacementIndex = feature.arrayPlacementIndex;
   if (feature.sourceFeatureIndex !== undefined) host.sourceFeatureIndex = feature.sourceFeatureIndex;
   if (feature.boundaryRole) host.boundaryRole = feature.boundaryRole;
   if (feature.stableKey) host.stableKey = feature.stableKey;
@@ -760,6 +770,10 @@ export function createNotchBoundaryResolver({
   derivedBoundaryProviders = new Set(),
 }) {
   const providers = () => [...derivedBoundaryProviders];
+  const prefersDerivedBoundary = (host) => Boolean(
+    host?.derivedBoundaryType
+    || host?.swellDerived,
+  );
 
   function derivedBoundaryForHost(host) {
     for (const provider of providers()) {
@@ -881,6 +895,10 @@ export function createNotchBoundaryResolver({
     if (!host) return null;
     const subtractFeature = getSubtractBoundaryFeature(host, context);
     if (subtractFeature) return subtractFeature;
+    if (prefersDerivedBoundary(host)) {
+      const derivedFeature = derivedFeatureForHost(host, context);
+      if (derivedFeature) return derivedFeature;
+    }
     const resolvedFeature = resolvedFeatureForHost(host, context);
     if (resolvedFeature) return resolvedFeature;
     const derivedFeature = derivedFeatureForHost(host, context);
@@ -892,6 +910,10 @@ export function createNotchBoundaryResolver({
     const subtractFeatures = getSubtractBoundaryFeaturesForHost?.(host)
       || getSubtractBoundaryFeatures(host?.recordId);
     if (subtractFeatures.length) return subtractFeatures;
+    if (prefersDerivedBoundary(host)) {
+      const derivedFeatures = derivedBoundaryFeatures(host);
+      if (derivedFeatures.length) return derivedFeatures;
+    }
     const boundary = currentResolvedBoundary(host);
     if (boundary) return boundary.features;
     const derivedFeatures = derivedBoundaryFeatures(host);
@@ -912,6 +934,10 @@ export function createNotchBoundaryResolver({
   }
 
   function polygonForHost(host) {
+    if (prefersDerivedBoundary(host)) {
+      const derivedBoundary = derivedBoundaryForHost(host);
+      if (derivedBoundary?.polygon?.length >= 3) return derivedBoundary.polygon.map((point) => [...point]);
+    }
     const boundary = currentResolvedBoundary(host);
     if (boundary?.polygon?.length >= 3) return boundary.polygon.map((point) => [...point]);
     const derivedBoundary = derivedBoundaryForHost(host);
@@ -1034,7 +1060,11 @@ export function createNotchBoundaryResolver({
   }
 
   return {
-    boundaryForHost: (host) => currentResolvedBoundary(host) || derivedBoundaryForHost(host),
+    boundaryForHost: (host) => (
+      prefersDerivedBoundary(host)
+        ? derivedBoundaryForHost(host) || currentResolvedBoundary(host)
+        : currentResolvedBoundary(host) || derivedBoundaryForHost(host)
+    ),
     boundaryFeatures,
     derivedBoundaries,
     featureForHost,
@@ -1199,6 +1229,7 @@ export function notchDependsOnRecordIds(notchEntity, changedRecordIds = null) {
     notchEntity?.host?.recordId,
     notchEntity?.host?.sourceId,
     notchEntity?.host?.targetId,
+    notchEntity?.host?.arrayId,
   ].some((recordId) => recordId && changedRecordIds.has(recordId));
 }
 
@@ -1227,30 +1258,7 @@ export function createNotchSystem({
 }) {
   let valueOnly = false;
   const inwardResolver = (host, context = null) => (point, tangent) => inwardTargetForHost(host, point, tangent, context);
-  const sourceParameterForFeature = (feature, parameter) => {
-    if (!Number.isFinite(Number(feature.parameterStart))
-      || !Number.isFinite(Number(feature.parameterEnd))
-      || !Number.isFinite(Number(parameter))) return null;
-    if (feature.kind === 'arc') {
-      const tau = Math.PI * 2;
-      return ((Number(parameter) % tau) + tau) % tau / tau;
-    }
-    return Number(feature.parameterStart)
-      + (Number(feature.parameterEnd) - Number(feature.parameterStart)) * Number(parameter);
-  };
-  const hostFromFeature = (feature, parameter = null) => ({
-    recordId: feature.recordId,
-    kind: feature.kind,
-    index: feature.index ?? 0,
-    ...(feature.sourceId ? { sourceId: feature.sourceId } : {}),
-    ...(feature.targetId ? { targetId: feature.targetId } : {}),
-    ...(feature.sourceFeatureIndex !== undefined ? { sourceFeatureIndex: feature.sourceFeatureIndex } : {}),
-    ...(feature.boundaryRole ? { boundaryRole: feature.boundaryRole } : {}),
-    ...(feature.stableKey ? { stableKey: feature.stableKey } : {}),
-    ...(sourceParameterForFeature(feature, parameter) !== null
-      ? { sourceParameter: sourceParameterForFeature(feature, parameter) }
-      : {}),
-  });
+  const hostFromFeature = (feature, parameter = null) => hostMetadataForFeature(feature, parameter);
 
   function evaluateRecord(record) {
     const feature = featureForHost(record.entity.host, record.entity);

@@ -47,7 +47,7 @@ export const CLASS_APPEARANCE_GROUPS = Object.freeze({
   ]),
   strokeThickness: Object.freeze(['strokeThickness']),
   strokeOpacity: Object.freeze(['strokeOpacityExpression', 'strokeOpacity']),
-  visible: Object.freeze(['visibleExpression', 'visible']),
+  visible: Object.freeze(['visibleExpression', 'visible', 'visibleManuallyEnabled']),
 });
 
 export const CLASS_ENTITY_PROPERTY_GROUPS = Object.freeze({

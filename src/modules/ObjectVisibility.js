@@ -27,32 +27,48 @@ export function normalizeVisibleExpression(expression, fallback = 'TRUE') {
 
 export function hasObjectVisibilityState(entity) {
   return Object.prototype.hasOwnProperty.call(entity?.appearance || {}, 'visible')
-    || Object.prototype.hasOwnProperty.call(entity?.appearance || {}, 'visibleExpression');
+    || Object.prototype.hasOwnProperty.call(entity?.appearance || {}, 'visibleExpression')
+    || Object.prototype.hasOwnProperty.call(entity?.appearance || {}, 'visibleManuallyEnabled');
 }
 
 export function visibleExpressionFor(entity) {
   const appearance = entity?.appearance || {};
+  if (Object.prototype.hasOwnProperty.call(appearance, 'visibleExpression')) {
+    return String(appearance.visibleExpression ?? '').trim();
+  }
   return normalizeVisibleExpression(
-    appearance.visibleExpression,
+    null,
     appearance.visible === false ? 'FALSE' : 'TRUE',
   );
 }
 
+export function visibleManuallyEnabledFor(entity) {
+  const appearance = entity?.appearance || {};
+  if (Object.prototype.hasOwnProperty.call(appearance, 'visibleManuallyEnabled')) {
+    return appearance.visibleManuallyEnabled !== false;
+  }
+  if (!hasObjectVisibilityState(entity)) return true;
+  const expression = visibleExpressionFor(entity);
+  if (!expression || expression.toUpperCase() === 'TRUE') return appearance.visible !== false;
+  return false;
+}
+
 export function evaluateVisibleExpression(expression, evaluate) {
-  const normalized = normalizeVisibleExpression(expression);
+  const stored = String(expression ?? '').trim();
+  const normalized = normalizeVisibleExpression(stored, 'FALSE');
   if (typeof evaluate !== 'function') {
-    return { value: true, expression: normalized, error: 'Boolean evaluator is unavailable.' };
+    return { value: true, expression: stored, error: 'Boolean evaluator is unavailable.' };
   }
   try {
     const value = evaluate(normalized);
     if (typeof value !== 'boolean') {
-      return { value: true, expression: normalized, error: 'Visible expression must evaluate to TRUE or FALSE.' };
+      return { value: true, expression: stored, error: 'Visible expression must evaluate to TRUE or FALSE.' };
     }
-    return { value, expression: normalized, error: null };
+    return { value, expression: stored, error: null };
   } catch (error) {
     return {
       value: true,
-      expression: normalized,
+      expression: stored,
       error: error.message || 'Visible expression is invalid.',
     };
   }
@@ -60,15 +76,22 @@ export function evaluateVisibleExpression(expression, evaluate) {
 
 export function objectVisibilityState(entity, evaluate) {
   if (!hasObjectVisibilityState(entity)) {
-    return { value: true, expression: 'TRUE', error: null };
+    return { value: true, expression: '', error: null };
   }
-  return evaluateVisibleExpression(visibleExpressionFor(entity), evaluate);
+  const expression = visibleExpressionFor(entity);
+  if (visibleManuallyEnabledFor(entity)) {
+    return {
+      value: true,
+      expression: expression.toUpperCase() === 'TRUE' ? '' : expression,
+      error: null,
+    };
+  }
+  return evaluateVisibleExpression(expression, evaluate);
 }
 
 export function objectVisibilityPropertiesMarkup() {
   return `
-    <label class="property-row object-visibility-property-row" for="visibleProperty" hidden><span>Visible</span><input id="visibleProperty" type="checkbox" disabled /></label>
-    <label class="property-row object-visibility-property-row" for="visibleExpressionProperty" hidden><span>Visible Expression</span><input id="visibleExpressionProperty" type="text" value="TRUE" spellcheck="false" disabled /></label>
+    <div class="property-row object-visibility-property-row" hidden><span>Visible</span><div class="property-inline object-visibility-controls"><label class="object-visibility-checkbox"><span class="sr-only">Visible</span><input id="visibleProperty" aria-label="Visible" type="checkbox" disabled /></label><label class="object-visibility-expression" hidden><span class="sr-only">Visible expression</span><input id="visibleExpressionProperty" aria-label="Visible expression" list="visibleExpressionSymbols" type="text" value="" placeholder="FALSE" autocomplete="off" spellcheck="false" disabled /></label><datalist id="visibleExpressionSymbols"></datalist></div></div>
   `;
 }
 
@@ -76,22 +99,40 @@ export function bindObjectVisibilityProperties({ root, canvas } = {}) {
   const rows = [...(root?.querySelectorAll?.('.object-visibility-property-row') || [])];
   const checkbox = root?.querySelector?.('#visibleProperty');
   const expression = root?.querySelector?.('#visibleExpressionProperty');
+  const expressionContainer = root?.querySelector?.('.object-visibility-expression');
+  const expressionSymbols = root?.querySelector?.('#visibleExpressionSymbols');
   if (!checkbox || !expression) return { update() {} };
+
+  const updateExpressionSymbols = () => {
+    if (!expressionSymbols) return;
+    const options = (canvas?.getParameterExpressionSymbols?.(null, { includeLocalAliases: true }) || [])
+      .map(({ name }) => {
+        const option = document.createElement('option');
+        option.value = name;
+        return option;
+      });
+    expressionSymbols.replaceChildren(...options);
+  };
 
   checkbox.addEventListener('change', () => {
     checkbox.indeterminate = false;
-    const nextExpression = checkbox.checked ? 'TRUE' : 'FALSE';
-    expression.value = nextExpression;
-    canvas?.setSelectedVisibility?.({
-      visible: checkbox.checked,
-      visibleExpression: nextExpression,
+    expressionContainer.hidden = checkbox.checked;
+    expression.disabled = checkbox.checked;
+    canvas?.setSelectedVisibility?.({ visible: checkbox.checked });
+    if (!checkbox.checked) queueMicrotask(() => {
+      updateExpressionSymbols();
+      expression.focus();
+      expression.select();
     });
   });
-  expression.addEventListener('change', () => {
+  expression.addEventListener('blur', () => {
     canvas?.setSelectedVisibility?.({ visibleExpression: expression.value });
   });
   expression.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') expression.blur();
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      expression.blur();
+    }
   });
 
   return {
@@ -102,12 +143,16 @@ export function bindObjectVisibilityProperties({ root, canvas } = {}) {
       expression.disabled = !enabled;
       checkbox.checked = properties.visible === true;
       checkbox.indeterminate = properties.mixedVisible === true;
+      const expressionVisible = enabled && (!checkbox.checked || checkbox.indeterminate);
+      expressionContainer.hidden = !expressionVisible;
+      expression.disabled = !expressionVisible;
       if (globalThis.document?.activeElement !== expression) {
         expression.value = properties.visibleExpression ?? '';
       }
-      expression.placeholder = properties.mixedVisible ? 'Mixed' : 'TRUE, FALSE, or expression';
+      expression.placeholder = properties.mixedVisible ? 'Mixed' : 'FALSE';
       expression.setAttribute('aria-invalid', String(Boolean(properties.errors?.visible)));
-      expression.title = properties.errors?.visible || 'Boolean expression or parameter name';
+      expression.title = properties.errors?.visible || 'Blank evaluates to false';
+      updateExpressionSymbols();
     },
   };
 }
@@ -164,10 +209,14 @@ export function createObjectVisibilitySystem({
 
   function stateForOwner(owner) {
     const entity = visibilityEntityForOwner(owner, records);
-    return objectVisibilityState(
-      { ...entity, appearance: resolveEntityAppearance(entity) },
-      (expression) => evaluateExpression?.(expression, entity),
-    );
+    const resolved = { ...entity, appearance: resolveEntityAppearance(entity) };
+    return {
+      ...objectVisibilityState(
+        resolved,
+        (expression) => evaluateExpression?.(expression, entity),
+      ),
+      manuallyVisible: visibleManuallyEnabledFor(resolved),
+    };
   }
 
   function visibilityOwners({ processingOnly = false } = {}) {
@@ -216,7 +265,7 @@ export function createObjectVisibilitySystem({
     const targets = targetsForRecordIds(requestedIds);
     const targetIds = new Set(targets.flatMap((owner) => owner.recordIds || []));
     const states = targets.map(stateForOwner);
-    const values = new Set(states.map(({ value }) => value));
+    const values = new Set(states.map(({ manuallyVisible }) => manuallyVisible));
     const expressions = new Set(states.map(({ expression }) => expression));
     const errors = states.map(({ error }) => error).filter(Boolean);
     return {
@@ -241,14 +290,25 @@ export function createObjectVisibilitySystem({
       || [...requestedIds].some((id) => !targetIds.has(id))) {
       return { success: false, error: 'Select one or more complete geometry objects.' };
     }
-    const expression = patch.visibleExpression !== undefined
-      ? normalizeVisibleExpression(patch.visibleExpression)
-      : (patch.visible === false ? 'FALSE' : 'TRUE');
     const evaluatedTargets = targets.map((owner) => {
       const entity = visibilityEntityForOwner(owner, records);
+      const resolved = { ...entity, appearance: resolveEntityAppearance(entity) };
+      const current = objectVisibilityState(
+        resolved,
+        (value) => evaluateExpression?.(value, entity),
+      );
+      const manuallyVisible = typeof patch.visible === 'boolean'
+        ? patch.visible
+        : visibleManuallyEnabledFor(resolved);
+      const expression = patch.visibleExpression !== undefined
+        ? String(patch.visibleExpression ?? '').trim()
+        : current.expression;
       return {
         owner,
-        evaluated: evaluateVisibleExpression(expression, (value) => evaluateExpression?.(value, entity)),
+        manuallyVisible,
+        evaluated: manuallyVisible
+          ? { value: true, expression, error: null }
+          : evaluateVisibleExpression(expression, (value) => evaluateExpression?.(value, entity)),
       };
     });
     const evaluationError = evaluatedTargets.find(({ evaluated }) => evaluated.error)?.evaluated.error || null;
@@ -261,22 +321,28 @@ export function createObjectVisibilitySystem({
       return { success: false, error: evaluationError };
     }
     if (history) requestHistoryCheckpoint('object-visibility-update');
-    const evaluationByRecordId = new Map(evaluatedTargets.flatMap(({ owner, evaluated }) => (
-      (owner.recordIds || []).map((id) => [id, evaluated])
+    const evaluationByRecordId = new Map(evaluatedTargets.flatMap(({ owner, manuallyVisible, evaluated }) => (
+      (owner.recordIds || []).map((id) => [id, { manuallyVisible, evaluated }])
     )));
     const updates = [...targetIds].map((id) => {
       const record = records.find((candidate) => candidate.id === id);
       const entity = record?.entity;
-      const evaluated = evaluationByRecordId.get(id);
+      const { manuallyVisible, evaluated } = evaluationByRecordId.get(id);
       const appearance = {
         ...resolveEntityAppearance(entity),
         visible: evaluated.value,
         visibleExpression: evaluated.expression,
+        visibleManuallyEnabled: manuallyVisible,
       };
       return {
         id,
         appearance,
-        entity: applyEntityAppearanceOverrides(entity, appearance, patch),
+        entity: applyEntityAppearanceOverrides(entity, appearance, {
+          ...patch,
+          visible: evaluated.value,
+          visibleExpression: evaluated.expression,
+          visibleManuallyEnabled: manuallyVisible,
+        }),
       };
     });
     const changed = typeof updateEntity === 'function'

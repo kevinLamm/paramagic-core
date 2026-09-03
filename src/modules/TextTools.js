@@ -5,6 +5,38 @@ export const TEXT_PIXELS_PER_INCH = 96;
 export const DEFAULT_TEXT_FONT_SIZE = 28;
 export const TEXT_EDITOR_PADDING = 4;
 export const TEXT_LINE_HEIGHT = 1.25;
+export const TEXT_FONT_NAMES = Object.freeze([
+  'Arial',
+  'Helvetica',
+  'Verdana',
+  'Tahoma',
+  'Trebuchet MS',
+  'Times New Roman',
+  'Georgia',
+  'Garamond',
+  'Courier New',
+  'Comic Sans MS',
+  'Impact',
+  'Lucida Console',
+]);
+
+export function textPropertiesMarkup() {
+  return `<label class="property-row text-property-row" data-property-availability="canEditText" for="fontNameProperty" hidden><span>Font Name</span><select id="fontNameProperty" disabled>
+    ${TEXT_FONT_NAMES.map((name) => `<option value="${name}">${name}</option>`).join('')}
+  </select></label>
+  <div class="property-row text-property-row text-font-property-row" data-property-availability="canEditText" hidden><span>Font</span><div class="property-inline text-font-controls"><label><span>Size</span><input id="fontSizeProperty" aria-label="Font Size" type="number" min="1" step="1" value="28" disabled /></label><label><span>Color</span><input id="fontColorProperty" aria-label="Font Color" type="color" value="#202020" disabled /></label></div></div>
+  <label class="property-row text-property-row text-layout-property-row text-checkbox-row" data-property-availability="canEditText" for="multilineTextProperty" hidden><span>Multiline</span><input id="multilineTextProperty" type="checkbox" checked disabled /></label>
+  <div class="property-row text-property-row text-layout-property-row" data-property-availability="canEditText" id="textAlignmentPropertyRow" hidden><span>Alignment</span><div class="text-alignment-options" role="group" aria-label="Text alignment">
+    <button type="button" data-text-align="left" aria-label="Left alignment" title="Left alignment" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 10h10M4 14h16M4 18h12"/></svg></button>
+    <button type="button" data-text-align="center" aria-label="Center alignment" title="Center alignment" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 10h10M4 14h16M6 18h12"/></svg></button>
+    <button type="button" data-text-align="right" aria-label="Right alignment" title="Right alignment" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M10 10h10M4 14h16M8 18h12"/></svg></button>
+  </div></div>
+  <div class="property-row text-property-row text-layout-property-row" data-property-availability="canEditText" id="textVerticalAlignmentPropertyRow" hidden><span>Text Alignment</span><div class="text-alignment-options" role="group" aria-label="Text vertical alignment">
+    <button type="button" data-text-vertical-align="top" aria-label="Top text alignment" title="Top" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M7 9h10M7 13h10M7 17h10"/></svg></button>
+    <button type="button" data-text-vertical-align="middle" aria-label="Middle text alignment" title="Middle" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h10M7 9h10M4 12h16M7 15h10M7 19h10"/></svg></button>
+    <button type="button" data-text-vertical-align="bottom" aria-label="Bottom text alignment" title="Bottom" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10M7 11h10M7 15h10M4 19h16"/></svg></button>
+  </div></div>`;
+}
 
 export function textHeightInMillimetres(entity = {}, fallbackFontSize = DEFAULT_TEXT_FONT_SIZE) {
   const explicitHeight = Number(entity.textHeight);

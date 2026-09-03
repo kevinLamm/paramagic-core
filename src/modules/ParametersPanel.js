@@ -8,8 +8,8 @@ import { stackNameById } from './NamingSystem.js';
 
 const PARAMETER_TABLE_GROUPS = [
   { key: 'parameter', label: 'Parameters' },
-  { key: 'dimension', label: 'Dimensions' },
   { key: 'control', label: 'Controls' },
+  { key: 'dimension', label: 'Dimensions' },
 ];
 
 export function parameterTableGroupKey(entry) {
@@ -48,7 +48,7 @@ const actionIcon = (paths) => `<span class="parameters-action-icon" aria-hidden=
 
 export function parametersPanelHeaderActionsMarkup() {
   return `<div class="parameters-heading-actions" role="toolbar" aria-label="Parameter table actions">
-    <button type="button" class="parameters-action-button parameters-table-view-toggle" aria-label="Group by type" aria-pressed="false" title="Group by type">${actionIcon('<path d="M5 4v16M5 7h3M5 12h3M5 17h3"/><path d="M10 5h10M10 9h7M10 12h10M10 16h7M10 19h10"/>')}</button>
+    <button type="button" class="parameters-action-button parameters-table-view-toggle" aria-label="Group by type" aria-pressed="true" title="Show the full user-sorted list">${actionIcon('<path d="M5 4v16M5 7h3M5 12h3M5 17h3"/><path d="M10 5h10M10 9h7M10 12h10M10 16h7M10 19h10"/>')}</button>
     <button type="button" class="parameters-action-button parameters-import-button" aria-label="Import parameter table" title="Import parameter table">${actionIcon('<path d="M12 3v11M8 10l4 4 4-4"/><path d="M5 17v3h14v-3M5 6h4M15 6h4"/>')}</button>
     <div class="parameters-export-control">
       <button type="button" class="parameters-action-button parameters-export-button" aria-label="Export parameter table" title="Export parameter table" aria-haspopup="menu" aria-expanded="false">${actionIcon('<path d="M12 15V4M8 8l4-4 4 4"/><path d="M5 18v3h14v-3M5 15h4M15 15h4"/>')}</button>
@@ -66,7 +66,7 @@ export function parametersPanelHeaderActionsMarkup() {
 
 export function createParameterTableViewToggle({ button, onChange } = {}) {
   if (!button) throw new Error('Parameter table view toggle button is required.');
-  let separated = false;
+  let separated = true;
 
   const updateButton = () => {
     button.setAttribute('aria-pressed', String(separated));

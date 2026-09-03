@@ -78,6 +78,8 @@ export {
   OBJECT_VISIBILITY_ICON,
   objectVisibilityPropertiesMarkup,
 } from './modules/ObjectVisibility.js';
+export { syncPropertiesPanelAvailability } from './modules/PropertiesPanel.js';
+export { textPropertiesMarkup } from './modules/TextTools.js';
 export {
   createImageCatalog,
   createImageEntityFromFile,

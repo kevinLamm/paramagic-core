@@ -373,6 +373,17 @@ export function swellPresentationHost(objectLayer, ownerRecordId) {
   return { container: group, before };
 }
 
+export function syncSwellGroupPresentation(group, ownerId, canvas) {
+  const inactive = Boolean(canvas?.getActiveStackId?.())
+    && canvas?.isRecordInActiveStack?.(ownerId) === false;
+  const stackHidden = canvas?.isRecordVisible?.(ownerId) === false;
+  const objectHidden = canvas?.isObjectVisible?.(ownerId) === false;
+  group?.classList?.toggle?.('stack-inactive', inactive);
+  group?.classList?.toggle?.('stack-hidden', stackHidden);
+  group?.classList?.toggle?.('object-visibility-hidden', objectHidden);
+  return { inactive, stackHidden, objectHidden };
+}
+
 export function swellBoundaryFeatureFromTarget(boundaries = [], target = null, world = null) {
   if (!finitePoint(world)) return null;
   const pieceId = target?.closest?.('[data-swell-piece-id]')?.dataset?.swellPieceId;
@@ -468,12 +479,7 @@ export function createSwellTools({
   }
 
   function syncGroupPresentation(group, ownerId) {
-    group.classList.toggle(
-      'stack-inactive',
-      Boolean(canvas.getActiveStackId?.()) && canvas.isRecordInActiveStack?.(ownerId) === false,
-    );
-    group.classList.toggle('object-visibility-hidden', canvas.isObjectVisible?.(ownerId) === false);
-    group.hidden = canvas.isRecordVisible?.(ownerId) === false;
+    syncSwellGroupPresentation(group, ownerId, canvas);
   }
 
   function syncDerivedSelection() {

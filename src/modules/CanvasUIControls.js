@@ -497,7 +497,8 @@ export function clearRepeatableTool() {
 
 // --- Parameter Control Widgets & UI Panel ---
 const clone = (value) => JSON.parse(JSON.stringify(value));
-export const CONTROL_EXTENSION_VERSION = 2;
+export const CONTROL_EXTENSION_VERSION = 3;
+export const CONTROL_VISIBILITY_EXPRESSION_PLACEHOLDER = 'FALSE';
 
 export const controlToolTypes = Object.freeze([
   'Slider Control',
@@ -627,6 +628,7 @@ export function normalizeControlItem(input = {}) {
     ),
     selectedIndex: Math.max(0, Math.round(Number(input.selectedIndex) || 0)),
     visible: input.visible !== false,
+    visibleExpression: String(input.visibleExpression ?? ''),
     parameterId: String(input.parameterId || ''),
     parameterName: String(input.parameterName || ''),
   };
@@ -702,12 +704,35 @@ function finiteScalarEvaluation(solver, expression, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+export function controlVisibilityState(item, solver) {
+  if (item?.visible !== false) return { visible: true, error: null };
+  const expression = String(item?.visibleExpression ?? '').trim();
+  if (!expression) return { visible: false, error: null };
+  try {
+    const evaluate = solver?.evaluateParameterExpression || solver?.evaluateScalarExpression;
+    if (typeof evaluate !== 'function') throw new Error('Expression evaluation is unavailable.');
+    return { visible: Boolean(evaluate.call(solver, expression)), error: null };
+  } catch (error) {
+    const name = item.label || item.parameterName || 'Control';
+    return {
+      visible: false,
+      error: `${name} visibility expression failed: ${error.message}`,
+    };
+  }
+}
+
 export function controlPanelState(item, solver) {
   const entry = currentParameter(item, solver);
+  const visibility = controlVisibilityState(item, solver);
+  const withVisibility = (state) => ({
+    ...state,
+    effectiveVisible: visibility.visible,
+    visibilityError: visibility.error,
+  });
   if (item.controlType === 'horizontal-scrollbar') {
     const parsed = parseMinMaxExpression(item.configurationExpression);
     if (!parsed) {
-      return {
+      return withVisibility({
         entry,
         value: Number(entry?.value) || 0,
         valueText: displayValue(Number(entry?.value) || 0),
@@ -715,7 +740,7 @@ export function controlPanelState(item, solver) {
         maximum: 100,
         step: 1,
         error: 'Use MinMax(minimum, maximum, initial, step).',
-      };
+      });
     }
     const first = finiteScalarEvaluation(solver, parsed.minimumExpression, 0);
     const second = finiteScalarEvaluation(solver, parsed.maximumExpression, 100);
@@ -724,7 +749,7 @@ export function controlPanelState(item, solver) {
     const step = Math.abs(finiteScalarEvaluation(solver, parsed.stepExpression, 1)) || 1;
     const raw = Number(entry?.value);
     const value = Math.max(minimum, Math.min(maximum, Number.isFinite(raw) ? raw : minimum));
-    return {
+    return withVisibility({
       entry,
       value,
       valueText: displayValue(value),
@@ -732,28 +757,28 @@ export function controlPanelState(item, solver) {
       maximum,
       step,
       error: entry?.error || null,
-    };
+    });
   }
   if (item.controlType === 'checkbox') {
-    return { entry, value: Boolean(entry?.value), error: entry?.error || null };
+    return withVisibility({ entry, value: Boolean(entry?.value), error: entry?.error || null });
   }
   if (item.controlType === 'numeric-textbox') {
     const value = Number(entry?.value);
-    return {
+    return withVisibility({
       entry,
       value: Number.isFinite(value) ? value : 0,
       error: entry?.error || null,
-    };
+    });
   }
   const resolved = resolveControlChoices(item, solver);
   const maximumIndex = Math.max(0, resolved.choices.length - 1);
-  return {
+  return withVisibility({
     entry,
     choices: resolved.choices,
     selectedIndex: Math.min(item.selectedIndex, maximumIndex),
     value: entry?.value,
     error: resolved.error || entry?.error || null,
-  };
+  });
 }
 
 export function snapMinMaxValue(value, minimum, maximum, step) {
@@ -872,6 +897,15 @@ export function createControlPanelModel({
     return true;
   }
 
+  function setItemVisibilityExpression(id, expression) {
+    const item = get(id);
+    if (!item) return null;
+    item.visibleExpression = String(expression ?? '');
+    const state = controlVisibilityState(item, solver);
+    emit('visibility-expression');
+    return state;
+  }
+
   function setConfigurationExpression(id, expression) {
     const item = get(id);
     if (!item) return null;
@@ -950,10 +984,9 @@ export function createControlPanelModel({
       items.forEach((item) => {
         renames.forEach(({ before, after }) => {
           const escaped = before.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          item.configurationExpression = item.configurationExpression.replace(
-            new RegExp(`\\b${escaped}\\b`, 'g'),
-            after,
-          );
+          ['configurationExpression', 'visibleExpression'].forEach((field) => {
+            item[field] = item[field].replace(new RegExp(`\\b${escaped}\\b`, 'g'), after);
+          });
         });
       });
     }
@@ -976,6 +1009,7 @@ export function createControlPanelModel({
     reorder,
     setLabel,
     setItemVisible,
+    setItemVisibilityExpression,
     setConfigurationExpression,
     setValue,
     previewValue,
@@ -1026,7 +1060,9 @@ function controlRuntimeMarkup(item, state) {
 }
 
 export function controlRowMarkup(item, state, editing) {
-  const error = state.error || '';
+  const configurationError = state.error || '';
+  const visibilityError = state.visibilityError || '';
+  const error = configurationError || visibilityError;
   return `<article class="panel-control-row${error ? ' invalid' : ''}" data-control-id="${escapeHtml(item.id)}">
     <div class="panel-control-row-heading">
       ${editing ? `<button type="button" class="control-row-drag-handle" title="Drag to reorder" aria-label="Drag ${escapeHtml(item.parameterName)} to reorder">${svgIcon('drag')}</button>` : ''}
@@ -1037,12 +1073,19 @@ export function controlRowMarkup(item, state, editing) {
       ${editing ? `<button type="button" class="panel-control-visibility" data-control-visibility aria-pressed="${item.visible}" title="${item.visible ? 'Hide control in regular view' : 'Show control in regular view'}" aria-label="${item.visible ? 'Hide' : 'Show'} ${escapeHtml(item.parameterName)} in regular view">${svgIcon(item.visible ? 'visible' : 'hidden')}</button>` : ''}
       ${editing ? `<button type="button" class="panel-control-remove" data-control-remove title="Remove control" aria-label="Remove ${escapeHtml(item.parameterName)}">${svgIcon('remove')}</button>` : ''}
     </div>
+    ${editing && item.visible === false ? `<label class="panel-control-visibility-expression">
+      <span class="sr-only">Visibility expression</span>
+      <input type="text" data-control-visibility-expression value="${escapeHtml(item.visibleExpression)}"
+        aria-label="${escapeHtml(item.parameterName)} visibility expression" autocomplete="off" spellcheck="false"
+        placeholder="${CONTROL_VISIBILITY_EXPRESSION_PLACEHOLDER}" aria-invalid="${visibilityError ? 'true' : 'false'}"
+        title="${escapeHtml(visibilityError || 'Blank evaluates to false')}" />
+    </label>` : ''}
     <div class="panel-control-runtime">${controlRuntimeMarkup(item, state)}</div>
     ${editing ? `<label class="panel-control-expression">
       <span>Expression</span>
       <textarea data-control-expression rows="2" wrap="soft" autocomplete="off" spellcheck="false"
         placeholder="${item.controlType === 'horizontal-scrollbar' ? 'MinMax(0, 100, 50, 1)' : item.controlType === 'options' || item.controlType === 'dropdown' ? '{dog|cat|house}' : 'Expression'}"
-        aria-invalid="${error ? 'true' : 'false'}">${escapeHtml(item.configurationExpression)}</textarea>
+        aria-invalid="${configurationError ? 'true' : 'false'}">${escapeHtml(item.configurationExpression)}</textarea>
     </label>
     <p class="panel-control-error" role="alert" ${error ? '' : 'hidden'}>${escapeHtml(error)}</p>` : ''}
   </article>`;
@@ -1073,6 +1116,7 @@ export function createControlTools({
   let suppressClick = false;
   let activeEdit = null;
   let controlUpdateRevision = 0;
+  let renderedControlIds = [];
   const pendingControlUpdates = new Map();
   const latestControlUpdateRevisions = new Map();
 
@@ -1098,6 +1142,7 @@ export function createControlTools({
       </label>
     </div>
     <div class="controls-list" data-controls-list aria-label="Drawing controls"></div>
+    <datalist id="controlVisibilityExpressionSymbols"></datalist>
   `;
   host.append(panel);
 
@@ -1105,6 +1150,7 @@ export function createControlTools({
   const actions = panel.querySelector('.controls-panel-actions');
   const editButton = panel.querySelector('[data-controls-edit]');
   const addSelect = panel.querySelector('[data-control-add]');
+  const visibilityExpressionSymbols = panel.querySelector('#controlVisibilityExpressionSymbols');
   const panelDragController = bindFloatingPanelDrag(panel, {
     ignoreSelector: 'button, input, select, textarea, label, .controls-list',
   });
@@ -1227,11 +1273,22 @@ export function createControlTools({
 
   function render() {
     const items = model.list();
-    const displayedItems = editing ? items : items.filter(({ visible }) => visible);
-    list.innerHTML = displayedItems.length
-      ? displayedItems.map((item) => controlRowMarkup(item, controlPanelState(item, solver), editing)).join('')
+    const rows = items.map((item) => ({ item, state: controlPanelState(item, solver) }));
+    const displayedRows = editing ? rows : rows.filter(({ state }) => state.effectiveVisible);
+    renderedControlIds = displayedRows.map(({ item }) => item.id);
+    list.innerHTML = displayedRows.length
+      ? displayedRows.map(({ item, state }) => controlRowMarkup(item, state, editing)).join('')
       : `<p class="controls-empty-state">${editing ? 'Use Add control to build this userform.' : items.length ? 'No controls are visible.' : 'No controls have been added.'}</p>`;
     resizeControlExpressions();
+    updateVisibilityExpressionSymbols();
+  }
+
+  function updateVisibilityExpressionSymbols() {
+    visibilityExpressionSymbols.innerHTML = (solver.parameterExpressionSymbols?.({ includeLocalAliases: true }) || [])
+      .map(({ name }) => `<option value="${escapeHtml(name)}"></option>`).join('');
+    list.querySelectorAll('[data-control-visibility-expression]').forEach((input) => {
+      input.setAttribute('list', visibilityExpressionSymbols.id);
+    });
   }
 
   function syncRuntimeControls() {
@@ -1241,11 +1298,18 @@ export function createControlTools({
       const state = controlPanelState(item, solver);
       const parameter = row.querySelector('.panel-control-parameter');
       if (parameter) parameter.textContent = state.entry?.name || item.parameterName;
-      row.classList.toggle('invalid', Boolean(state.error));
+      row.classList.toggle('invalid', Boolean(state.error || state.visibilityError));
       const error = row.querySelector('.panel-control-error');
       if (error) {
-        error.hidden = !state.error;
-        error.textContent = state.error || '';
+        const message = state.error || state.visibilityError || '';
+        error.hidden = !message;
+        error.textContent = message;
+      }
+      const visibilityExpression = row.querySelector('[data-control-visibility-expression]');
+      if (visibilityExpression && document.activeElement !== visibilityExpression) {
+        visibilityExpression.value = item.visibleExpression;
+        visibilityExpression.setAttribute('aria-invalid', String(Boolean(state.visibilityError)));
+        visibilityExpression.title = state.visibilityError || 'Blank evaluates to false';
       }
       const expression = row.querySelector('[data-control-expression]');
       if (expression && document.activeElement !== expression) {
@@ -1324,6 +1388,12 @@ export function createControlTools({
       model.setItemVisible(item.id, !item.visible);
       render();
       notifyMutation('visibility');
+      if (item.visible) queueMicrotask(() => {
+        updateVisibilityExpressionSymbols();
+        const input = list.querySelector(`[data-control-id="${CSS.escape(item.id)}"] [data-control-visibility-expression]`);
+        input?.focus();
+        input?.select();
+      });
     } else if (event.target.closest('[data-control-remove]')) {
       beginMutation('remove');
       model.remove(row.dataset.controlId);
@@ -1333,12 +1403,17 @@ export function createControlTools({
   });
 
   list.addEventListener('focusin', (event) => {
-    const field = event.target.closest?.('[data-control-label], [data-control-expression]');
+    const field = event.target.closest?.('[data-control-label], [data-control-expression], [data-control-visibility-expression]');
     const row = field?.closest('[data-control-id]');
     if (!field || !row) return;
-    const key = `${row.dataset.controlId}:${field.hasAttribute('data-control-label') ? 'label' : 'expression'}`;
+    const fieldType = field.hasAttribute('data-control-label')
+      ? 'label'
+      : field.hasAttribute('data-control-visibility-expression')
+        ? 'visibility-expression'
+        : 'expression';
+    const key = `${row.dataset.controlId}:${fieldType}`;
     if (activeEdit !== key) {
-      beginMutation(field.hasAttribute('data-control-label') ? 'label' : 'expression');
+      beginMutation(fieldType);
       activeEdit = key;
     }
   });
@@ -1349,6 +1424,12 @@ export function createControlTools({
     const id = row.dataset.controlId;
     if (event.target.matches('[data-control-label]')) {
       model.setLabel(id, event.target.value);
+      canvas.notifyObjectChange?.({ history: 'none' });
+      return;
+    }
+    if (event.target.matches('[data-control-visibility-expression]')) {
+      model.setItemVisibilityExpression(id, event.target.value);
+      syncRuntimeControls();
       canvas.notifyObjectChange?.({ history: 'none' });
       return;
     }
@@ -1388,6 +1469,11 @@ export function createControlTools({
   list.addEventListener('change', (event) => {
     const row = event.target.closest?.('[data-control-id]');
     if (!row) return;
+    if (event.target.matches('[data-control-visibility-expression]')) {
+      notifyMutation('visibility-expression');
+      syncRuntimeControls();
+      return;
+    }
     if (event.target.matches('[data-control-label], [data-control-expression]')) {
       commitPendingControlMutation(row.dataset.controlId, 'edit');
       return;
@@ -1465,7 +1551,16 @@ export function createControlTools({
 
   const stopSolverSubscription = solver.subscribe((parameters) => {
     model.synchronizeParameters(parameters);
-    if (!panel.hidden) syncRuntimeControls();
+    updateVisibilityExpressionSymbols();
+    if (panel.hidden) return;
+    const nextControlIds = (editing
+      ? model.list()
+      : model.list().filter((item) => controlVisibilityState(item, solver).visible))
+      .map(({ id }) => id);
+    const visibilityChanged = nextControlIds.length !== renderedControlIds.length
+      || nextControlIds.some((id, index) => id !== renderedControlIds[index]);
+    if (visibilityChanged) render();
+    else syncRuntimeControls();
   });
   const unregisterExtension = canvas.registerDrawingExtension?.('controls', {
     serialize: model.serialize,

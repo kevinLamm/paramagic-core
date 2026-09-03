@@ -1103,7 +1103,12 @@ export class ParameterRepository {
   }
 
   evaluateLengthExpression(expression, { stackId = null } = {}) {
-    if (!this.defaultLengthUnit) return this.evaluateExpression(expression, { stackId });
+    const finiteLength = (value) => {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) throw new Error('Length expression must evaluate to a finite number.');
+      return numeric;
+    };
+    if (!this.defaultLengthUnit) return finiteLength(this.evaluateExpression(expression, { stackId }));
     const drawingUnitFactor = unitFactors[this.defaultLengthUnit];
     const symbols = this.symbolDefinitions(stackId);
     const value = parseExpression(expression, (name) => {
@@ -1117,7 +1122,7 @@ export class ParameterRepository {
       const entryIsLength = typeof entry.value === 'number' && isLengthParameter(entry);
       return entryIsLength ? Number(entry.value) / drawingUnitFactor : entry.value;
     }, { baseUnit: this.defaultLengthUnit, symbols });
-    return Number(value) * drawingUnitFactor;
+    return finiteLength(value) * drawingUnitFactor;
   }
 
   list() {

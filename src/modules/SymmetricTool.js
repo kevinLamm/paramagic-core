@@ -5,7 +5,7 @@ import {
   directClosedRegionNodesForSourceIds,
   splitDerivedPresentationNodes,
 } from './CanvasPaintOrder.js';
-import { evaluateVisibleExpression, normalizeVisibleExpression } from './ObjectVisibility.js';
+import { evaluateVisibleExpression } from './ObjectVisibility.js';
 import { replaceTableCellForeignObjects } from './TableTools.js';
 import { prepareNotchDerivativePresentationClone } from './NotchSystem.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
@@ -130,10 +130,14 @@ function finiteLinear(value) {
 export function normalizeLinkedCopyDefinition(value = {}) {
   const id = String(value.id || createUuid());
   const stackId = value.stackId ? String(value.stackId) : null;
-  const visibleExpression = normalizeVisibleExpression(
-    value.visibleExpression,
-    value.visible === false ? 'FALSE' : 'TRUE',
-  );
+  const visibleExpression = Object.prototype.hasOwnProperty.call(value, 'visibleExpression')
+    ? String(value.visibleExpression ?? '').trim()
+    : '';
+  const visibleManuallyEnabled = Object.prototype.hasOwnProperty.call(value, 'visibleManuallyEnabled')
+    ? value.visibleManuallyEnabled !== false
+    : (!visibleExpression || visibleExpression.toUpperCase() === 'TRUE')
+      ? value.visible !== false
+      : false;
   return {
     id,
     sourceDefinitionId: String(value.sourceDefinitionId || id),
@@ -143,9 +147,12 @@ export function normalizeLinkedCopyDefinition(value = {}) {
     anchor: finitePoint(value.anchor),
     linear: finiteLinear(value.linear),
     stackId,
-    visible: typeof value.visible === 'boolean'
-      ? value.visible
-      : visibleExpression.toUpperCase() !== 'FALSE',
+    visible: visibleManuallyEnabled
+      ? true
+      : typeof value.visible === 'boolean'
+        ? value.visible
+        : false,
+    visibleManuallyEnabled,
     visibleExpression,
     zIndex: value.zIndex !== null
       && value.zIndex !== undefined
@@ -168,6 +175,15 @@ export function linkedCopyUsesOutlineHit(definition, entities) {
 
 export function linkedCopyVisibilityState(definition, evaluate) {
   const normalized = normalizeLinkedCopyDefinition(definition);
+  if (normalized.visibleManuallyEnabled) {
+    return {
+      value: true,
+      expression: normalized.visibleExpression.toUpperCase() === 'TRUE'
+        ? ''
+        : normalized.visibleExpression,
+      error: null,
+    };
+  }
   return evaluateVisibleExpression(
     normalized.visibleExpression,
     (expression) => evaluate(expression, normalized),
@@ -178,7 +194,9 @@ export function linkedCopySelectionPropertyPatch(definitions = [], evaluate, bas
   const selected = [...definitions];
   if (!selected.length) return null;
   const states = selected.map((definition) => linkedCopyVisibilityState(definition, evaluate));
-  const values = new Set(states.map(({ value }) => value));
+  const values = new Set(selected.map((definition) => (
+    normalizeLinkedCopyDefinition(definition).visibleManuallyEnabled
+  )));
   const expressions = new Set(states.map(({ expression }) => expression));
   const baseSelectionCount = Number(baseProperties.selectionCount) || 0;
   const baseSupportedCount = Number(baseProperties.supportedCount) || 0;
@@ -1062,21 +1080,35 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       if (selectedCopyId) ids.add(selectedCopyId);
       const selected = definitions.filter(({ id }) => ids.has(id));
       if (!selected.length) return { success: false, error: 'No Duplicate or Symmetric object selected.' };
-      const expression = patch.visibleExpression !== undefined
-        ? normalizeVisibleExpression(patch.visibleExpression)
-        : (patch.visible === false ? 'FALSE' : 'TRUE');
-      const evaluated = evaluateVisibleExpression(
-        expression,
-        (value) => canvas.evaluateNumericExpression(value, selected[0]),
-      );
-      if (evaluated.error) {
-        selected.forEach((definition) => { definition.visibilityError = evaluated.error; });
+      const outcomes = selected.map((definition) => {
+        const normalized = normalizeLinkedCopyDefinition(definition);
+        const visibleManuallyEnabled = typeof patch.visible === 'boolean'
+          ? patch.visible
+          : normalized.visibleManuallyEnabled;
+        const expression = patch.visibleExpression !== undefined
+          ? String(patch.visibleExpression ?? '').trim()
+          : linkedCopyVisibilityState(normalized, canvas.evaluateNumericExpression).expression;
+        return {
+          definition,
+          visibleManuallyEnabled,
+          evaluated: visibleManuallyEnabled
+            ? { value: true, expression, error: null }
+            : evaluateVisibleExpression(
+              expression,
+              (value) => canvas.evaluateNumericExpression(value, normalized),
+            ),
+        };
+      });
+      const error = outcomes.find(({ evaluated }) => evaluated.error)?.evaluated.error || null;
+      if (error) {
+        selected.forEach((definition) => { definition.visibilityError = error; });
         canvas.syncState?.();
-        return { success: false, error: evaluated.error };
+        return { success: false, error };
       }
       canvas.requestHistoryCheckpoint?.('linked-copy-visibility-update');
-      selected.forEach((definition) => {
+      outcomes.forEach(({ definition, visibleManuallyEnabled, evaluated }) => {
         definition.visible = evaluated.value;
+        definition.visibleManuallyEnabled = visibleManuallyEnabled;
         definition.visibleExpression = evaluated.expression;
         definition.visibilityError = null;
       });

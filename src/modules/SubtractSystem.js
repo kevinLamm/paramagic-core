@@ -702,6 +702,11 @@ function featureForPiece(target, source, role, segment, localStart, localEnd, ou
     recordId: target.id,
     targetId: target.id,
     sourceId: source.id,
+    ...(source.arrayId ? {
+      arrayId: source.arrayId,
+      arrayPlacementIndex: source.arrayPlacementIndex,
+      arraySourceId: source.arraySourceOwnerId,
+    } : {}),
     entityType: source.type,
     kind: 'segment',
     index: outputIndex,
@@ -725,6 +730,11 @@ function featureForCirclePiece(target, source, role, startAngle, endAngle, outpu
     recordId: target.id,
     targetId: target.id,
     sourceId: source.id,
+    ...(source.arrayId ? {
+      arrayId: source.arrayId,
+      arrayPlacementIndex: source.arrayPlacementIndex,
+      arraySourceId: source.arraySourceOwnerId,
+    } : {}),
     entityType: source.type,
     kind: fullCircle ? 'circle' : 'arc',
     index: outputIndex,
@@ -1605,7 +1615,13 @@ export function createSubtractSystem({
       if (exact) return exact;
     }
     const sourceMatch = features.filter((feature) => (
-      (!host.sourceId || feature.sourceId === host.sourceId || feature.targetId === host.sourceId)
+      (!host.sourceId
+        || feature.sourceId === host.sourceId
+        || feature.targetId === host.sourceId
+        || feature.arraySourceId === host.sourceId)
+      && (!host.arrayId || feature.arrayId === host.arrayId)
+      && (host.arrayPlacementIndex === undefined
+        || Number(feature.arrayPlacementIndex) === Number(host.arrayPlacementIndex))
       && (host.sourceFeatureIndex === undefined || feature.sourceFeatureIndex === host.sourceFeatureIndex)
     ));
     const candidates = sourceMatch.length ? sourceMatch : features;
