@@ -1,3 +1,4 @@
+import { GLOBAL_LAYER_ID } from '../StackCoordinates.js';
 function recordStackId(record, fallbackStackId = null) {
   return String(record?.stackId || fallbackStackId || '');
 }
@@ -6,7 +7,7 @@ function relationshipStackIds(record, fallbackStackId = null) {
   return [...new Set([
     recordStackId(record, fallbackStackId),
     ...(record?.participantStackIds || []).map(String),
-  ].filter(Boolean))];
+  ].filter((id) => id && id !== GLOBAL_LAYER_ID))];
 }
 
 export function buildStackParticipationGraph({
@@ -22,7 +23,7 @@ export function buildStackParticipationGraph({
   const enabled = enabledStackIds ? new Set([...enabledStackIds].map(String)) : null;
   const addStack = (stackId) => {
     const id = String(stackId || defaultStackId || '');
-    if (!id || (enabled && !enabled.has(id))) return null;
+    if (!id || id === GLOBAL_LAYER_ID || (enabled && !enabled.has(id))) return null;
     if (!adjacency.has(id)) adjacency.set(id, new Set());
     return id;
   };

@@ -1,19 +1,133 @@
+import { GLOBAL_LAYER_ID, stackFrameFor, transformStackEntity, stackFrameMatrix, IDENTITY_FRAME, transformStackPoint } from './StackCoordinates.js';
 import { formatUnitlessValue } from './solver/Units.js';
 import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from './ArcGeometry.js';
+import { stackRelationshipSolveDomain } from './StackRelationshipSystem.js';
+import { createExpressionBoxLookup, expressionBoxLookupMarkup } from './ExpressionBox.js';
 
 export const DIMENSION_EDIT_INPUT_MINIMUM_HEIGHT = 54;
 export const DIMENSION_EDIT_INPUT_MAXIMUM_HEIGHT = 180;
+export const DIMENSION_TEXT_HIT_PADDING_PX = 10;
+export const DIMENSION_TEXT_HIT_MINIMUM_WIDTH_PX = 32;
+export const DIMENSION_TEXT_HIT_MINIMUM_HEIGHT_PX = 36;
+export const DIMENSION_TEXT_DOUBLE_PRESS_INTERVAL_MS = 500;
+export const DIMENSION_TEXT_DOUBLE_PRESS_DISTANCE_PX = 8;
+
+export function dimensionTextHitBounds(box, scale = 1) {
+  const safeScale = Math.max(Number(scale) || 1, 0.01);
+  const source = {
+    x: Number(box?.x) || 0,
+    y: Number(box?.y) || 0,
+    width: Math.max(0, Number(box?.width) || 0),
+    height: Math.max(0, Number(box?.height) || 0),
+  };
+  const padding = DIMENSION_TEXT_HIT_PADDING_PX / safeScale;
+  const width = Math.max(
+    source.width + padding * 2,
+    DIMENSION_TEXT_HIT_MINIMUM_WIDTH_PX / safeScale,
+  );
+  const height = Math.max(
+    source.height + padding * 2,
+    DIMENSION_TEXT_HIT_MINIMUM_HEIGHT_PX / safeScale,
+  );
+  return {
+    x: source.x + (source.width - width) / 2,
+    y: source.y + (source.height - height) / 2,
+    width,
+    height,
+  };
+}
+
+function dimensionInteractionTarget(event, selector) {
+  return event?.target?.closest?.(selector) || null;
+}
+
+function consumeDimensionInteraction(event) {
+  event.preventDefault?.();
+  if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+  else event.stopPropagation?.();
+}
+
+export function bindDimensionRecordInteractions(record, {
+  canInteract = () => true,
+  canEditText = (candidate) => (
+    dimensionMode(candidate?.entity) === 'driving'
+    && Boolean(candidate?.entity?.dimensionId)
+  ),
+  beginLineDrag = () => {},
+  editText = () => {},
+} = {}) {
+  if (!record?.group?.addEventListener) return () => {};
+  let lastTextPress = null;
+  let editOpenedOnSecondPress = false;
+
+  const handlePointerDown = (event) => {
+    if (
+      event.button !== 0
+      || event.ctrlKey
+      || event.metaKey
+      || !canInteract(record)
+    ) return;
+    const textTarget = dimensionInteractionTarget(event, '.dimension-text, .dimension-text-hit');
+    const pathTarget = dimensionInteractionTarget(event, '.dimension-path');
+    if (!textTarget && !pathTarget) return;
+
+    if (textTarget) {
+      const time = Number(event.timeStamp) || Date.now();
+      const press = { time, x: Number(event.clientX) || 0, y: Number(event.clientY) || 0 };
+      const isSecondPress = lastTextPress
+        && time - lastTextPress.time <= DIMENSION_TEXT_DOUBLE_PRESS_INTERVAL_MS
+        && Math.hypot(press.x - lastTextPress.x, press.y - lastTextPress.y)
+          <= DIMENSION_TEXT_DOUBLE_PRESS_DISTANCE_PX;
+      if (
+        record.entity?.dimensionId
+        && canEditText(record)
+        && (isSecondPress || event.detail > 1)
+      ) {
+        lastTextPress = null;
+        editOpenedOnSecondPress = true;
+        consumeDimensionInteraction(event);
+        editText(record, event);
+        return;
+      }
+      lastTextPress = press;
+    } else {
+      lastTextPress = null;
+    }
+
+    editOpenedOnSecondPress = false;
+    beginLineDrag(event, record);
+    event.stopImmediatePropagation?.();
+  };
+
+  const handleDoubleClick = (event) => {
+    if (!record.entity?.dimensionId || !canInteract(record) || !canEditText(record)) return;
+    if (!dimensionInteractionTarget(event, '.dimension-text, .dimension-text-hit')) return;
+    consumeDimensionInteraction(event);
+    if (!editOpenedOnSecondPress) editText(record, event);
+    editOpenedOnSecondPress = false;
+    lastTextPress = null;
+  };
+
+  record.group.addEventListener('pointerdown', handlePointerDown, { capture: true });
+  record.group.addEventListener('dblclick', handleDoubleClick, { capture: true });
+  return () => {
+    record.group.removeEventListener?.('pointerdown', handlePointerDown, { capture: true });
+    record.group.removeEventListener?.('dblclick', handleDoubleClick, { capture: true });
+  };
+}
 
 export function dimensionEditPanelMarkup() {
   return `
     <label class="dimension-edit-label">
       <span>Dimension</span>
-      <textarea class="dimension-edit-input" list="dimensionEditParameterNames" rows="2" wrap="soft" autocomplete="off" spellcheck="false"
-        title="Enter to apply; Shift+Enter for a new line; Escape to cancel"></textarea>
+      <span class="expression-box">
+        <textarea class="dimension-edit-input" aria-label="Dimension expression" rows="2" wrap="soft" autocomplete="off" spellcheck="false"
+          title="Enter to apply; Shift+Enter for a new line; Escape to cancel"></textarea>
+        ${expressionBoxLookupMarkup({ id: 'dimensionEditParameterLookup' })}
+      </span>
     </label>
-    <datalist id="dimensionEditParameterNames"></datalist>
     <p class="dimension-edit-error" role="alert" aria-live="polite"></p>
   `;
 }
@@ -47,7 +161,7 @@ export function createDimensionEditPanel({
   panel.innerHTML = dimensionEditPanelMarkup();
   const input = panel.querySelector('.dimension-edit-input');
   const labelText = panel.querySelector('.dimension-edit-label > span');
-  const options = panel.querySelector('#dimensionEditParameterNames');
+  const lookupList = panel.querySelector('[data-expression-lookup-list]');
   const error = panel.querySelector('.dimension-edit-error');
 
   const resizeInput = () => {
@@ -56,6 +170,11 @@ export function createDimensionEditPanel({
     input.style.height = `${height}px`;
     input.style.overflowY = input.scrollHeight > DIMENSION_EDIT_INPUT_MAXIMUM_HEIGHT ? 'auto' : 'hidden';
   };
+
+  const lookup = createExpressionBoxLookup({
+    field: input,
+    listbox: lookupList,
+  });
 
   ['pointerdown', 'click', 'dblclick', 'keydown'].forEach((name) => {
     panel.addEventListener(name, (event) => event.stopPropagation());
@@ -69,7 +188,15 @@ export function createDimensionEditPanel({
     else onCancel();
   });
 
-  return { panel, input, labelText, options, error, resizeInput };
+  return {
+    panel,
+    input,
+    labelText,
+    error,
+    closeLookup: lookup.close,
+    resizeInput,
+    setLookupOptions: lookup.setOptions,
+  };
 }
 
 // --- Dimension Feature Geometry ---
@@ -304,6 +431,16 @@ function perpendicular(point) {
   return [-point[1], point[0]];
 }
 
+function rotateDirection(direction, angle) {
+  if (!Array.isArray(direction) || direction.length < 2) return null;
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  return [
+    direction[0] * cosine - direction[1] * sine,
+    direction[0] * sine + direction[1] * cosine,
+  ];
+}
+
 function readableAngleDegrees(vector) {
   let angle = Math.atan2(vector[1], vector[0]) * 180 / Math.PI;
   if (angle > 90) angle -= 180;
@@ -331,7 +468,43 @@ function arrowPath(tip, direction, scale, size = 12 / scale) {
   return `M ${tip[0]} ${tip[1]} L ${a[0]} ${a[1]} L ${b[0]} ${b[1]} Z`;
 }
 
-export function distanceDimensionLayout(entity, scale) {
+function dimensionExtensionSegment(segment) {
+  return { start: [...segment.start], end: [...segment.end] };
+}
+
+function segmentEndpointForRole(segment, role) {
+  if (role === 'start') return segment?.start;
+  if (role === 'end') return segment?.end;
+  return null;
+}
+
+function closestSegmentEndpointRole(segment, dimensionPoint, dimensionDirection) {
+  if (!segment?.start || !segment?.end) return null;
+  const lineNormal = perpendicular(unitVector(dimensionDirection));
+  const distance = (point) => Math.abs(dot(subtractPoints(point, dimensionPoint), lineNormal));
+  return distance(segment.start) <= distance(segment.end) ? 'start' : 'end';
+}
+
+function distanceExtensionLayout(measuredPoint, segment, dimensionPoint, normal, side, gap, overshoot, endpointRole = null) {
+  if (!segment) return {
+    start: addPoints(measuredPoint, scalePoint(normal, gap * side)),
+    end: addPoints(dimensionPoint, scalePoint(normal, overshoot * side)),
+  };
+  // Distance to the dimension's supporting line selects the visible geometry end.
+  const distance = (point) => Math.abs(dot(subtractPoints(point, dimensionPoint), normal));
+  const origin = segmentEndpointForRole(segment, endpointRole)
+    || (distance(segment.start) <= distance(segment.end) ? segment.start : segment.end);
+  const direction = unitVector(subtractPoints(dimensionPoint, origin), scalePoint(normal, side));
+  return {
+    start: addPoints(origin, scalePoint(direction, gap)),
+    end: addPoints(dimensionPoint, scalePoint(direction, overshoot)),
+  };
+}
+
+function distanceDimensionPlacement(entity, scale, {
+  useStoredDirection = true,
+  useStoredDistance = true,
+} = {}) {
   const measureStart = entity.measureStart || entity.start;
   const measureEnd = entity.measureEnd || entity.end;
   let dimensionBaseStart = entity.anchors?.start ? (entity.start || measureStart) : measureStart;
@@ -344,44 +517,154 @@ export function distanceDimensionLayout(entity, scale) {
     dimensionBaseStart = [measureStart[0], measureStart[1]];
     dimensionBaseEnd = [measureStart[0], measureEnd[1]];
   }
-  const measured = subtractPoints(dimensionBaseEnd, dimensionBaseStart);
-  const axis = unitVector(measured);
+  const axis = unitVector(subtractPoints(dimensionBaseEnd, dimensionBaseStart));
   const normal = perpendicular(axis);
   const measuredMid = midpoint(dimensionBaseStart, dimensionBaseEnd);
-  let offset = dot(subtractPoints(entity.label, measuredMid), normal);
-  if (Math.abs(offset) < 14 / scale) offset = offset < 0 ? -28 / scale : 28 / scale;
-  const side = offset < 0 ? -1 : 1;
-  const offsetVector = scalePoint(normal, offset);
+  const labelOffset = subtractPoints(entity.label, measuredMid);
+  const storedDirection = useStoredDirection && pointLength(entity.offsetDirection || []) > 0.0001
+    ? unitVector(entity.offsetDirection)
+    : null;
+  const projectedOffset = dot(labelOffset, normal);
+  const placementDirection = storedDirection
+    ? scalePoint(normal, dot(normal, storedDirection) < 0 ? -1 : 1)
+    : scalePoint(normal, projectedOffset < 0 ? -1 : 1);
+  const storedDistance = useStoredDistance && Number.isFinite(Number(entity.offsetDistance))
+    ? Math.max(0, Number(entity.offsetDistance))
+    : null;
+  let distance = storedDistance ?? Math.abs(projectedOffset);
+  if (storedDistance === null && distance < 14 / scale) distance = 28 / scale;
+  return {
+    axis,
+    direction: placementDirection,
+    distance,
+    dimensionBaseStart,
+    dimensionBaseEnd,
+    measuredMid,
+  };
+}
+
+function restoreDistanceDimensionPlacement(entity, placement) {
+  const current = distanceDimensionPlacement(entity, 1, {
+    useStoredDirection: false,
+    useStoredDistance: false,
+  });
+  const direction = dot(current.direction, placement.direction) < 0
+    ? scalePoint(current.direction, -1)
+    : current.direction;
+  entity.offsetDirection = direction;
+  entity.offsetDistance = placement.distance;
+  entity.label = addPoints(current.measuredMid, scalePoint(direction, placement.distance));
+}
+
+function recordDistanceDimensionPlacement(entity, scale = 1) {
+  const placement = distanceDimensionPlacement(entity, scale, {
+    useStoredDirection: false,
+    useStoredDistance: false,
+  });
+  entity.offsetDirection = placement.direction;
+  entity.offsetDistance = placement.distance;
+  return entity;
+}
+
+export function distanceDimensionLayout(entity, scale) {
+  const measureStart = entity.measureStart || entity.start;
+  const measureEnd = entity.measureEnd || entity.end;
+  const placement = distanceDimensionPlacement(entity, scale);
+  const { axis, direction, distance, dimensionBaseStart, dimensionBaseEnd } = placement;
+  const offsetVector = scalePoint(direction, distance);
   const extensionGap = 6 / scale;
   const extensionOvershoot = 10 / scale;
   const dimensionStart = addPoints(dimensionBaseStart, offsetVector);
   const dimensionEnd = addPoints(dimensionBaseEnd, offsetVector);
   const dimensionMid = midpoint(dimensionStart, dimensionEnd);
-  const textPoint = addPoints(dimensionMid, scalePoint(normal, side * 14 / scale));
+  const textPoint = addPoints(dimensionMid, scalePoint(direction, 14 / scale));
+  const lineToLine = entity.anchors?.lineToLine;
   return {
     dimensionStart,
     dimensionEnd,
     dimensionMid,
     textPoint,
     angle: readableAngleDegrees(axis),
-    extensionA: {
-      start: addPoints(measureStart, scalePoint(normal, extensionGap * side)),
-      end: addPoints(dimensionStart, scalePoint(normal, extensionOvershoot * side)),
-    },
-    extensionB: {
-      start: addPoints(measureEnd, scalePoint(normal, extensionGap * side)),
-      end: addPoints(dimensionEnd, scalePoint(normal, extensionOvershoot * side)),
-    },
+    extensionA: distanceExtensionLayout(
+      measureStart,
+      entity.firstSegment,
+      dimensionStart,
+      direction,
+      1,
+      extensionGap,
+      extensionOvershoot,
+      lineToLine?.referenceEndpoint,
+    ),
+    extensionB: distanceExtensionLayout(
+      measureEnd,
+      entity.secondSegment,
+      dimensionEnd,
+      direction,
+      1,
+      extensionGap,
+      extensionOvershoot,
+      lineToLine?.measuredEndpoint,
+    ),
     arrowA: arrowPath(dimensionStart, axis, scale),
     arrowB: arrowPath(dimensionEnd, scalePoint(axis, -1), scale),
   };
 }
 
+function radialDimensionPlacement(entity, {
+  useStoredDirection = true,
+  useStoredDistance = true,
+} = {}) {
+  const center = entity.center;
+  const radius = Number(entity.radius)
+    || pointLength(subtractPoints(entity.target || center, center))
+    || 72;
+  const sourceElbow = entity.elbow || entity.label || addPoints(center, [-72, -48]);
+  const currentDirection = unitVector(
+    subtractPoints(sourceElbow, center),
+    unitVector(entity.direction || [1, 0]),
+  );
+  const direction = useStoredDirection && pointLength(entity.offsetDirection || []) > 0.0001
+    ? unitVector(entity.offsetDirection)
+    : currentDirection;
+  const storedDistance = useStoredDistance && Number.isFinite(Number(entity.offsetDistance))
+    ? Number(entity.offsetDistance)
+    : null;
+  const distance = storedDistance ?? (pointLength(subtractPoints(sourceElbow, center)) - radius);
+  return {
+    direction,
+    distance,
+    radius,
+    elbow: addPoints(center, scalePoint(direction, Math.max(0, radius + distance))),
+  };
+}
+
+function recordRadialDimensionPlacement(entity) {
+  const placement = radialDimensionPlacement(entity, {
+    useStoredDirection: false,
+    useStoredDistance: false,
+  });
+  entity.direction = placement.direction;
+  entity.offsetDirection = placement.direction;
+  entity.offsetDistance = placement.distance;
+  entity.elbow = placement.elbow;
+  return entity;
+}
+
+function restoreRadialDimensionPlacement(entity, placement) {
+  entity.direction = placement.direction;
+  entity.offsetDirection = placement.direction;
+  entity.offsetDistance = placement.distance;
+  entity.elbow = addPoints(
+    entity.center,
+    scalePoint(placement.direction, Math.max(0, Number(entity.radius) + placement.distance)),
+  );
+  return entity;
+}
+
 export function radiusDimensionLayout(entity, scale) {
   const center = entity.center;
-  const elbow = entity.elbow || entity.label || addPoints(center, [-72, -48]);
-  const radius = entity.radius || pointLength(subtractPoints(entity.target || center, center)) || 72;
-  const radialDirection = unitVector(subtractPoints(elbow, center), [1, 0]);
+  const placement = radialDimensionPlacement(entity);
+  const { elbow, radius, direction: radialDirection } = placement;
   const target = addPoints(center, scalePoint(radialDirection, radius));
   const oppositeTarget = addPoints(center, scalePoint(radialDirection, -radius));
   const diameter = entity.subtype === 'diameter';
@@ -523,6 +806,29 @@ export function dimensionHiddenInTextMode(entity, textMode = 'named-value') {
   return !dimensionIncludedInValueOnly(entity);
 }
 
+export function dimensionVisibleInStackContext(entity, activeStackId = null) {
+  const global = entity?.stackId === GLOBAL_LAYER_ID || entity?.coordinateSpace === 'global';
+  return global
+    || Boolean(activeStackId)
+    || dimensionIncludedInValueOnly(entity);
+}
+
+export function syncDimensionRecordPresentation(record, {
+  textMode = 'named-value',
+  activeStackId = null,
+} = {}) {
+  if (!record?.group) return false;
+  const hiddenForMode = dimensionHiddenInTextMode(record.entity, textMode);
+  const hiddenForStack = !dimensionVisibleInStackContext(record.entity, activeStackId);
+  const hiddenForParent = record.dimensionParentsVisible === false;
+  const hidden = hiddenForMode || hiddenForStack;
+  record.group.style.display = hidden ? 'none' : '';
+  record.group.classList.toggle('object-visibility-hidden', hiddenForParent);
+  record.group.setAttribute('data-object-visible', String(!hiddenForParent));
+  record.group.setAttribute('aria-hidden', String(hidden || hiddenForParent));
+  return !hidden && !hiddenForParent;
+}
+
 export function dimensionTextEditable(entity, textMode = 'named-value') {
   return dimensionMode(entity) === 'driving' && textMode !== 'value';
 }
@@ -589,8 +895,29 @@ export function dimensionHandles(entity, scale) {
   return [];
 }
 
+export function syncDimensionStackFrames(records, previousState, nextState) {
+  for (const record of records) {
+    if (record.recordType !== 'dimension') continue;
+    const previous = stackFrameFor(previousState, record.entity.stackId);
+    const next = stackFrameFor(nextState, record.entity.stackId);
+    record.entity = transformStackEntity(transformStackEntity(record.entity, previous, true), next);
+    if (record.entity.offsetDirection) {
+      record.entity.offsetDirection = rotateDirection(
+        record.entity.offsetDirection,
+        next.rotation - previous.rotation,
+      );
+    }
+    record.entity.coordinateFrame = { ...next };
+  }
+}
+
 export function updateDimensionNode(record, scale) {
-  const entity = record.entity;
+  const frame = record.entity.coordinateFrame || IDENTITY_FRAME;
+  const entity = frame.x || frame.y || frame.rotation ? transformStackEntity(record.entity, frame, true) : record.entity;
+  if (entity !== record.entity && entity.offsetDirection) {
+    entity.offsetDirection = rotateDirection(entity.offsetDirection, -frame.rotation);
+  }
+  record.group?.setAttribute?.('transform', stackFrameMatrix(frame));
   const safeScale = Math.max(Number(scale) || 1, 0.01);
   record.scale = safeScale;
   if (record.text) {
@@ -666,11 +993,11 @@ export function updateDimensionNode(record, scale) {
   if (record.textHit) {
     try {
       const box = record.text.getBBox();
-      const padding = 8 / Math.max(Number(scale) || 1, 0.01);
-      record.textHit.setAttribute('x', box.x - padding);
-      record.textHit.setAttribute('y', box.y - padding);
-      record.textHit.setAttribute('width', Math.max(box.width + padding * 2, padding * 2));
-      record.textHit.setAttribute('height', Math.max(box.height + padding * 2, padding * 2));
+      const hitBounds = dimensionTextHitBounds(box, scale);
+      record.textHit.setAttribute('x', hitBounds.x);
+      record.textHit.setAttribute('y', hitBounds.y);
+      record.textHit.setAttribute('width', hitBounds.width);
+      record.textHit.setAttribute('height', hitBounds.height);
       record.textHit.setAttribute('transform', record.text.getAttribute('transform') || '');
     } catch {
       // SVG text measurement is unavailable in some non-browser renderers.
@@ -784,6 +1111,10 @@ export function createDimensionRecord({
   scale,
   updateRecordHandles,
   bindRecordEvents,
+  canInteract = () => true,
+  canEditText = null,
+  onBeginLineDrag = null,
+  onEditText = null,
   onToggleExport = null,
 }) {
   const group = add(objectLayer, 'g', { class: `canvas-record entity-record dimension-record dimension-${dimensionMode(entity)}`, 'data-record-id': entity.id || `dimension-${index}` });
@@ -841,6 +1172,7 @@ export function createDimensionRecord({
   const toggleExport = (event) => {
     event.preventDefault();
     event.stopPropagation();
+    const entity = record.entity;
     const previousIncludeInValueOnly = entity.includeInValueOnly;
     const hadIncludeInValueOnly = Object.hasOwn(entity, 'includeInValueOnly');
     const previousExcludeFromExport = entity.excludeFromExport;
@@ -861,6 +1193,14 @@ export function createDimensionRecord({
     if (!['Enter', ' '].includes(event.key)) return;
     toggleExport(event);
   });
+  if (onBeginLineDrag || onEditText) {
+    bindDimensionRecordInteractions(record, {
+      canInteract,
+      canEditText: canEditText || undefined,
+      beginLineDrag: onBeginLineDrag || undefined,
+      editText: onEditText || undefined,
+    });
+  }
   updateDimensionNode(record, scale);
   updateRecordHandles(record);
   bindRecordEvents(record);
@@ -871,6 +1211,7 @@ export function moveDimensionHandle(record, handleIndex, world, startWorld, star
   const entity = record.entity;
   if (entity.type === 'radius-dimension' && handleIndex === 0) {
     entity.elbow = world;
+    recordRadialDimensionPlacement(entity);
     const textSide = world[0] >= entity.center[0] ? 1 : -1;
     entity.label = [world[0] + (32 / scale) * textSide, world[1]];
   }
@@ -889,6 +1230,30 @@ export function moveDimensionLine(record, world, startWorld, startEntity, scale)
   const dy = world[1] - startWorld[1];
   if (entity.type === 'dimension-line') {
     entity.label = [startEntity.label[0] + dx, startEntity.label[1] + dy];
+    const lineToLine = entity.anchors?.lineToLine;
+    if (lineToLine && entity.firstSegment && entity.secondSegment) {
+      const endpointRoles = parallelDimensionEndpointRoles(
+        entity.firstSegment,
+        entity.secondSegment,
+        entity.label,
+      );
+      Object.assign(lineToLine, endpointRoles);
+      const geometry = supportingLineDimensionGeometry(
+        entity.firstSegment,
+        entity.secondSegment,
+        lineToLine.measuredEndpoint,
+      );
+      entity.start = geometry.projected;
+      entity.end = geometry.measuredPoint;
+      entity.measureStart = geometry.projected;
+      entity.measureEnd = geometry.measuredPoint;
+    }
+    const placement = distanceDimensionPlacement(entity, scale, {
+      useStoredDirection: false,
+      useStoredDistance: false,
+    });
+    entity.offsetDirection = placement.direction;
+    entity.offsetDistance = placement.distance;
   }
   if (entity.type === 'angle-dimension') {
     entity.radius = Math.max(18, pointLength(subtractPoints(world, entity.vertex)));
@@ -897,6 +1262,7 @@ export function moveDimensionLine(record, world, startWorld, startEntity, scale)
   if (entity.type === 'radius-dimension') {
     const startElbow = startEntity.elbow || startEntity.label || addPoints(startEntity.center, [-72, -48]);
     entity.elbow = [startElbow[0] + dx, startElbow[1] + dy];
+    recordRadialDimensionPlacement(entity);
     const textSide = entity.elbow[0] >= entity.center[0] ? 1 : -1;
     entity.label = [entity.elbow[0] + (32 / scale) * textSide, entity.elbow[1]];
   }
@@ -907,6 +1273,15 @@ export function moveDimensionLine(record, world, startWorld, startEntity, scale)
     entity.label = [entity.elbow[0] + (34 / scale) * textSide, entity.elbow[1]];
   }
   updateDimensionNode(record, scale);
+}
+
+export function finishDimensionLineMove(record, solver) {
+  const entity = record?.entity;
+  if (
+    !['dimension-line', 'radius-dimension', 'angle-dimension', 'multi-curve-length-dimension'].includes(entity?.type)
+    || !entity.dimensionId
+  ) return false;
+  return Boolean(solver?.updateDimensionAnnotation?.(entity.dimensionId, entity));
 }
 
 export function dimensionAnchorRecordIds(entity) {
@@ -984,8 +1359,10 @@ export function createDimensionLinkManager({
   derivedFeatureDependsOn = () => false,
   isRecordProcessingEnabled = () => true,
 }) {
+  let dimensionFrame = null;
   function resolveRecordEntity(record, rendered = false) {
-    return (rendered ? renderedEntityForRecord(record) : null) || record?.entity || null;
+    const entity = (rendered ? renderedEntityForRecord(record) : null) || record?.entity || null;
+    return dimensionFrame ? transformStackEntity(entity, dimensionFrame, true) : entity;
   }
 
   function nearestSegmentFeature(record, world, sourceNode = null, { rendered = false } = {}) {
@@ -1209,27 +1586,38 @@ export function createDimensionLinkManager({
     } : null;
   }
 
+  function resolveDerivedAnchor(anchor) {
+    if (anchor.type === 'point') {
+      const point = resolveDerivedFeature({ ...anchor, kind: 'point' });
+      if (point?.point) return [...point.point];
+      const featureSet = resolveDerivedFeature(anchor);
+      return featureSet?.controlPoints?.[anchor.index]?.slice() || null;
+    }
+    if (anchor.type === 'segment-start' || anchor.type === 'segment-end') {
+      const segment = resolveDerivedFeature({ ...anchor, kind: 'segment' });
+      return segment ? [...(anchor.type === 'segment-start' ? segment.start : segment.end)] : null;
+    }
+    if (anchor.type === 'segment-point') {
+      const segment = resolveDerivedFeature({ ...anchor, kind: 'segment' });
+      if (!segment) return null;
+      const ratio = Math.max(0, Math.min(1, Number(anchor.ratio) || 0));
+      return addPoints(segment.start, scalePoint(subtractPoints(segment.end, segment.start), ratio));
+    }
+    const feature = resolveDerivedFeature(anchor);
+    if (anchor.type === 'center') return feature?.center?.slice() || null;
+    if (anchor.type === 'radius') return feature?.radius ?? null;
+    return null;
+  }
+
   function resolveAnchor(anchor, { rendered = false } = {}) {
     if (!anchor) return null;
-    if (isCanvasOriginReference(anchor)) return [0, 0];
-    const record = recordById(anchor.recordId, { includeFillets: true });
-    if (!record) {
-      const derived = resolveDerivedFeature(anchor);
-      if (anchor.type === 'point') return derived?.controlPoints?.[anchor.index]?.slice() || null;
-      if (anchor.type === 'segment-start' || anchor.type === 'segment-end') {
-        const segment = resolveDerivedFeature({ kind: 'segment', recordId: anchor.recordId, index: anchor.index });
-        return segment ? [...(anchor.type === 'segment-start' ? segment.start : segment.end)] : null;
-      }
-      if (anchor.type === 'segment-point') {
-        const segment = resolveDerivedFeature({ kind: 'segment', recordId: anchor.recordId, index: anchor.index });
-        if (!segment) return null;
-        const ratio = Math.max(0, Math.min(1, Number(anchor.ratio) || 0));
-        return addPoints(segment.start, scalePoint(subtractPoints(segment.end, segment.start), ratio));
-      }
-      if (anchor.type === 'center') return derived?.center?.slice() || null;
-      if (anchor.type === 'radius') return derived?.radius ?? null;
-      return null;
+    if (isCanvasOriginReference(anchor)) {
+      const origin = solver.model?.resolvePoint?.(anchor) || [0, 0];
+      return dimensionFrame ? transformStackPoint(origin, dimensionFrame, true) : origin;
     }
+    if (anchor.derivedFeature) return resolveDerivedAnchor(anchor);
+    const record = recordById(anchor.recordId, { includeFillets: true });
+    if (!record) return resolveDerivedAnchor(anchor);
     const entity = resolveRecordEntity(record, rendered && record.recordType !== 'fillet');
     if (anchor.type === 'point') return recordHandles(entity)[anchor.index]?.slice() || null;
     if (anchor.type === 'segment-start' || anchor.type === 'segment-end') {
@@ -1249,6 +1637,7 @@ export function createDimensionLinkManager({
   }
 
   function resolveFeatureFromAnchor(featureAnchor, { rendered = false } = {}) {
+    if (featureAnchor?.derivedFeature) return resolveDerivedFeature(featureAnchor);
     const record = recordById(featureAnchor?.recordId, { includeFillets: true });
     if (!record) return resolveDerivedFeature(featureAnchor);
     if (featureAnchor.kind === 'segment') return segmentFeatureFromRecord(record, featureAnchor.index, { rendered });
@@ -1288,7 +1677,7 @@ export function createDimensionLinkManager({
     if (!entity.anchors) return false;
     const useRendered = entity.dimensionMode === 'driven';
     if (entity.type === 'dimension-line') {
-      const oldMid = midpoint(entity.measureStart || entity.start, entity.measureEnd || entity.end);
+      const placement = distanceDimensionPlacement(entity, getScale());
       const lineToLine = entity.anchors.lineToLine;
       if (lineToLine) {
         const reference = getSegmentFeature(
@@ -1302,13 +1691,18 @@ export function createDimensionLinkManager({
           { rendered: useRendered },
         );
         if (!reference || !measured) return false;
-        const geometry = supportingLineDimensionGeometry(reference, measured);
-        const nextMid = midpoint(geometry.projected, geometry.measuredPoint);
+        entity.firstSegment = dimensionExtensionSegment(reference);
+        entity.secondSegment = dimensionExtensionSegment(measured);
+        Object.assign(
+          lineToLine,
+          completedParallelDimensionEndpointRoles(lineToLine, reference, measured, entity.label),
+        );
+        const geometry = supportingLineDimensionGeometry(reference, measured, lineToLine.measuredEndpoint);
         entity.start = geometry.projected;
         entity.end = geometry.measuredPoint;
         entity.measureStart = geometry.projected;
         entity.measureEnd = geometry.measuredPoint;
-        entity.label = addPoints(entity.label, subtractPoints(nextMid, oldMid));
+        restoreDistanceDimensionPlacement(entity, placement);
         entity.text = dimensionLineText(entity);
         entity.measuredValue = computedDimensionValue(entity);
         return true;
@@ -1318,13 +1712,13 @@ export function createDimensionLinkManager({
         const point = resolveAnchor(pointToSegment.point, { rendered: useRendered });
         const segment = getSegmentFeature(pointToSegment.segment.recordId, pointToSegment.segment.index, { rendered: useRendered });
         if (!point || !segment) return false;
+        entity.firstSegment = dimensionExtensionSegment(segment);
         const projected = projectionOnSegmentSmart(point, segment, pointToSegment.projectionMode);
-        const nextMid = midpoint(projected, point);
         entity.start = projected;
         entity.end = point;
         entity.measureStart = projected;
         entity.measureEnd = point;
-        entity.label = addPoints(entity.label, subtractPoints(nextMid, oldMid));
+        restoreDistanceDimensionPlacement(entity, placement);
         entity.text = dimensionLineText(entity);
         entity.measuredValue = computedDimensionValue(entity);
         return true;
@@ -1341,27 +1735,25 @@ export function createDimensionLinkManager({
         || entity.end;
       const nextStart = resolvedStart || nextMeasureStart;
       const nextEnd = resolvedEnd || nextMeasureEnd;
-      const nextMid = midpoint(nextMeasureStart, nextMeasureEnd);
-      const delta = subtractPoints(nextMid, oldMid);
       entity.start = nextStart;
       entity.end = nextEnd;
       entity.measureStart = nextMeasureStart;
       entity.measureEnd = nextMeasureEnd;
-      entity.label = addPoints(entity.label, delta);
+      restoreDistanceDimensionPlacement(entity, placement);
       entity.text = dimensionLineText(entity);
       entity.measuredValue = computedDimensionValue(entity);
       return true;
     }
     if (entity.type === 'radius-dimension') {
-      const oldCenter = entity.center;
+      const placement = radialDimensionPlacement(entity);
       const center = resolveAnchor(entity.anchors.center, { rendered: useRendered });
       const radius = resolveAnchor(entity.anchors.radius, { rendered: useRendered });
       if (!center) return false;
-      const delta = subtractPoints(center, oldCenter);
       entity.center = center;
       if (radius) entity.radius = radius;
-      entity.elbow = addPoints(entity.elbow || entity.label, delta);
-      entity.label = addPoints(entity.label, delta);
+      restoreRadialDimensionPlacement(entity, placement);
+      const textSide = entity.elbow[0] >= entity.center[0] ? 1 : -1;
+      entity.label = addPoints(entity.elbow, [(32 / getScale()) * textSide, 0]);
       entity.text = formatDrawingLength(radialDimensionValue(entity));
       entity.measuredValue = computedDimensionValue(entity);
       return true;
@@ -1424,12 +1816,25 @@ export function createDimensionLinkManager({
       if (changedRecordIds && ![...anchorIds].some((id) => (
         changedRecordIds.has(id) || derivedFeatureDependsOn(id, changedRecordIds)
       ))) return;
-      if (!updateLinkedDimensionEntity(record.entity)) return;
+      dimensionFrame = stackFrameFor(solver.stackState, record.entity.stackId);
+      const local = transformStackEntity(record.entity, dimensionFrame, true);
+      if (local.offsetDirection) {
+        local.offsetDirection = rotateDirection(local.offsetDirection, -dimensionFrame.rotation);
+      }
+      try {
+        if (!updateLinkedDimensionEntity(local)) return;
+        const next = transformStackEntity(local, dimensionFrame);
+        if (next.offsetDirection) {
+          next.offsetDirection = rotateDirection(next.offsetDirection, dimensionFrame.rotation);
+        }
+        Object.assign(record.entity, next);
+        record.entity.coordinateFrame = { ...dimensionFrame };
+      } finally { dimensionFrame = null; }
       if (record.entity.dimensionId) solver.updateDimensionAnnotation?.(record.entity.dimensionId, record.entity);
       if (record.entity.dimensionMode === 'driven' && record.entity.dimensionId) {
         solver.dimensions.setComputedValue(
           record.entity.dimensionId,
-          computedDimensionValue(record.entity),
+          local.measuredValue ?? computedDimensionValue(local),
           computedDimensionUnit(record.entity),
         );
       }
@@ -1466,6 +1871,15 @@ const unitSmart = (point, fallback = [1, 0]) => {
 
 const formatDrawingLengthSmart = (value, drawingUnit) => formatUnitlessValue(value, drawingUnit || 'in');
 
+function dimensionReferenceForFeature(feature) {
+  const reference = feature?.dimensionReference;
+  if (!reference) return { recordId: feature?.recordId };
+  return {
+    recordId: reference.recordId,
+    ...(reference.derivedFeature ? { derivedFeature: { ...reference.derivedFeature } } : {}),
+  };
+}
+
 function pointAnchor(feature) {
   if (feature?.kind !== 'point') return null;
   if (isCanvasOriginReference(feature)) {
@@ -1473,6 +1887,7 @@ function pointAnchor(feature) {
       type: 'point',
       kind: 'point',
       referenceRole: feature.referenceRole,
+      ...(feature.stackId ? { stackId: feature.stackId } : {}),
       entityType: 'canvas-origin',
       pointRole: feature.pointRole || 'origin',
       index: 0,
@@ -1480,7 +1895,7 @@ function pointAnchor(feature) {
   }
   return {
     type: 'point',
-    recordId: feature.recordId,
+    ...dimensionReferenceForFeature(feature),
     index: feature.index,
     ...(feature.pointRole ? { pointRole: feature.pointRole } : {}),
   };
@@ -1488,14 +1903,17 @@ function pointAnchor(feature) {
 
 function segmentEndpointAnchors(feature) {
   if (feature?.kind !== 'segment') return null;
+  const reference = dimensionReferenceForFeature(feature);
   return {
-    start: { type: 'segment-start', recordId: feature.recordId, index: feature.index },
-    end: { type: 'segment-end', recordId: feature.recordId, index: feature.index },
+    start: { type: 'segment-start', ...reference, index: feature.index },
+    end: { type: 'segment-end', ...reference, index: feature.index },
   };
 }
 
 function segmentAnchor(feature) {
-  return feature?.kind === 'segment' ? { kind: 'segment', recordId: feature.recordId, index: feature.index } : null;
+  return feature?.kind === 'segment'
+    ? { kind: 'segment', ...dimensionReferenceForFeature(feature), index: feature.index }
+    : null;
 }
 
 function segmentPointAnchor(feature, point) {
@@ -1505,18 +1923,22 @@ function segmentPointAnchor(feature, point) {
   const ratio = sizeSquared ? dotSmart(subtractSmart(point, feature.start), vector) / sizeSquared : 0;
   return {
     type: 'segment-point',
-    recordId: feature.recordId,
+    ...dimensionReferenceForFeature(feature),
     index: feature.index,
     ratio: Math.max(0, Math.min(1, ratio)),
   };
 }
 
 function entityCenterAnchor(feature) {
-  return ['circle', 'arc'].includes(feature?.kind) ? { type: 'center', recordId: feature.recordId } : null;
+  return ['circle', 'arc'].includes(feature?.kind)
+    ? { type: 'center', ...dimensionReferenceForFeature(feature) }
+    : null;
 }
 
 function entityRadiusAnchor(feature) {
-  return ['circle', 'arc'].includes(feature?.kind) ? { type: 'radius', recordId: feature.recordId } : null;
+  return ['circle', 'arc'].includes(feature?.kind)
+    ? { type: 'radius', ...dimensionReferenceForFeature(feature) }
+    : null;
 }
 
 function featureEndpoints(feature) {
@@ -1542,8 +1964,9 @@ function projectionOnLineSmart(point, segment) {
   return addSmart(segment.start, scaleSmart(vector, t));
 }
 
-function supportingLineDimensionGeometry(reference, measured) {
-  const measuredPoint = midpointSmart(measured.start, measured.end);
+function supportingLineDimensionGeometry(reference, measured, measuredEndpoint = null) {
+  const measuredPoint = segmentEndpointForRole(measured, measuredEndpoint)
+    || midpointSmart(measured.start, measured.end);
   const projected = projectionOnLineSmart(measuredPoint, reference);
   const referenceVector = subtractSmart(reference.end, reference.start);
   const referenceLength = Math.hypot(...referenceVector);
@@ -1555,6 +1978,32 @@ function supportingLineDimensionGeometry(reference, measured) {
     projected,
     signedDistance,
     measuredValue: Math.abs(signedDistance),
+  };
+}
+
+function parallelDimensionEndpointRoles(reference, measured, dimensionPoint) {
+  const midpointGeometry = supportingLineDimensionGeometry(reference, measured);
+  const referenceVector = subtractSmart(reference.end, reference.start);
+  const fallbackDirection = unitSmart([-referenceVector[1], referenceVector[0]]);
+  const dimensionDirection = unitSmart(
+    subtractSmart(midpointGeometry.measuredPoint, midpointGeometry.projected),
+    fallbackDirection,
+  );
+  return {
+    referenceEndpoint: closestSegmentEndpointRole(reference, dimensionPoint, dimensionDirection),
+    measuredEndpoint: closestSegmentEndpointRole(measured, dimensionPoint, dimensionDirection),
+  };
+}
+
+function completedParallelDimensionEndpointRoles(lineToLine, reference, measured, dimensionPoint) {
+  const selected = parallelDimensionEndpointRoles(reference, measured, dimensionPoint);
+  return {
+    referenceEndpoint: ['start', 'end'].includes(lineToLine?.referenceEndpoint)
+      ? lineToLine.referenceEndpoint
+      : selected.referenceEndpoint,
+    measuredEndpoint: ['start', 'end'].includes(lineToLine?.measuredEndpoint)
+      ? lineToLine.measuredEndpoint
+      : selected.measuredEndpoint,
   };
 }
 
@@ -1599,7 +2048,8 @@ function storedSegment(entityById, reference) {
 }
 
 function parallelEdgeSegmentAnchors(annotation, constraint) {
-  if (annotation?.type !== 'dimension-line' || annotation.anchors?.lineToLine) return null;
+  if (annotation?.type !== 'dimension-line') return null;
+  if (annotation.anchors?.lineToLine) return { ...annotation.anchors.lineToLine };
   const pointToSegment = annotation.anchors?.pointToSegment;
   if (
     annotation.measurementKind === 'parallel-edge-distance'
@@ -1649,13 +2099,23 @@ export function upgradeLegacyParallelEdgeDimensions(snapshot = {}) {
     const reference = storedSegment(entityById, lineToLine.reference);
     const measured = storedSegment(entityById, lineToLine.measured);
     if (!reference || !measured) return annotation;
-    const geometry = supportingLineDimensionGeometry(reference, measured);
+    const lineToLineWithEndpoints = {
+      ...lineToLine,
+      ...completedParallelDimensionEndpointRoles(lineToLine, reference, measured, annotation.label),
+    };
+    const geometry = supportingLineDimensionGeometry(
+      reference,
+      measured,
+      lineToLineWithEndpoints.measuredEndpoint,
+    );
     const orientation = Math.sign(geometry.signedDistance) || 1;
     const direction = unitSmart(subtractSmart(geometry.measuredPoint, geometry.projected));
-    migrations.set(annotation.dimensionId, { lineToLine, orientation, direction });
-    return {
+    migrations.set(annotation.dimensionId, { lineToLine: lineToLineWithEndpoints, orientation, direction });
+    const upgraded = {
       ...annotation,
       measurementKind: 'parallel-edge-distance',
+      firstSegment: dimensionExtensionSegment(reference),
+      secondSegment: dimensionExtensionSegment(measured),
       subtype: 'aligned',
       orientation,
       direction,
@@ -1663,9 +2123,48 @@ export function upgradeLegacyParallelEdgeDimensions(snapshot = {}) {
       end: geometry.measuredPoint,
       measureStart: geometry.projected,
       measureEnd: geometry.measuredPoint,
-      anchors: { lineToLine },
+      anchors: { lineToLine: lineToLineWithEndpoints },
       measuredValue: geometry.measuredValue,
     };
+    const placement = distanceDimensionPlacement(upgraded, 1, {
+      useStoredDirection: false,
+      useStoredDistance: false,
+    });
+    upgraded.offsetDirection = annotation.offsetDirection || placement.direction;
+    upgraded.offsetDistance = Number.isFinite(Number(annotation.offsetDistance))
+      ? Math.max(0, Number(annotation.offsetDistance))
+      : placement.distance;
+    return upgraded;
+  }).map((annotation) => {
+    if (annotation?.type === 'radius-dimension' && Array.isArray(annotation.center)) {
+      const hasStoredDirection = pointLength(annotation.offsetDirection || []) > 0.0001;
+      const hasStoredDistance = Number.isFinite(Number(annotation.offsetDistance));
+      if (hasStoredDirection && hasStoredDistance) return annotation;
+      const upgraded = { ...annotation };
+      const placement = radialDimensionPlacement(upgraded, {
+        useStoredDirection: false,
+        useStoredDistance: false,
+      });
+      if (!hasStoredDirection) upgraded.offsetDirection = placement.direction;
+      if (!hasStoredDistance) upgraded.offsetDistance = placement.distance;
+      if (pointLength(upgraded.direction || []) <= 0.0001) upgraded.direction = placement.direction;
+      return upgraded;
+    }
+    if (
+      annotation?.type !== 'dimension-line'
+      || !Array.isArray(annotation.label)
+    ) return annotation;
+    const hasStoredDirection = pointLength(annotation.offsetDirection || []) > 0.0001;
+    const hasStoredDistance = Number.isFinite(Number(annotation.offsetDistance));
+    if (hasStoredDirection && hasStoredDistance) return annotation;
+    const upgraded = { ...annotation };
+    const placement = distanceDimensionPlacement(upgraded, 1, {
+      useStoredDirection: false,
+      useStoredDistance: false,
+    });
+    if (!hasStoredDirection) upgraded.offsetDirection = placement.direction;
+    if (!hasStoredDistance) upgraded.offsetDistance = placement.distance;
+    return upgraded;
   });
   return {
     ...snapshot,
@@ -1693,11 +2192,14 @@ export function upgradeLegacyParallelEdgeDimensions(snapshot = {}) {
 }
 
 function parallelEndpointDimension(first, second, pointer, mode, drawingUnit) {
-  const geometry = supportingLineDimensionGeometry(first, second);
-  return {
+  const endpointRoles = parallelDimensionEndpointRoles(first, second, pointer);
+  const geometry = supportingLineDimensionGeometry(first, second, endpointRoles.measuredEndpoint);
+  const dimension = {
     type: 'dimension-line',
     dimensionMode: mode,
     measurementKind: 'parallel-edge-distance',
+    firstSegment: dimensionExtensionSegment(first),
+    secondSegment: dimensionExtensionSegment(second),
     subtype: 'aligned',
     orientation: Math.sign(geometry.signedDistance) || 1,
     direction: unitSmart(subtractSmart(geometry.measuredPoint, geometry.projected)),
@@ -1711,11 +2213,13 @@ function parallelEndpointDimension(first, second, pointer, mode, drawingUnit) {
       lineToLine: {
         reference: segmentAnchor(first),
         measured: segmentAnchor(second),
+        ...endpointRoles,
       },
     },
     measuredValue: geometry.measuredValue,
     useRenderedMeasurement: mode === 'driven',
   };
+  return recordDistanceDimensionPlacement(dimension);
 }
 
 function linesIntersection(a, b) {
@@ -1776,7 +2280,7 @@ function distanceDimensionSmart(start, end, pointer, mode, sourceStart = start, 
     : subtype === 'vertical'
       ? Math.abs(sourceEnd[1] - sourceStart[1])
       : pointDistanceSmart(start, end);
-  return {
+  const dimension = {
     type: 'dimension-line',
     dimensionMode: mode,
     subtype,
@@ -1792,6 +2296,7 @@ function distanceDimensionSmart(start, end, pointer, mode, sourceStart = start, 
     useRenderedMeasurement: mode === 'driven',
     ...(orientation ? { orientation } : {}),
   };
+  return recordDistanceDimensionPlacement(dimension);
 }
 
 function linkedPositionAxis(start, end, pointer) {
@@ -1826,7 +2331,8 @@ export function linkedPositionDimension(selections, pointer, drawingUnit = 'in')
   const perpendicularAxis = axis === 0 ? 1 : 0;
   const measured = Math.abs(second.point[axis] - first.point[axis]);
   const orientation = distanceOrientation(subtype, first.point, second.point);
-  return {
+  const derivedReference = dimensionReferenceForFeature(derived);
+  const dimension = {
     type: 'dimension-line',
     dimensionMode: 'driving',
     subtype,
@@ -1848,7 +2354,7 @@ export function linkedPositionDimension(selections, pointer, drawingUnit = 'in')
     },
     externalDrivingTarget: {
       type: 'linked-position',
-      recordId: derived.recordId,
+      ...derivedReference,
       copyId: derived.linkedCopyId,
       sourceId: derived.linkedSourceId,
       pointIndex: derived.index,
@@ -1858,6 +2364,7 @@ export function linkedPositionDimension(selections, pointer, drawingUnit = 'in')
       perpendicularOffset: derived.point[perpendicularAxis] - other.point[perpendicularAxis],
     },
   };
+  return recordDistanceDimensionPlacement(dimension);
 }
 
 function angleBetweenSegments(first, second, pointer, mode) {
@@ -1919,7 +2426,7 @@ function angleBetweenSegments(first, second, pointer, mode) {
 function radiusDimension(feature, pointer, mode, drawingUnit) {
   const subtype = feature.kind === 'circle' ? 'diameter' : 'radius';
   const measuredValue = subtype === 'diameter' ? feature.radius * 2 : feature.radius;
-  return {
+  return recordRadialDimensionPlacement({
     type: 'radius-dimension',
     subtype,
     dimensionMode: mode,
@@ -1935,7 +2442,7 @@ function radiusDimension(feature, pointer, mode, drawingUnit) {
       center: entityCenterAnchor(feature),
       radius: entityRadiusAnchor(feature),
     },
-  };
+  });
 }
 
 function mclDimension(features, pointer, drawingUnit) {
@@ -1954,7 +2461,7 @@ function mclDimension(features, pointer, drawingUnit) {
     anchors: {
       features: features.map((feature) => ({
         kind: feature.kind,
-        recordId: feature.recordId,
+        ...dimensionReferenceForFeature(feature),
         index: feature.index,
       })),
     },
@@ -2008,6 +2515,7 @@ export function candidateFromSelections(selections, pointer, mode, ctrlMcl = fal
       const dimension = distanceDimensionSmart(projected, first.point, pointer, mode, projected, first.point, {
         pointToSegment: { point: pointAnchor(first), segment: segmentAnchor(second) },
       }, drawingUnit);
+      dimension.firstSegment = dimensionExtensionSegment(second);
       if (mode === 'driving' && first.entityType === 'notch') {
         dimension.externalDrivingTarget = {
           type: 'notch-distance',
@@ -2022,6 +2530,7 @@ export function candidateFromSelections(selections, pointer, mode, ctrlMcl = fal
       const dimension = distanceDimensionSmart(projected, second.point, pointer, mode, projected, second.point, {
         pointToSegment: { point: pointAnchor(second), segment: segmentAnchor(first) },
       }, drawingUnit);
+      dimension.firstSegment = dimensionExtensionSegment(first);
       if (mode === 'driving' && second.entityType === 'notch') {
         dimension.externalDrivingTarget = {
           type: 'notch-distance',
@@ -2044,6 +2553,16 @@ export function candidateFromSelections(selections, pointer, mode, ctrlMcl = fal
 export function radialCandidateUsesPlacementClick(candidate, mode, event = {}) {
   return candidate?.type === 'radius-dimension'
     && !(mode === 'driven' && event.ctrlKey);
+}
+
+export function commitSmartDimensionCandidate(canvas, candidate, { preserveSelectionThroughClick = false } = {}) {
+  if (!candidate) return false;
+  canvas.addDimension({
+    ...candidate,
+    solveDomain: stackRelationshipSolveDomain(canvas.getActiveStackId?.()),
+  });
+  if (preserveSelectionThroughClick) canvas.suppressNextCanvasSelectionClear?.();
+  return true;
 }
 
 export function setDimensionSelectionActive(canvas, active) {
@@ -2124,10 +2643,10 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
     selections = selections.length >= 2 ? [feature] : [...selections, feature];
   }
 
-  function placeCandidate() {
+  function placeCandidate({ preserveSelectionThroughClick = false } = {}) {
     if (!candidate) return false;
     const completedMode = activeMode;
-    canvas.addDimension(candidate);
+    commitSmartDimensionCandidate(canvas, candidate, { preserveSelectionThroughClick });
     deactivate();
     rememberRepeatableTool(() => {
       if (activeMode) return false;
@@ -2147,7 +2666,7 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
       const pointer = canvas.screenToWorld(event.clientX, event.clientY);
       if (radialCandidateUsesPlacementClick(candidate, activeMode, event)) {
         updateCandidate(pointer);
-        if (placeCandidate()) {
+        if (placeCandidate({ preserveSelectionThroughClick: true })) {
           event.preventDefault();
           event.stopPropagation();
           return true;
@@ -2157,7 +2676,7 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
         rendered: true,
         dimensionMode: activeMode,
       });
-      if (!feature && placeCandidate()) {
+      if (!feature && placeCandidate({ preserveSelectionThroughClick: true })) {
         event.preventDefault();
         event.stopPropagation();
         return true;

@@ -1,5 +1,6 @@
 import { createUuid } from './IdentitySystem.js';
 import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+import { createExpressionBoxLookup, expressionBoxLookupMarkup } from './ExpressionBox.js';
 
 registerIdentitySchema('controls', {
   declarations: (value) => (value?.items || []).map((object, index) => ({
@@ -357,7 +358,7 @@ export function clampPanelToViewport(panel, {
   minTop = null,
   maxRight = null,
 } = {}) {
-  if (!panel || panel.hidden) return null;
+  if (!panel || panel.hidden || panel.closest?.('[data-dock-panel]')) return null;
   const rect = panel.getBoundingClientRect();
   const position = clampPanelPosition(rect, {
     viewportWidth: window.innerWidth,
@@ -388,6 +389,7 @@ export function bindFloatingPanelDrag(panel, {
     maxRight,
   });
   const pointerDown = (event) => {
+    if (panel.closest?.('[data-dock-panel]')) return;
     if (event.button !== 0 || event.target.closest?.(ignoreSelector)) return;
     const rect = panel.getBoundingClientRect();
     drag = {
@@ -1083,9 +1085,12 @@ export function controlRowMarkup(item, state, editing) {
     <div class="panel-control-runtime">${controlRuntimeMarkup(item, state)}</div>
     ${editing ? `<label class="panel-control-expression">
       <span>Expression</span>
-      <textarea data-control-expression rows="2" wrap="soft" autocomplete="off" spellcheck="false"
-        placeholder="${item.controlType === 'horizontal-scrollbar' ? 'MinMax(0, 100, 50, 1)' : item.controlType === 'options' || item.controlType === 'dropdown' ? '{dog|cat|house}' : 'Expression'}"
-        aria-invalid="${configurationError ? 'true' : 'false'}">${escapeHtml(item.configurationExpression)}</textarea>
+      <span class="expression-box">
+        <textarea data-control-expression aria-label="${escapeHtml(item.parameterName)} expression" rows="2" wrap="soft" autocomplete="off" spellcheck="false"
+          placeholder="${item.controlType === 'horizontal-scrollbar' ? 'MinMax(0, 100, 50, 1)' : item.controlType === 'options' || item.controlType === 'dropdown' ? '{dog|cat|house}' : 'Expression'}"
+          aria-invalid="${configurationError ? 'true' : 'false'}">${escapeHtml(item.configurationExpression)}</textarea>
+        ${expressionBoxLookupMarkup({ id: `controlExpressionLookup-${item.id}` })}
+      </span>
     </label>
     <p class="panel-control-error" role="alert" ${error ? '' : 'hidden'}>${escapeHtml(error)}</p>` : ''}
   </article>`;
@@ -1096,6 +1101,7 @@ export function createControlTools({
   canvas,
   solver,
   host = document.querySelector('.app-shell') || document.body,
+  onVisibilityChange = () => {},
 } = {}) {
   const button = toolbar?.matches?.('[data-controls-toggle]')
     ? toolbar
@@ -1119,6 +1125,7 @@ export function createControlTools({
   let renderedControlIds = [];
   const pendingControlUpdates = new Map();
   const latestControlUpdateRevisions = new Map();
+  const controlExpressionLookups = new Map();
 
   panel.className = 'floating-panel controls-panel';
   panel.id = 'controlsPanel';
@@ -1160,9 +1167,12 @@ export function createControlTools({
     if (visible) {
       render();
       panelDragController.clamp();
+    } else {
+      controlExpressionLookups.forEach((lookup) => lookup.close());
     }
     button?.classList.toggle('active', visible);
     button?.setAttribute('aria-pressed', String(visible));
+    onVisibilityChange(Boolean(visible));
   }
 
   function setEditing(value) {
@@ -1271,7 +1281,39 @@ export function createControlTools({
     list.querySelectorAll('[data-control-expression]').forEach(resizeControlExpression);
   }
 
+  function destroyControlExpressionLookups() {
+    controlExpressionLookups.forEach((lookup) => lookup.destroy());
+    controlExpressionLookups.clear();
+  }
+
+  function controlExpressionLookupOptions(item) {
+    const entries = new Map((solver.parameters?.() || []).map((entry) => [entry.id, entry]));
+    return (solver.parameterExpressionSymbols?.({ includeLocalAliases: true }) || [])
+      .filter((symbol) => (
+        symbol.name
+        && symbol.parameterId !== item.parameterId
+        && !entries.get(symbol.parameterId)?.error
+      ))
+      .map((symbol) => ({
+        name: symbol.name,
+        label: symbol.kind === 'dimension' ? `${symbol.name} (dimension)` : symbol.name,
+      }));
+  }
+
+  function bindControlExpressionLookups() {
+    list.querySelectorAll('[data-control-id]').forEach((row) => {
+      const item = model.get(row.dataset.controlId);
+      const field = row.querySelector('[data-control-expression]');
+      const listbox = row.querySelector('[data-expression-lookup-list]');
+      if (!item || !field || !listbox) return;
+      const lookup = createExpressionBoxLookup({ field, listbox });
+      lookup.setOptions(controlExpressionLookupOptions(item));
+      controlExpressionLookups.set(item.id, lookup);
+    });
+  }
+
   function render() {
+    destroyControlExpressionLookups();
     const items = model.list();
     const rows = items.map((item) => ({ item, state: controlPanelState(item, solver) }));
     const displayedRows = editing ? rows : rows.filter(({ state }) => state.effectiveVisible);
@@ -1280,6 +1322,7 @@ export function createControlTools({
       ? displayedRows.map(({ item, state }) => controlRowMarkup(item, state, editing)).join('')
       : `<p class="controls-empty-state">${editing ? 'Use Add control to build this userform.' : items.length ? 'No controls are visible.' : 'No controls have been added.'}</p>`;
     resizeControlExpressions();
+    bindControlExpressionLookups();
     updateVisibilityExpressionSymbols();
   }
 
@@ -1287,7 +1330,7 @@ export function createControlTools({
     visibilityExpressionSymbols.innerHTML = (solver.parameterExpressionSymbols?.({ includeLocalAliases: true }) || [])
       .map(({ name }) => `<option value="${escapeHtml(name)}"></option>`).join('');
     list.querySelectorAll('[data-control-visibility-expression]').forEach((input) => {
-      input.setAttribute('list', visibilityExpressionSymbols.id);
+      input.setAttribute('data-expression-source', visibilityExpressionSymbols.id);
     });
   }
 
@@ -1582,6 +1625,7 @@ export function createControlTools({
     setVisible,
     setEditing,
     destroy() {
+      destroyControlExpressionLookups();
       stopSolverSubscription?.();
       unregisterExtension?.();
       panelDragController.destroy();

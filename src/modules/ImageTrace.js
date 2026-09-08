@@ -71,6 +71,19 @@ export function normalizeImageTraceSettings(input = {}) {
   };
 }
 
+export function createImageTraceSettingsMemory(initialSettings = {}) {
+  let settings = normalizeImageTraceSettings(initialSettings);
+  return {
+    recall() {
+      return { ...settings };
+    },
+    remember(nextSettings = {}) {
+      settings = normalizeImageTraceSettings(nextSettings);
+      return { ...settings };
+    },
+  };
+}
+
 export function imageWorldToLocalPoint(entity, worldPoint) {
   const translated = [worldPoint[0] - entity.x, worldPoint[1] - entity.y];
   const rotated = rotatePoint(translated, -finite(entity.rotation, 0));

@@ -12,6 +12,9 @@ import { nearestDimensionFeature, resolveDimensionFeatureSet } from './Dimension
 import { inwardTargetFromBoundary, projectPointToNotchFeature } from './NotchSystem.js';
 import { bindFloatingPanelDrag } from './CanvasUIControls.js';
 import { createUuid } from './IdentitySystem.js';
+import { imageFillSelectionProperties } from './ImageSystem.js';
+import { imageStrokeSelectionProperties } from './ImageStrokeSystem.js';
+import { arcSweepFromAngles } from './ArcGeometry.js';
 
 export const SWELL_ICON = '<path d="M4 16h4c2.5 0 2.5-8 5-8h7"/><path d="M4 20h5c3.5 0 3.5-8 7-8h4"/>';
 
@@ -72,24 +75,31 @@ function pieceEnd(entity) {
   return null;
 }
 
-function styleGeometry(node, appearance = {}, { fill = false, stroke = true } = {}) {
+function styleGeometry(node, appearance = {}, {
+  fill = false,
+  stroke = true,
+  fillPaint = null,
+  strokePaint = null,
+} = {}) {
   const strokeColor = appearance.strokeColor || '#202020';
   const strokeThickness = Math.max(0.1, Number(appearance.strokeThickness) || 1.5);
   const strokeOpacity = Number.isFinite(Number(appearance.strokeOpacity)) ? Number(appearance.strokeOpacity) : 1;
   const fillColor = appearance.fillColor || '#ffffff';
   const fillOpacity = Number.isFinite(Number(appearance.fillOpacity)) ? Number(appearance.fillOpacity) : 1;
+  const resolvedStrokePaint = strokePaint || strokeColor;
+  const resolvedFillPaint = fillPaint || fillColor;
   node.style.setProperty('--original-stroke-width', `${strokeThickness}px`);
-  node.setAttribute('stroke', stroke ? strokeColor : 'none');
+  node.setAttribute('stroke', stroke ? resolvedStrokePaint : 'none');
   node.setAttribute('stroke-width', stroke ? strokeThickness : 0);
   node.setAttribute('stroke-opacity', stroke ? strokeOpacity : 0);
-  node.setAttribute('fill', fill ? fillColor : 'none');
+  node.setAttribute('fill', fill ? resolvedFillPaint : 'none');
   node.setAttribute('fill-opacity', fill ? fillOpacity : 0);
-  node.style.stroke = stroke ? strokeColor : 'none';
+  node.style.stroke = stroke ? resolvedStrokePaint : 'none';
   node.style.strokeWidth = `${stroke ? strokeThickness : 0}px`;
   node.style.strokeOpacity = String(stroke ? strokeOpacity : 0);
   node.style.strokeLinecap = 'round';
   node.style.strokeLinejoin = 'round';
-  node.style.fill = fill ? fillColor : 'none';
+  node.style.fill = fill ? resolvedFillPaint : 'none';
   node.style.fillOpacity = String(fill ? fillOpacity : 0);
 }
 
@@ -107,6 +117,144 @@ function geometryNode(entity) {
   return null;
 }
 
+function linearPathMetrics(points = [], closed = false) {
+  const pairs = points.slice(0, -1).map((point, index) => ({
+    start: point,
+    end: points[index + 1],
+  }));
+  if (closed && points.length > 1) pairs.push({ start: points.at(-1), end: points[0] });
+  const segments = pairs.map(({ start, end }) => ({
+    start,
+    end,
+    length: pointDistance(start, end),
+  })).filter(({ length }) => length > 1e-12);
+  const totalLength = segments.reduce((sum, { length }) => sum + length, 0);
+  return {
+    totalLength,
+    pointAtLength(distance) {
+      if (!segments.length) return { x: Number(points[0]?.[0]) || 0, y: Number(points[0]?.[1]) || 0 };
+      let remaining = Math.max(0, Math.min(totalLength, Number(distance) || 0));
+      for (const segment of segments) {
+        if (remaining <= segment.length) {
+          const t = segment.length > 0 ? remaining / segment.length : 0;
+          return {
+            x: segment.start[0] + (segment.end[0] - segment.start[0]) * t,
+            y: segment.start[1] + (segment.end[1] - segment.start[1]) * t,
+          };
+        }
+        remaining -= segment.length;
+      }
+      const end = segments.at(-1).end;
+      return { x: end[0], y: end[1] };
+    },
+  };
+}
+
+export function swellImageStrokePathMetrics(entity = {}) {
+  if (entity.type === 'line') return linearPathMetrics([entity.start, entity.end]);
+  if (entity.type === 'polyline' || entity.type === 'polygon') {
+    return linearPathMetrics(entity.points || [], entity.type === 'polygon');
+  }
+  if (entity.type === 'circle') {
+    const radius = Math.max(0, Math.abs(Number(entity.radius) || 0));
+    const totalLength = Math.PI * 2 * radius;
+    return {
+      totalLength,
+      pointAtLength(distance) {
+        const angle = totalLength > 0 ? Math.max(0, Math.min(totalLength, Number(distance) || 0)) / radius : 0;
+        return {
+          x: entity.center[0] + radius * Math.cos(angle),
+          y: entity.center[1] + radius * Math.sin(angle),
+        };
+      },
+    };
+  }
+  if (entity.type === 'arc') {
+    const radius = Math.max(0, Math.abs(Number(entity.radius) || 0));
+    const startAngle = Math.atan2(entity.start[1] - entity.center[1], entity.start[0] - entity.center[0]);
+    const endAngle = Math.atan2(entity.end[1] - entity.center[1], entity.end[0] - entity.center[0]);
+    const middleAngle = finitePoint(entity.arcPoint)
+      ? Math.atan2(entity.arcPoint[1] - entity.center[1], entity.arcPoint[0] - entity.center[0])
+      : null;
+    const sweep = arcSweepFromAngles(startAngle, endAngle, middleAngle, entity);
+    const totalLength = Math.abs(sweep.span) * radius;
+    return {
+      totalLength,
+      pointAtLength(distance) {
+        const t = totalLength > 0 ? Math.max(0, Math.min(totalLength, Number(distance) || 0)) / totalLength : 0;
+        const angle = startAngle + sweep.span * t;
+        return {
+          x: entity.center[0] + radius * Math.cos(angle),
+          y: entity.center[1] + radius * Math.sin(angle),
+        };
+      },
+    };
+  }
+  return null;
+}
+
+export function swellDimensionReference(ownerId, segmentIndex, role, ordinal = 0) {
+  return {
+    recordId: String(ownerId),
+    derivedFeature: {
+      provider: 'swell',
+      segmentIndex: Number.isInteger(segmentIndex) ? segmentIndex : null,
+      role,
+      ordinal: Number.isInteger(ordinal) ? ordinal : 0,
+    },
+  };
+}
+
+export function swellDerivedFeatureReference(feature = {}) {
+  const reference = feature.dimensionReference
+    || (feature.swellSourceId
+      ? swellDimensionReference(
+        feature.swellSourceId,
+        feature.swellSegmentIndex,
+        feature.swellRole,
+        feature.swellOrdinal,
+      )
+      : null);
+  if (!reference?.recordId || !reference?.derivedFeature) return null;
+  return {
+    kind: feature.kind,
+    recordId: String(reference.recordId),
+    index: Number(feature.index),
+    derivedFeature: clone(reference.derivedFeature),
+    ...(feature.pointRole ? { pointRole: feature.pointRole } : {}),
+  };
+}
+
+export function normalizeSwellExternalConstraint(value = {}, resolveDerivedFeature = () => null) {
+  const constraint = clone(value);
+  const target = constraint.externalTarget;
+  const supplied = target?.derivedRef;
+  if (target?.type !== 'swell-derived' || !supplied) return constraint;
+  const resolved = resolveDerivedFeature(supplied);
+  const resolvedReference = resolved && swellDerivedFeatureReference(resolved);
+  const derivedFeature = supplied.derivedFeature || resolvedReference?.derivedFeature;
+  const sourceId = resolvedReference?.recordId || target.sourceId || (
+    supplied.derivedFeature ? supplied.recordId : null
+  );
+  if (!sourceId || !derivedFeature) return constraint;
+  return {
+    ...constraint,
+    externalTarget: {
+      ...target,
+      sourceId: String(sourceId),
+      derivedRef: {
+        kind: supplied.kind || resolved?.kind,
+        recordId: String(sourceId),
+        index: Number(supplied.index ?? resolved?.index ?? 0),
+        derivedFeature: clone(derivedFeature),
+        ...(supplied.pointRole || resolved?.pointRole
+          ? { pointRole: supplied.pointRole || resolved.pointRole }
+          : {}),
+      },
+    },
+  };
+}
+
 export function swellDimensionFeatureSetForPiece(piece, node = null) {
   const { entity, id: recordId } = piece;
   const common = {
@@ -116,6 +264,13 @@ export function swellDimensionFeatureSetForPiece(piece, node = null) {
     swellSourceId: piece.ownerId,
     swellSegmentIndex: piece.segmentIndex,
     swellRole: piece.role,
+    swellOrdinal: Number.isInteger(piece.ordinal) ? piece.ordinal : 0,
+    dimensionReference: swellDimensionReference(
+      piece.ownerId,
+      piece.segmentIndex,
+      piece.role,
+      piece.ordinal,
+    ),
     node,
   };
   if (entity.type === 'line') {
@@ -181,6 +336,21 @@ export function swellDimensionFeatureSetForPiece(piece, node = null) {
   return null;
 }
 
+export function swellDimensionFeatureForMode(feature, mode = 'driven') {
+  if (!feature) return null;
+  return mode === 'driving' && feature.kind !== 'point' ? null : feature;
+}
+
+export function swellPieceMatchesDimensionReference(piece, request = {}) {
+  const selector = request.derivedFeature;
+  if (selector?.provider !== 'swell' || piece?.ownerId !== request.recordId) return false;
+  const pieceSegmentIndex = Number.isInteger(piece.segmentIndex) ? piece.segmentIndex : null;
+  const requestedSegmentIndex = Number.isInteger(selector.segmentIndex) ? selector.segmentIndex : null;
+  return pieceSegmentIndex === requestedSegmentIndex
+    && piece.role === selector.role
+    && (Number.isInteger(piece.ordinal) ? piece.ordinal : 0) === (Number.isInteger(selector.ordinal) ? selector.ordinal : 0);
+}
+
 export function swellPieceHandlePoints(piece) {
   const entity = piece?.entity;
   if (!entity) return [];
@@ -237,8 +407,12 @@ function mixedValue(values, fallback = null) {
   return new Set(values.map((value) => JSON.stringify(value))).size === 1 ? values[0] : fallback;
 }
 
-function appearanceSelectionPatch(appearances, { canFill = false } = {}) {
+export function swellAppearanceSelectionProperties(appearances, { canFill = false } = {}) {
   const values = (key) => appearances.map((appearance) => appearance?.[key]);
+  const canEditImageFill = canFill && appearances.length > 0;
+  const canEditImageStroke = appearances.length > 0;
+  const imageFillProperties = imageFillSelectionProperties(appearances, canEditImageFill);
+  const imageStrokeProperties = imageStrokeSelectionProperties(appearances, canEditImageStroke);
   return {
     fillColor: mixedValue(values('fillColor'), '#ffffff'),
     fillExpression: mixedValue(values('fillExpression')),
@@ -252,8 +426,20 @@ function appearanceSelectionPatch(appearances, { canFill = false } = {}) {
     canEditFill: canFill,
     canEditStroke: appearances.length > 0,
     canEditOpacity: appearances.length > 0,
-    canEditImageFill: false,
-    canEditImageStroke: false,
+    canEditImageFill,
+    ...imageFillProperties,
+    ...imageStrokeProperties,
+    errors: {
+      fill: appearances.find(({ errors }) => errors?.fill)?.errors.fill || null,
+      imageLeft: imageFillProperties.imageLeftError,
+      imageTop: imageFillProperties.imageTopError,
+      imageRotation: imageFillProperties.imageRotationError,
+      fillOpacity: appearances.find(({ errors }) => errors?.fillOpacity)?.errors.fillOpacity || null,
+      strokeOpacity: appearances.find(({ errors }) => errors?.strokeOpacity)?.errors.strokeOpacity || null,
+      stroke: appearances.find(({ errors }) => errors?.stroke)?.errors.stroke || null,
+      imageStrokeWidth: imageStrokeProperties.imageStrokeWidthError,
+      imageStrokeHeight: imageStrokeProperties.imageStrokeHeightError,
+    },
     mixedFill: new Set(values('fillExpression')).size > 1,
     mixedFillOpacity: new Set(values('fillOpacityExpression')).size > 1,
     mixedStrokeColor: new Set(values('strokeColor')).size > 1,
@@ -276,11 +462,11 @@ function selectedSwellTargets(canvas, entitiesById) {
 export function swellPropertiesPanelMarkup() {
   return `<header class="swell-panel-header"><h2>Swell</h2></header>
   <div class="swell-properties" data-swell-properties>
-    <label class="property-row" for="swellOffsetBaseProperty"><span>Offset</span><input class="swell-expression-input" id="swellOffsetBaseProperty" aria-label="Offset expression" list="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
+    <label class="property-row" for="swellOffsetBaseProperty"><span>Offset</span><input class="swell-expression-input" id="swellOffsetBaseProperty" aria-label="Offset expression" data-expression-source="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
     <label class="property-row text-checkbox-row swell-toggle-property" for="swellEnabledProperty" hidden style="display:none"><span>Swell</span><input id="swellEnabledProperty" type="checkbox" /></label>
-    <label class="property-row swell-line-property" for="swellOffsetProperty" hidden style="display:none"><span>Swell Offset</span><input class="swell-expression-input" id="swellOffsetProperty" aria-label="Swell offset expression" list="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
-    <label class="property-row swell-line-property" for="swellStartTransitionProperty" hidden style="display:none"><span>Start Arc Length</span><input class="swell-expression-input" id="swellStartTransitionProperty" aria-label="Start arc length expression" list="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
-    <label class="property-row swell-line-property" for="swellEndTransitionProperty" hidden style="display:none"><span>End Arc Length</span><input class="swell-expression-input" id="swellEndTransitionProperty" aria-label="End arc length expression" list="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
+    <label class="property-row swell-line-property" for="swellOffsetProperty" hidden style="display:none"><span>Swell Offset</span><input class="swell-expression-input" id="swellOffsetProperty" aria-label="Swell offset expression" data-expression-source="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
+    <label class="property-row swell-line-property" for="swellStartTransitionProperty" hidden style="display:none"><span>Start Arc Length</span><input class="swell-expression-input" id="swellStartTransitionProperty" aria-label="Start arc length expression" data-expression-source="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
+    <label class="property-row swell-line-property" for="swellEndTransitionProperty" hidden style="display:none"><span>End Arc Length</span><input class="swell-expression-input" id="swellEndTransitionProperty" aria-label="End arc length expression" data-expression-source="swellExpressionNames" type="text" autocomplete="off" spellcheck="false" /></label>
     <datalist id="swellExpressionNames"></datalist>
   </div>`;
 }
@@ -344,14 +530,16 @@ export function swellExternalConstraintRequest(type, features = [], request = {}
     };
   }
   if (!movableRef) return null;
+  const derivedRef = swellDerivedFeatureReference(derived);
+  if (!derivedRef) return null;
   return {
     ...clone(request),
     id: String(request.id || createUuid()),
     externalTarget: {
       type: 'swell-derived',
-      derivedRef: { kind: derived.kind, recordId: derived.recordId, index: derived.index },
+      derivedRef,
       movableRef,
-      sourceId: derived.swellSourceId,
+      sourceId: derivedRef.recordId,
     },
   };
 }
@@ -465,6 +653,27 @@ export function createSwellTools({
       || { entities: [], constraints: [] };
   }
 
+  const derivativeSourceProvider = {
+    referenceFromTarget(target) {
+      const piece = target?.closest?.('[data-swell-piece-index]');
+      const group = piece?.closest?.('.swell-derived-group[data-swell-owner-id]');
+      const pieceIndex = Number(piece?.dataset?.swellPieceIndex);
+      if (!group || !Number.isInteger(pieceIndex)) return null;
+      return { kind: 'swell-piece', ownerId: group.dataset.swellOwnerId, pieceIndex };
+    },
+    nodeForReference(reference) {
+      if (reference?.kind !== 'swell-piece') return null;
+      const group = [...(objectLayer?.children || [])].find((node) => (
+        node.classList?.contains?.('swell-derived-group')
+        && node.dataset?.swellOwnerId === String(reference.ownerId)
+      ));
+      return [...(group?.children || [])].find((node) => (
+        node.classList?.contains?.('swell-derived-piece')
+        && Number(node.dataset?.swellPieceIndex) === Number(reference.pieceIndex)
+      )) || null;
+    },
+  };
+
   function sourceAppearance(recordId) {
     return canvas.getResolvedGeometryAppearance?.(recordId) || {
       fillColor: '#ffffff', fillOpacity: 1, strokeColor: '#202020', strokeOpacity: 1, strokeThickness: 1.5,
@@ -514,27 +723,39 @@ export function createSwellTools({
     syncGroupPresentation(group, result.ownerId);
     const appearance = sourceAppearance(result.ownerId);
     const handlePoints = [];
-    const applyPieceData = (node, piece) => {
+    const renderedPieces = [];
+    const applyPieceData = (node, piece, pieceIndex) => {
       node.dataset.swellPieceId = piece.id;
       node.dataset.swellSourceId = piece.ownerId;
+      node.dataset.swellPieceIndex = String(pieceIndex);
       if (Number.isInteger(piece.segmentIndex)) node.dataset.swellSegmentIndex = String(piece.segmentIndex);
     };
-    result.pieces.forEach((piece) => {
+    result.pieces.forEach((piece, pieceIndex) => {
       const node = geometryNode(piece.entity);
       if (!node) return;
       node.classList.add('entity', 'selectable-entity', 'swell-derived-piece');
       if (piece.entity.type === 'circle' || piece.entity.type === 'polygon') node.classList.add('closed-entity');
-      applyPieceData(node, piece);
+      applyPieceData(node, piece, pieceIndex);
       styleGeometry(node, appearance, { fill: false });
       group.appendChild(node);
       const hitNode = geometryNode(piece.entity);
       if (hitNode) {
         hitNode.classList.add('selectable-entity', 'hit-target', 'swell-derived-hit');
-        applyPieceData(hitNode, piece);
+        applyPieceData(hitNode, piece, pieceIndex);
         group.appendChild(hitNode);
       }
-      swellPieceHandlePoints(piece).forEach((point, index) => handlePoints.push({ point, index, piece }));
-      derivedByPieceId.set(piece.id, { piece, node, hitNode });
+      swellPieceHandlePoints(piece).forEach((point, index) => handlePoints.push({ point, index, piece, pieceIndex }));
+      const renderedPiece = {
+        id: piece.id,
+        piece,
+        entity: piece.entity,
+        group,
+        node,
+        hitNode,
+        pathMetrics: swellImageStrokePathMetrics(piece.entity),
+      };
+      renderedPieces.push(renderedPiece);
+      derivedByPieceId.set(piece.id, renderedPiece);
     });
     const handleGroup = createSvg('g', {
       class: 'handle-group canvas-handle-group swell-derived-handle-group',
@@ -544,7 +765,7 @@ export function createSwellTools({
     });
     syncGroupPresentation(handleGroup, result.ownerId);
     const seenHandles = new Set();
-    handlePoints.forEach(({ point, index, piece }) => {
+    handlePoints.forEach(({ point, index, piece, pieceIndex }) => {
       const key = `${Math.round(point[0] * 1e7)}:${Math.round(point[1] * 1e7)}`;
       if (seenHandles.has(key)) return;
       seenHandles.add(key);
@@ -555,7 +776,7 @@ export function createSwellTools({
         class: 'point-handle swell-derived-point-handle',
         'data-swell-handle-index': index,
       });
-      applyPieceData(handle, piece);
+      applyPieceData(handle, piece, pieceIndex);
       handleGroup.appendChild(handle);
     });
     const handlePointerDown = (event) => {
@@ -595,6 +816,14 @@ export function createSwellTools({
       target.addEventListener('click', handleClick);
     });
     objectLayer.appendChild(group);
+    renderedPieces.forEach((record) => {
+      const imageStrokeActive = canvas.renderImageStroke?.(
+        record,
+        appearance,
+        render,
+      ) === true;
+      if (imageStrokeActive) styleGeometry(record.node, appearance, { fill: false, strokePaint: 'transparent' });
+    });
     (handleLayer || group).appendChild(handleGroup);
   }
 
@@ -614,7 +843,14 @@ export function createSwellTools({
       });
       syncGroupPresentation(group, ownerId);
       const node = createSvg('path', { d: path, class: 'entity closed-entity selectable-entity swell-derived-fill' });
-      styleGeometry(node, sourceAppearance(ownerId), { fill: true, stroke: false });
+      const appearance = sourceAppearance(ownerId);
+      const fillPaint = canvas.getImageFillPaint?.(
+        { id: `swell-boundary:${boundary.id}`, type: 'polygon', points: boundary.polygon },
+        appearance,
+        boundary,
+        `swell-boundary:${boundary.id}`,
+      ) || appearance.fillColor;
+      styleGeometry(node, appearance, { fill: true, stroke: false, fillPaint });
       group.appendChild(node);
       const ownerIds = [...boundary.recordIds];
       group.addEventListener('pointerdown', (event) => {
@@ -689,6 +925,10 @@ export function createSwellTools({
     derivedBoundaries = swellBoundariesFromDerived(derivedByOwnerId);
     renderClosedBoundaryFills(derivedBoundaries);
     derivedByOwnerId.forEach(renderOwner);
+    externalConstraints = externalConstraints.map((constraint) => normalizeSwellExternalConstraint(
+      constraint,
+      (request) => derivedDimensionProvider.resolveFeature(request),
+    ));
     canvas.syncGeometryStacking?.();
     syncDerivedSelection();
     applyExternalConstraints();
@@ -700,24 +940,37 @@ export function createSwellTools({
     renderFrame = requestAnimationFrame(renderNow);
   }
 
+  function dimensionEntryForRequest(request = {}) {
+    const direct = derivedByPieceId.get(request.recordId);
+    if (direct) return direct;
+    return [...derivedByPieceId.values()].find(({ piece }) => (
+      swellPieceMatchesDimensionReference(piece, request)
+    )) || null;
+  }
+
   const derivedDimensionProvider = {
     featureFromEvent({ target, world, mode = 'driven' }) {
-      if (mode === 'driving') return null;
       const pieceNode = target?.closest?.('[data-swell-piece-id]');
       const entry = pieceNode && derivedByPieceId.get(pieceNode.dataset.swellPieceId);
       const featureSet = entry && swellDimensionFeatureSetForPiece(entry.piece, entry.node);
       if (!featureSet) return null;
-      return nearestDimensionFeature([featureSet], world, {
+      const feature = swellDimensionFeatureForMode(nearestDimensionFeature([featureSet], world, {
         pointTolerance: canvas.getWorldTolerance?.(10) || 10,
-      });
+      }), mode);
+      if (!feature) return null;
+      const handle = target?.closest?.('.swell-derived-point-handle');
+      return feature.kind === 'point' && handle ? { ...feature, node: handle } : feature;
     },
     resolveFeature(request) {
-      const entry = derivedByPieceId.get(request?.recordId);
+      const entry = dimensionEntryForRequest(request);
       return entry ? resolveDimensionFeatureSet(swellDimensionFeatureSetForPiece(entry.piece, entry.node), request) : null;
     },
     dependsOn(recordId, changedRecordIds) {
       const entry = derivedByPieceId.get(recordId);
-      return Boolean(entry && changedRecordIds?.has(entry.piece.ownerId));
+      return Boolean(
+        (entry && changedRecordIds?.has(entry.piece.ownerId))
+        || (derivedByOwnerId.has(recordId) && changedRecordIds?.has(recordId))
+      );
     },
     isRecordVisible(recordId) {
       const entry = derivedByPieceId.get(recordId);
@@ -872,7 +1125,7 @@ export function createSwellTools({
     const closedSelection = swellSelectionCanFill(targetIds, derivedBoundaries)
       || targets.every(({ entity }) => entity.type === 'circle' || entity.type === 'polygon' || entity.composite?.closed === true);
     return {
-      ...appearanceSelectionPatch(appearances, { canFill: closedSelection }),
+      ...swellAppearanceSelectionProperties(appearances, { canFill: closedSelection }),
       supportedCount: targets.length,
       ids: targetIds,
       canEditConstruction: false,
@@ -885,7 +1138,14 @@ export function createSwellTools({
   function setSelectedAppearance(patch = {}) {
     const targets = selectionTargets();
     if (!targets.length) return undefined;
-    return canvas.setRecordGeometryAppearance?.(targets.map(({ recordId }) => recordId), patch)
+    const targetIds = targets.map(({ recordId }) => recordId);
+    const allowImageFill = swellSelectionCanFill(targetIds, derivedBoundaries)
+      || targets.every(({ entity }) => (
+        entity.type === 'circle'
+        || entity.type === 'polygon'
+        || entity.composite?.closed === true
+      ));
+    return canvas.setRecordGeometryAppearance?.(targetIds, patch, { allowImageFill })
       || { success: false, error: 'Swell appearance could not be updated.' };
   }
 
@@ -911,7 +1171,11 @@ export function createSwellTools({
 
   const extensionProvider = {
     serialize() {
-      return externalConstraints.length ? { version: 1, constraints: externalConstraints.map(clone) } : null;
+      externalConstraints = externalConstraints.map((constraint) => normalizeSwellExternalConstraint(
+        constraint,
+        (request) => derivedDimensionProvider.resolveFeature(request),
+      ));
+      return externalConstraints.length ? { version: 2, constraints: externalConstraints.map(clone) } : null;
     },
     restore(value) {
       externalConstraints = Array.isArray(value?.constraints) ? value.constraints.map(clone) : [];
@@ -1047,6 +1311,7 @@ export function createSwellTools({
     derivedBoundaryProvider,
     constraintOperation,
     selectionPropertyProvider,
+    derivativeSourceProvider,
     updateSelectedDefinitions,
     removeStackReferences: constraintOperation.removeStackReferences,
   };

@@ -311,6 +311,7 @@ export function createGeometryAppearanceSystem({
   function setSelectedAppearance(patch = {}, {
     recordIds = null,
     includeConstruction = false,
+    allowImageFill = false,
   } = {}) {
     const appearanceSelection = recordIds ? new Set(recordIds) : selectedIds;
     const selectedGeometry = selectedGeometryRecords(appearanceSelection, { includeConstruction });
@@ -337,7 +338,9 @@ export function createGeometryAppearanceSystem({
       : null;
     if (resolvedFill?.fillType === 'image') {
       const eligibility = closedImageFillSelection(records, appearanceSelection, getClosedCycles());
-      if (!eligibility.canEditImageFill) return { success: false, error: 'Image fills can only be applied to complete closed objects.' };
+      if (!allowImageFill && !eligibility.canEditImageFill) {
+        return { success: false, error: 'Image fills can only be applied to complete closed objects.' };
+      }
     }
     const requestedStrokeColor = patch.strokeColor === undefined ? null : String(patch.strokeColor).trim();
     const strokeColor = requestedStrokeColor !== null && HEX_COLOR.test(requestedStrokeColor)

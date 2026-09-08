@@ -13,6 +13,17 @@ export { ARRAY_TOOL_ICONS, arrayToolTypes, createArrayTools } from './modules/Ar
 export { createNotchTools } from './modules/NotchSystem.js';
 export { createSwellTools, SWELL_ICON } from './modules/SwellTools.js';
 export { createDrawingHint } from './modules/CanvasViewport.js';
+export {
+  bindExpressionBoxInputs,
+  createExpressionBoxLookup,
+  expressionBoxLookupMarkup,
+  expressionLookupKeyAction,
+  expressionLookupMatches,
+  expressionLookupRange,
+  insertExpressionLookupValue,
+  normalizeExpressionLookupOptions,
+  replaceExpressionLookupOptions,
+} from './modules/ExpressionBox.js';
 export { createSmartDimensionTools } from './modules/DimensionSystem.js';
 export { createConstraintHandlers } from './modules/ConstraintSystem.js';
 export { DrawingHistory } from './modules/DrawingHistory.js';

@@ -1,4 +1,5 @@
 import { resolveVectorDrawingPoint } from './DrawingTools.js';
+import { IDENTITY_FRAME, stackFrameFor } from './StackCoordinates.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 import { valueInUnit } from './solver/Units.js';
 import { clampPanelPosition, positionHeaderToolMenu } from './CanvasUIControls.js';
@@ -13,17 +14,24 @@ import {
 } from './CanvasPaintOrder.js';
 import { prepareNotchDerivativePresentationClone } from './NotchSystem.js';
 import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+import { constructionHiddenInValueOnly } from './CanvasPresentation.js';
+import { resolveWindowSelectionIds } from './CanvasSelection.js';
 
 registerIdentitySchema('arrayTools', {
   declarations: (value) => (value?.arrays || []).map((object, index) => ({
     object, key: 'id', value: object.id, path: ['extensions', 'arrayTools', 'arrays', String(index), 'id'], kind: 'array-definition',
   })),
-  liveReferenceKeys: ['stackId', 'recordId'],
+  liveReferenceKeys: ['stackId', 'recordId', 'sourceId', 'targetId', 'ownerId', 'arrayId', 'copyId'],
   liveReferenceArrayKeys: ['sourceIds'],
   lineageReferenceKeys: ['sourceDefinitionId', 'sourceStackId'],
   targetKindsByKey: {
     stackId: ['stack'],
     recordId: ['entity'],
+    sourceId: ['entity'],
+    targetId: ['entity'],
+    ownerId: ['entity'],
+    arrayId: ['array-definition'],
+    copyId: ['linked-copy-definition'],
     sourceIds: ['entity'],
   },
 });
@@ -62,6 +70,26 @@ const arrayTypeLabels = Object.freeze({
   circular: 'Circular Array',
 });
 
+const ARRAY_VISIBLE_GEOMETRY_SELECTORS = [
+  '.selectable-entity:not(.hit-target):not(.segment-select-line)',
+  '.subtract-result-boundary',
+  '.resolved-boundary-visual',
+  '.seam-line-path',
+];
+const ARRAY_VISIBLE_GEOMETRY_SELECTOR = ARRAY_VISIBLE_GEOMETRY_SELECTORS.join(',');
+const ARRAY_WINDOW_GEOMETRY_SELECTOR = ARRAY_VISIBLE_GEOMETRY_SELECTORS
+  .map((selector) => `.array-item > .array-item-template .array-item-content ${selector}`)
+  .join(',');
+const ARRAY_STROKE_HIT_ELEMENTS = new Set([
+  'circle',
+  'ellipse',
+  'line',
+  'path',
+  'polygon',
+  'polyline',
+  'rect',
+]);
+
 export function isArrayCenterPointEntity(entity, arrayId = null) {
   return entity?.type === 'point'
     && entity.composite?.kind === 'array-center'
@@ -84,6 +112,18 @@ export function createArrayCenterPointEntity(definition, point, id = createUuid(
 
 export function arrayDerivedRecordId(arrayId, placementIndex, sourceId) {
   return deriveUuidForKey('array-placement', arrayId, Number(placementIndex), sourceId);
+}
+
+export function arrayDimensionReference(arrayId, placementIndex, sourceId) {
+  return {
+    recordId: String(sourceId),
+    derivedFeature: {
+      provider: 'array',
+      arrayId: String(arrayId),
+      placementIndex: Number(placementIndex),
+      sourceId: String(sourceId),
+    },
+  };
 }
 
 export function parseArrayDerivedRecordId(recordId) {
@@ -262,6 +302,88 @@ function uniqueIds(values = []) {
   return [...new Set(values.map((value) => String(value || '')).filter(Boolean))];
 }
 
+export function arraySourceReferenceKey(reference = {}) {
+  if (reference.kind === 'array-placement') {
+    return `array-placement:${String(reference.arrayId || '')}:${Number(reference.placementIndex)}`;
+  }
+  if (reference.kind === 'linked-copy') return `linked-copy:${String(reference.copyId || '')}`;
+  if (reference.kind === 'swell-piece') {
+    return `swell-piece:${String(reference.ownerId || '')}:${Number(reference.pieceIndex)}`;
+  }
+  if (reference.kind === 'seam-line') {
+    const features = Array.isArray(reference.sourceFeatures) ? reference.sourceFeatures : [];
+    return `seam-line:${features.map((feature) => [
+      String(feature.sourceId || feature.recordId || ''),
+      Number(feature.sourceFeatureIndex ?? feature.index ?? 0) || 0,
+      String(feature.boundaryRole || 'outer'),
+      String(feature.kind || 'segment'),
+      Number.isFinite(Number(feature.sourceParameter)) ? Number(feature.sourceParameter) : '',
+    ].join('|')).sort().join('::')}`;
+  }
+  return '';
+}
+
+export function normalizeArraySourceReferences(values = []) {
+  const references = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    let reference = null;
+    if (value?.kind === 'array-placement' && value.arrayId && Number.isInteger(Number(value.placementIndex))) {
+      reference = { kind: 'array-placement', arrayId: String(value.arrayId), placementIndex: Number(value.placementIndex) };
+    }
+    if (value?.kind === 'linked-copy' && value.copyId) {
+      reference = { kind: 'linked-copy', copyId: String(value.copyId) };
+    }
+    if (value?.kind === 'swell-piece' && value.ownerId && Number.isInteger(Number(value.pieceIndex))) {
+      reference = { kind: 'swell-piece', ownerId: String(value.ownerId), pieceIndex: Number(value.pieceIndex) };
+    }
+    if (value?.kind === 'seam-line' && Array.isArray(value.sourceFeatures) && value.sourceFeatures.length) {
+      const sourceFeatures = value.sourceFeatures.map((feature) => ({
+        sourceId: String(feature?.sourceId || feature?.recordId || ''),
+        sourceFeatureIndex: Number(feature?.sourceFeatureIndex ?? feature?.index ?? 0) || 0,
+        boundaryRole: String(feature?.boundaryRole || 'outer'),
+        kind: String(feature?.kind || 'segment'),
+        ...(Number.isFinite(Number(feature?.sourceParameter))
+          ? { sourceParameter: Number(feature.sourceParameter) }
+          : {}),
+      })).filter(({ sourceId }) => sourceId);
+      if (sourceFeatures.length) reference = { kind: 'seam-line', sourceFeatures };
+    }
+    const key = reference && arraySourceReferenceKey(reference);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    references.push(reference);
+  }
+  return references;
+}
+
+export function orderArrayDefinitionsByDependencies(definitions = []) {
+  const byId = new Map(definitions.map((definition) => [String(definition.id), definition]));
+  const ordered = [];
+  const cyclicIds = new Set();
+  const state = new Map();
+  const visit = (definition, lineage = []) => {
+    const id = String(definition.id);
+    if (state.get(id) === 'done') return;
+    if (state.get(id) === 'visiting') {
+      const start = lineage.indexOf(id);
+      (start >= 0 ? lineage.slice(start) : [id]).forEach((value) => cyclicIds.add(value));
+      cyclicIds.add(id);
+      return;
+    }
+    state.set(id, 'visiting');
+    normalizeArraySourceReferences(definition.sourceRefs).forEach((reference) => {
+      if (reference.kind === 'array-placement' && byId.has(reference.arrayId)) {
+        visit(byId.get(reference.arrayId), [...lineage, id]);
+      }
+    });
+    state.set(id, 'done');
+    ordered.push(definition);
+  };
+  definitions.forEach((definition) => visit(definition));
+  return { ordered, cyclicIds };
+}
+
 function arrayType(value) {
   return arrayTypeLabels[value] ? value : arrayTypeKeys[value] || 'rectangular';
 }
@@ -285,6 +407,7 @@ export function normalizeArrayDefinition(input = {}) {
     stackId,
     arrayType: type,
     sourceIds: uniqueIds(input.sourceIds),
+    sourceRefs: normalizeArraySourceReferences(input.sourceRefs),
     rowCountExpression: String(input.rowCountExpression ?? '2'),
     columnCountExpression: String(input.columnCountExpression ?? '2'),
     rowSpacingExpression: String(input.rowSpacingExpression ?? '100'),
@@ -459,10 +582,12 @@ export function evaluateArrayDefinition(input, {
   evaluateLength = evaluateNumeric,
   sourceBounds = null,
   centerPoint = null,
+  coordinateFrame = IDENTITY_FRAME,
 } = {}) {
   const definition = normalizeArrayDefinition(input);
   const errors = {};
-  if (!definition.sourceIds.length) errors.sources = 'Select at least one drawing object.';
+  const sourceCount = definition.sourceIds.length + definition.sourceRefs.length;
+  if (!sourceCount) errors.sources = 'Select at least one drawing object.';
   if (definition.arrayType === 'rectangular') {
     const rowCount = evaluateValue(definition.rowCountExpression, evaluateNumeric, 'rowCount', errors, { integer: true, minimum: 0 });
     const columnCount = evaluateValue(definition.columnCountExpression, evaluateNumeric, 'columnCount', errors, { integer: true, minimum: 0 });
@@ -487,7 +612,11 @@ export function evaluateArrayDefinition(input, {
           columnCentroidSpacing: definition.columnCentroidSpacing,
           rowDirection: definition.rowDirection,
           columnDirection: definition.columnDirection,
-        })
+        }).map((placement) => ({
+          ...placement,
+          translateX: placement.translateX * Math.cos(coordinateFrame.rotation) - placement.translateY * Math.sin(coordinateFrame.rotation),
+          translateY: placement.translateX * Math.sin(coordinateFrame.rotation) + placement.translateY * Math.cos(coordinateFrame.rotation),
+        }))
         : [],
     };
   }
@@ -502,7 +631,7 @@ export function evaluateArrayDefinition(input, {
     ? Math.hypot(sourceCentroid[0] - resolvedCenter[0], sourceCentroid[1] - resolvedCenter[1])
     : null;
   if (count !== 0 && !resolvedCenter) errors.center = 'Select the circular array center point.';
-  if (count !== 0 && !sourceCentroid && definition.sourceIds.length) errors.sources = 'The selected drawing objects are unavailable.';
+  if (count !== 0 && !sourceCentroid && sourceCount) errors.sources = 'The selected drawing objects are unavailable.';
   if (count !== 0 && radius !== null && radius <= 1e-9) errors.center = 'The center point must differ from the selected objects\' centroid.';
   if (count !== 0 && !definition.fullCircle && stopAngle !== null && Math.abs(stopAngle) <= 1e-9) {
     errors.stopAngle = 'Stop Angle must be positive or negative, not zero.';
@@ -529,7 +658,6 @@ function createSvg(tag, attributes = {}) {
 function isArrayableEntity(entity) {
   if (!entity?.id || String(entity.type || '').includes('dimension')) return false;
   if (isArrayCenterPointEntity(entity)) return false;
-  if (entity.composite?.kind === 'finish-size-offset') return false;
   if (entity.composite?.kind === 'symmetric-centerline') return false;
   return true;
 }
@@ -538,10 +666,58 @@ export function arraySourceIdsFromSelection(recordIds = [], entities = new Map()
   return uniqueIds(recordIds).filter((id) => isArrayableEntity(entities.get(id)));
 }
 
+export function arrayIdsFromWindow(groups = [], matchesNode = () => false, bottomUp = false) {
+  return uniqueIds([...groups].filter((group) => {
+    const targets = [...(group?.querySelectorAll?.(ARRAY_WINDOW_GEOMETRY_SELECTOR) || [])];
+    if (!targets.length) return false;
+    return bottomUp
+      ? targets.some((target) => matchesNode(target))
+      : targets.every((target) => matchesNode(target));
+  }).map((group) => group?.dataset?.arrayId));
+}
+
+export function arraySourceReferencesFromWindow(
+  candidates = [],
+  referenceFromTarget = () => null,
+  matchesNode = () => false,
+  bottomUp = false,
+) {
+  return normalizeArraySourceReferences([...candidates].flatMap((candidate) => {
+    const targets = [
+      ...(candidate?.matches?.(ARRAY_VISIBLE_GEOMETRY_SELECTOR) ? [candidate] : []),
+      ...(candidate?.querySelectorAll?.(ARRAY_VISIBLE_GEOMETRY_SELECTOR) || []),
+    ];
+    const matches = targets.length
+      ? (bottomUp
+        ? targets.some((target) => matchesNode(target))
+        : targets.every((target) => matchesNode(target)))
+      : matchesNode(candidate);
+    return matches ? [referenceFromTarget(candidate)] : [];
+  }));
+}
+
+export function arrayDerivativeSourceVisible(node) {
+  if (!node) return false;
+  const owner = node.closest?.(
+    '.array-group, .linked-copy-group, .swell-derived-group, .canvas-record',
+  ) || node;
+  return !owner.classList.contains('object-visibility-hidden')
+    && !owner.classList.contains('stack-hidden');
+}
+
 function sanitizeClone(node) {
   prepareNotchDerivativePresentationClone(node);
-  node.removeAttribute('id');
-  node.removeAttribute('data-record-id');
+  [
+    'id',
+    'data-record-id',
+    'data-array-id',
+    'data-array-placement-index',
+    'data-linked-copy-id',
+    'data-swell-owner-id',
+    'data-swell-piece-id',
+    'data-swell-piece-index',
+    'data-swell-segment-index',
+  ].forEach((attribute) => node.removeAttribute(attribute));
   node.removeAttribute('aria-label');
   node.removeAttribute('role');
   node.classList.remove(
@@ -561,6 +737,13 @@ function sanitizeClone(node) {
   node.querySelectorAll('*').forEach((child) => {
     child.removeAttribute('id');
     child.removeAttribute('data-record-id');
+    child.removeAttribute('data-array-id');
+    child.removeAttribute('data-array-placement-index');
+    child.removeAttribute('data-linked-copy-id');
+    child.removeAttribute('data-swell-owner-id');
+    child.removeAttribute('data-swell-piece-id');
+    child.removeAttribute('data-swell-piece-index');
+    child.removeAttribute('data-swell-segment-index');
     child.removeAttribute('aria-label');
     child.removeAttribute('role');
     child.removeAttribute('contenteditable');
@@ -578,6 +761,15 @@ function sanitizeClone(node) {
     '.text-rotation-handle',
     '.text-rotation-stem',
     '.notch-hit',
+    '.array-item-hit-definitions',
+    '.array-item-hit-layer',
+    '.array-item-hit-template',
+    '.array-item-geometry-hit',
+    '.array-item-area-hit',
+    '.array-item-bounds-hit',
+    '.linked-copy-hit',
+    '.swell-derived-hit',
+    '.seam-line-hit',
   ].join(',')).forEach((child) => child.remove());
   return node;
 }
@@ -597,7 +789,7 @@ function firstError(errors = {}) {
   return Object.values(errors).find(Boolean) || '';
 }
 
-export function createArrayTools({ toolbar, canvas }) {
+export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = [] }) {
   const button = toolbar?.querySelector('[data-array-toggle]');
   const menu = toolbar?.querySelector('[data-array-menu]');
   const tool = toolbar?.classList?.contains('menu-tool') ? toolbar : button?.closest('.menu-tool');
@@ -609,14 +801,18 @@ export function createArrayTools({ toolbar, canvas }) {
   let mode = 'idle';
   let activeType = null;
   let pendingSourceIds = new Set();
+  let pendingSourceRefs = new Map();
   let selectedArrayId = null;
+  const windowSelectedArrayIds = new Set();
   let editingDraft = null;
   let editingSourceBounds = null;
   let editingIsNew = false;
   let editingHistoryCheckpointed = false;
   let closeTimer = null;
   let renderFrame = null;
+  let hitTemplateSerial = 0;
   let suppressNextOutsideClick = false;
+  let preserveArraySelectionDuringCanvasClear = false;
   let popupPosition = null;
   let popupDrag = null;
 
@@ -639,12 +835,12 @@ export function createArrayTools({ toolbar, canvas }) {
         <output data-array-source-count>0 objects selected</output>
       </div>
       <div class="array-rectangular-fields" data-array-rectangular>
-        <label><span>Row Count</span><input class="array-expression-input" name="rowCountExpression" list="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
-        <label><span>Row Spacing</span><input class="array-expression-input" name="rowSpacingExpression" list="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
+        <label><span>Row Count</span><input class="array-expression-input" name="rowCountExpression" data-expression-source="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
+        <label><span>Row Spacing</span><input class="array-expression-input" name="rowSpacingExpression" data-expression-source="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
         <label class="array-checkbox-field" title="Use Row Spacing as the centroid-to-centroid distance"><span>Row Centroid Spacing</span><input type="checkbox" name="rowCentroidSpacing" aria-label="Use centroid-to-centroid row spacing" /></label>
         <label><span>Row Direction</span><select name="rowDirection"><option value="up">Up</option><option value="center">Center</option><option value="down">Down</option></select></label>
-        <label><span>Column Count</span><input class="array-expression-input" name="columnCountExpression" list="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
-        <label><span>Column Spacing</span><input class="array-expression-input" name="columnSpacingExpression" list="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
+        <label><span>Column Count</span><input class="array-expression-input" name="columnCountExpression" data-expression-source="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
+        <label><span>Column Spacing</span><input class="array-expression-input" name="columnSpacingExpression" data-expression-source="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
         <label class="array-checkbox-field" title="Use Column Spacing as the centroid-to-centroid distance"><span>Column Centroid Spacing</span><input type="checkbox" name="columnCentroidSpacing" aria-label="Use centroid-to-centroid column spacing" /></label>
         <label><span>Column Direction</span><select name="columnDirection"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
       </div>
@@ -653,10 +849,10 @@ export function createArrayTools({ toolbar, canvas }) {
           <button type="button" class="array-center-button" data-array-center>Select Center Point</button>
           <output class="array-center-value" data-array-center-value>No center selected</output>
         </div>
-        <label><span>Object Count</span><input class="array-expression-input" name="countExpression" list="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
+        <label><span>Object Count</span><input class="array-expression-input" name="countExpression" data-expression-source="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
         <label class="array-checkbox-field"><span>Full 360 Circle</span><input type="checkbox" name="fullCircle" /></label>
         <div class="array-angle-fields" data-array-angles>
-          <label><span>Stop Angle</span><input class="array-expression-input" name="stopAngleExpression" list="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
+          <label><span>Stop Angle</span><input class="array-expression-input" name="stopAngleExpression" data-expression-source="arrayParameterNames" autocomplete="off" spellcheck="false" /></label>
         </div>
       </div>
       <datalist id="arrayParameterNames"></datalist>
@@ -690,7 +886,10 @@ export function createArrayTools({ toolbar, canvas }) {
   );
 
   function evaluateDefinition(definition, bounds) {
-    const resolvedBounds = bounds === undefined ? sourceBounds(definition.sourceIds) : bounds;
+    const coordinateFrame = stackFrameFor(canvas.getStackState?.(), definition.stackId);
+    const localBounds = definition.arrayType === 'rectangular' && coordinateFrame.rotation;
+    const resolvedBounds = localBounds ? sourceBounds(definition.sourceIds, coordinateFrame, definition.sourceRefs)
+      : bounds === undefined ? sourceBounds(definition.sourceIds, null, definition.sourceRefs) : bounds;
     return evaluateArrayDefinition(definition, {
       evaluateNumeric: (expression) => evaluateArrayCountExpression(expression, {
         evaluateLength: (value) => canvas.evaluateLengthExpression(value, definition),
@@ -699,6 +898,7 @@ export function createArrayTools({ toolbar, canvas }) {
       evaluateLength: (expression) => canvas.evaluateLengthExpression(expression, definition),
       sourceBounds: resolvedBounds,
       centerPoint: definition.arrayType === 'circular' ? resolveCenter(definition) : null,
+      coordinateFrame,
     });
   }
 
@@ -726,6 +926,13 @@ export function createArrayTools({ toolbar, canvas }) {
       expression: definition.parentVisibleExpression,
       manuallyEnabled: definition.parentVisibleManuallyEnabled,
     };
+  }
+
+  function sameSourceSelection(first, second) {
+    if (!sameSourceIds(first?.sourceIds, second?.sourceIds)) return false;
+    const left = normalizeArraySourceReferences(first?.sourceRefs).map(arraySourceReferenceKey);
+    const right = normalizeArraySourceReferences(second?.sourceRefs).map(arraySourceReferenceKey);
+    return left.length === right.length && left.every((key) => right.includes(key));
   }
 
   function applyArrayParentVisibility(definition, { restore = false } = {}) {
@@ -792,17 +999,10 @@ export function createArrayTools({ toolbar, canvas }) {
     return definition;
   }
 
-  function removeOwnedCenterControl(definition) {
-    const owned = definition && ownedCenterEntity(definition);
-    if (!owned) return false;
-    canvas.deleteRecords?.([owned.id], { checkpoint: false, notify: false });
-    return true;
-  }
-
   const subtractOperandProvider = {
     owners(baseOwners = []) {
       return arrays.filter(definitionProcessingEnabled).flatMap((definition) => {
-        const bounds = sourceBounds(definition.sourceIds);
+        const bounds = sourceBounds(definition.sourceIds, null, definition.sourceRefs);
         const evaluated = evaluateDefinition(definition, bounds);
         if (!evaluated.valid) return [];
         return materializeArraySubtractOwners(definition, evaluated, baseOwners, {
@@ -814,7 +1014,9 @@ export function createArrayTools({ toolbar, canvas }) {
 
   function selectedDefinitionValue() {
     if (editingDraft?.id === selectedArrayId) return editingDraft;
-    return arrays.find(({ id }) => id === selectedArrayId) || null;
+    const selectionId = selectedArrayId
+      || (windowSelectedArrayIds.size === 1 ? [...windowSelectedArrayIds][0] : null);
+    return arrays.find(({ id }) => id === selectionId) || null;
   }
 
   const selectionPropertyProvider = {
@@ -861,12 +1063,79 @@ export function createArrayTools({ toolbar, canvas }) {
     return svg.querySelector(`.canvas-record[data-record-id="${escaped(recordId)}"]`);
   }
 
+  function ownDerivativeReferenceFromTarget(target) {
+    const item = target?.closest?.('.array-item[data-array-placement-index]');
+    const group = item?.parentElement?.matches?.('.array-group[data-array-id]')
+      ? item.parentElement
+      : null;
+    if (!group) return null;
+    return normalizeArraySourceReferences([{
+      kind: 'array-placement',
+      arrayId: group.dataset.arrayId,
+      placementIndex: Number(item.dataset.arrayPlacementIndex),
+    }])[0] || null;
+  }
+
+  function ownDerivativeNodeForReference(reference) {
+    if (reference?.kind !== 'array-placement') return null;
+    const group = objectLayer.querySelector(`.array-group[data-array-id="${escaped(reference.arrayId)}"]`);
+    return [...(group?.children || [])].find((node) => (
+      node.matches?.('.array-item[data-array-placement-index]')
+      && Number(node.dataset.arrayPlacementIndex) === Number(reference.placementIndex)
+    )) || null;
+  }
+
+  function derivativeReferenceFromTarget(target) {
+    const ownReference = ownDerivativeReferenceFromTarget(target);
+    if (ownReference) return ownReference;
+    for (const provider of derivativeSourceProviders) {
+      const reference = normalizeArraySourceReferences([provider?.referenceFromTarget?.(target)])[0];
+      if (reference) return reference;
+    }
+    return null;
+  }
+
+  function derivativeNodeForReference(reference) {
+    const ownNode = ownDerivativeNodeForReference(reference);
+    if (ownNode) return ownNode;
+    for (const provider of derivativeSourceProviders) {
+      const node = provider?.nodeForReference?.(reference);
+      if (node) return node;
+    }
+    return null;
+  }
+
+  function arrayDependsOn(arrayId, targetArrayId, visited = new Set()) {
+    const sourceId = String(arrayId || '');
+    const targetId = String(targetArrayId || '');
+    if (!sourceId || !targetId) return false;
+    if (sourceId === targetId) return true;
+    if (visited.has(sourceId)) return false;
+    visited.add(sourceId);
+    const definition = arrays.find(({ id }) => id === sourceId);
+    return Boolean(definition?.sourceRefs?.some((reference) => (
+      reference.kind === 'array-placement'
+      && arrayDependsOn(reference.arrayId, targetId, visited)
+    )));
+  }
+
+  function derivativeReferenceCreatesCycle(reference) {
+    return reference?.kind === 'array-placement'
+      && editingDraft?.id
+      && arrayDependsOn(reference.arrayId, editingDraft.id);
+  }
+
+  function derivativeSourceVisible(reference) {
+    return arrayDerivativeSourceVisible(derivativeNodeForReference(reference));
+  }
+
   function regionNodesFor(sourceIds) {
     return directClosedRegionNodesForSourceIds(objectLayer, sourceIds);
   }
 
   function templateFor(definition, entities) {
     const template = createSvg('g', { class: 'array-item-template' });
+    const dimensionTextMode = canvas.getDimensionTextMode?.() || 'named-value';
     const explicitDependentIds = definition.sourceIds.filter((recordId) => {
       const entity = entities.get(recordId);
       return entity?.type === 'notch' || entity?.composite?.kind === 'finish-size-offset';
@@ -882,6 +1151,7 @@ export function createArrayTools({ toolbar, canvas }) {
       template.appendChild(sanitizeClone(node.cloneNode(true)));
     });
     sourceIds.forEach((recordId) => {
+      if (constructionHiddenInValueOnly(entities.get(recordId), dimensionTextMode)) return;
       const node = recordNode(recordId);
       if (node) {
         const copy = sanitizeClone(node.cloneNode(true));
@@ -898,6 +1168,7 @@ export function createArrayTools({ toolbar, canvas }) {
         template.appendChild(sanitizeClone(node.cloneNode(true)));
       });
     dependentIds.forEach((recordId) => {
+      if (constructionHiddenInValueOnly(entities.get(recordId), dimensionTextMode)) return;
       const node = recordNode(recordId);
       if (node) {
         const copy = sanitizeClone(node.cloneNode(true));
@@ -905,21 +1176,59 @@ export function createArrayTools({ toolbar, canvas }) {
         template.appendChild(copy);
       }
     });
+    definition.sourceRefs.forEach((reference) => {
+      const node = derivativeNodeForReference(reference);
+      if (node) template.appendChild(sanitizeClone(node.cloneNode(true)));
+    });
     regionNodesFor(definition.sourceIds).forEach((region) => {
       template.insertBefore(sanitizeClone(region.cloneNode(true)), template.firstChild);
     });
     return template;
   }
 
-  function itemWithHitTarget(template, bounds) {
+  function hitTemplateFor(template) {
+    const hitLayer = template.cloneNode(true);
+    hitLayer.setAttribute('class', 'array-item-hit-template');
+    const hitTargets = [...hitLayer.querySelectorAll(ARRAY_VISIBLE_GEOMETRY_SELECTOR)];
+    const retained = new Set([hitLayer]);
+    hitTargets.forEach((node) => {
+      const hitClass = ARRAY_STROKE_HIT_ELEMENTS.has(node.localName)
+        ? 'array-item-geometry-hit'
+        : 'array-item-area-hit';
+      node.classList.add('array-item-hit', hitClass);
+      let ancestor = node;
+      while (ancestor && ancestor !== hitLayer) {
+        retained.add(ancestor);
+        ancestor = ancestor.parentElement;
+      }
+      if (hitClass === 'array-item-area-hit') {
+        node.querySelectorAll('*').forEach((descendant) => retained.add(descendant));
+      }
+    });
+    [...hitLayer.querySelectorAll('*')].reverse().forEach((node) => {
+      if (!retained.has(node)) node.remove();
+    });
+    return hitTargets.length ? hitLayer : null;
+  }
+
+  function itemWithHitTarget(template, bounds, hitTemplateId = null) {
     const item = createSvg('g', { class: 'array-item' });
-    item.appendChild(createSvg('rect', {
-      class: 'array-item-hit',
-      x: bounds.x,
-      y: bounds.y,
-      width: Math.max(bounds.width, 0.001),
-      height: Math.max(bounds.height, 0.001),
-    }));
+    const hitLayer = createSvg('g', { class: 'array-item-hit-layer' });
+    if (hitTemplateId) {
+      hitLayer.appendChild(createSvg('use', {
+        class: 'array-item-hit-use',
+        href: `#${hitTemplateId}`,
+      }));
+    } else {
+      hitLayer.appendChild(createSvg('rect', {
+        class: 'array-item-bounds-hit',
+        x: bounds.x,
+        y: bounds.y,
+        width: Math.max(bounds.width, 0.001),
+        height: Math.max(bounds.height, 0.001),
+      }));
+    }
+    item.appendChild(hitLayer);
     item.appendChild(template.cloneNode(true));
     return item;
   }
@@ -940,7 +1249,7 @@ export function createArrayTools({ toolbar, canvas }) {
     if (!bounds || !Number.isFinite(bounds.width) || !Number.isFinite(bounds.height)) return null;
     const evaluated = evaluateDefinition(definition, bounds);
     if (!evaluated.valid) return null;
-    return { center, template, bounds, evaluated };
+    return { center, template, hitTemplate: hitTemplateFor(template), bounds, evaluated };
   }
 
   function renderDefinition(definition, entities) {
@@ -950,16 +1259,16 @@ export function createArrayTools({ toolbar, canvas }) {
     const stackActive = !canvas.getActiveStackId?.() || canvas.isStackActive?.(stackId) !== false;
     const objectVisible = definition.sourceIds.some((recordId) => (
       canvas.isObjectVisible?.(recordId) !== false
-    ));
+    )) || definition.sourceRefs.some(derivativeSourceVisible);
     const renderData = definitionRenderData(definition, entities);
     if (!renderData) return;
-    const { center, template, bounds, evaluated } = renderData;
+    const { center, template, hitTemplate, bounds, evaluated } = renderData;
     const paintAnchorId = arrayPaintAnchorRecordId(
       definition,
       canvas.getObjectPaintOrder?.() || [],
     );
     const group = createSvg('g', {
-      class: `array-group${selectedArrayId === definition.id ? ' selected' : ''}${stackVisible ? '' : ' stack-hidden'}${stackActive ? '' : ' stack-inactive'}${objectVisible ? '' : ' object-visibility-hidden'}`,
+      class: `array-group${selectedArrayId === definition.id || windowSelectedArrayIds.has(definition.id) ? ' selected' : ''}${stackVisible ? '' : ' stack-hidden'}${stackActive ? '' : ' stack-inactive'}${objectVisible ? '' : ' object-visibility-hidden'}`,
       'data-array-id': definition.id,
       'data-stack-id': stackId,
       'data-object-visible': String(objectVisible),
@@ -967,6 +1276,14 @@ export function createArrayTools({ toolbar, canvas }) {
       'data-paint-after-record-id': paintAnchorId || '',
       'aria-label': `${arrayTypeLabels[definition.arrayType]} group`,
     });
+    let hitTemplateId = null;
+    if (hitTemplate) {
+      hitTemplateId = `array-hit-${++hitTemplateSerial}`;
+      hitTemplate.setAttribute('id', hitTemplateId);
+      const definitions = createSvg('defs', { class: 'array-item-hit-definitions' });
+      definitions.appendChild(hitTemplate);
+      group.appendChild(definitions);
+    }
     evaluated.placements.forEach((placement, placementIndex) => {
       if (
         (definition.arrayType === 'rectangular'
@@ -974,7 +1291,7 @@ export function createArrayTools({ toolbar, canvas }) {
           && Math.abs(placement.translateY) < 1e-9)
         || (definition.arrayType === 'circular' && Math.abs(placement.angle) < 1e-9)
       ) return;
-      const item = itemWithHitTarget(template, bounds);
+      const item = itemWithHitTarget(template, bounds, hitTemplateId);
       item.setAttribute('data-array-placement-index', String(placementIndex));
       if (definition.arrayType === 'rectangular') {
         item.setAttribute('transform', `translate(${placement.translateX} ${placement.translateY})`);
@@ -1025,7 +1342,10 @@ export function createArrayTools({ toolbar, canvas }) {
     renderFrame = null;
     objectLayer.querySelectorAll('.array-group').forEach((node) => node.remove());
     const entities = entityMap();
-    definitionsForRender().forEach((definition) => renderDefinition(definition, entities));
+    const { ordered, cyclicIds } = orderArrayDefinitionsByDependencies(definitionsForRender());
+    ordered
+      .filter((definition) => !cyclicIds.has(String(definition.id)))
+      .forEach((definition) => renderDefinition(definition, entities));
     syncSourceHighlights();
     syncCenterHandle();
     canvas.syncGeometryStacking?.();
@@ -1057,6 +1377,7 @@ export function createArrayTools({ toolbar, canvas }) {
     );
     transformed.features = (transformed.features || []).map((feature) => ({
       ...feature,
+      dimensionReference: arrayDimensionReference(definition.id, placementIndex, sourceId),
       derivedKind: 'array-placement',
       arrayId: definition.id,
       arrayPlacementIndex: placementIndex,
@@ -1109,7 +1430,14 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function resolveDerivedFeature(request) {
-    const parsed = request?.derivedKind === 'array-placement'
+    const selector = request?.derivedFeature;
+    const parsed = selector?.provider === 'array' && selector.arrayId
+      ? {
+        arrayId: String(selector.arrayId),
+        placementIndex: Number(selector.placementIndex),
+        sourceId: String(selector.sourceId || request.recordId),
+      }
+      : request?.derivedKind === 'array-placement'
       ? {
         arrayId: request.arrayId,
         placementIndex: Number(request.arrayPlacementIndex),
@@ -1168,7 +1496,7 @@ export function createArrayTools({ toolbar, canvas }) {
   function updatePopupFromDraft() {
     if (!editingDraft) return;
     title.textContent = arrayTypeLabels[editingDraft.arrayType];
-    const selectedCount = editingDraft.sourceIds.length;
+    const selectedCount = editingDraft.sourceIds.length + editingDraft.sourceRefs.length;
     sourceCount.textContent = `${selectedCount} object${selectedCount === 1 ? '' : 's'} selected`;
     selectObjectsButton.textContent = mode === 'selecting-sources' ? 'Finish Selection' : 'Select Objects';
     selectObjectsButton.classList.toggle('active', mode === 'selecting-sources');
@@ -1232,8 +1560,9 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function openEditor(definition, { isNew = false } = {}) {
+    windowSelectedArrayIds.clear();
     editingDraft = normalizeArrayDefinition(definition);
-    editingSourceBounds = sourceBounds(editingDraft.sourceIds);
+    editingSourceBounds = sourceBounds(editingDraft.sourceIds, null, editingDraft.sourceRefs);
     editingIsNew = isNew;
     editingHistoryCheckpointed = false;
     selectedArrayId = editingDraft.id;
@@ -1256,10 +1585,14 @@ export function createArrayTools({ toolbar, canvas }) {
     popup.hidden = true;
     popup.classList.remove('selecting-center');
     errorText.textContent = '';
-    if (deselect) selectedArrayId = null;
+    if (deselect) {
+      selectedArrayId = null;
+      windowSelectedArrayIds.clear();
+    }
     mode = 'idle';
     activeType = null;
     pendingSourceIds.clear();
+    pendingSourceRefs.clear();
     if (releaseFeatureDelegate) canvas.setFeatureCommandDelegate(null);
     canvas.clearObjectSnapCandidate?.();
     updateButton();
@@ -1267,9 +1600,93 @@ export function createArrayTools({ toolbar, canvas }) {
     canvas.syncState?.();
   }
 
+  function derivativeWindowSourceCandidates() {
+    return [...objectLayer.querySelectorAll([
+      ':scope > .array-group[data-array-id] > .array-item[data-array-placement-index]',
+      ':scope > .linked-copy-group[data-linked-copy-id]',
+      '.swell-derived-group > .swell-derived-piece[data-swell-piece-index]',
+      '.seam-line-presentation[data-seam-line-id]',
+    ].join(','))].filter((node) => (
+      !node.closest('.array-item-hit-definitions')
+      && (!node.closest('.array-item') || node.matches('.array-item[data-array-placement-index]'))
+    ));
+  }
+
+  function syncPendingSourceSelection(recordIds = []) {
+    if (!editingDraft) return;
+    pendingSourceIds = new Set(arraySourceIdsFromSelection(recordIds, entityMap()));
+    editingDraft.sourceIds = [...pendingSourceIds];
+    editingDraft.sourceRefs = [...pendingSourceRefs.values()];
+    editingSourceBounds = sourceBounds(editingDraft.sourceIds, null, editingDraft.sourceRefs);
+    syncSourceHighlights();
+    updatePopupFromDraft();
+    commitDraft();
+  }
+
+  const selectionProvider = {
+    clearSelection() {
+      if (
+        preserveArraySelectionDuringCanvasClear
+        || mode === 'selecting-sources'
+        || mode === 'selecting-center'
+      ) return false;
+      const hadSelection = Boolean(selectedArrayId || windowSelectedArrayIds.size);
+      if (!hadSelection) return false;
+      if (!popup.hidden || editingDraft) closeEditor({ deselect: true });
+      else {
+        selectedArrayId = null;
+        windowSelectedArrayIds.clear();
+        render();
+      }
+      return true;
+    },
+    selectWindow({ matchesNode, bottomUp = false, additive = false } = {}) {
+      if (mode === 'selecting-sources') {
+        const references = arraySourceReferencesFromWindow(
+          derivativeWindowSourceCandidates(),
+          derivativeReferenceFromTarget,
+          matchesNode,
+          bottomUp,
+        ).filter((reference) => (
+          !derivativeReferenceCreatesCycle(reference) && derivativeSourceVisible(reference)
+        ));
+        if (!additive) pendingSourceRefs.clear();
+        const remove = additive
+          && references.length > 0
+          && references.every((reference) => pendingSourceRefs.has(arraySourceReferenceKey(reference)));
+        references.forEach((reference) => {
+          const key = arraySourceReferenceKey(reference);
+          if (remove) pendingSourceRefs.delete(key);
+          else pendingSourceRefs.set(key, reference);
+        });
+        syncPendingSourceSelection(canvas.getSelectedRecordIds?.() || []);
+        return { recordIds: [] };
+      }
+      if (mode === 'selecting-center') return { recordIds: [] };
+      const matchedIds = arrayIdsFromWindow(
+        objectLayer.querySelectorAll('.array-group[data-array-id]'),
+        matchesNode,
+        bottomUp,
+      );
+      const currentIds = [...windowSelectedArrayIds];
+      if (selectedArrayId) currentIds.push(selectedArrayId);
+      if ((!popup.hidden || editingDraft) && (!additive || matchedIds.length)) {
+        closeEditor({ deselect: !additive });
+      }
+      const nextIds = resolveWindowSelectionIds(currentIds, matchedIds, additive);
+      selectedArrayId = null;
+      windowSelectedArrayIds.clear();
+      nextIds.forEach((id) => windowSelectedArrayIds.add(id));
+      suppressNextOutsideClick = windowSelectedArrayIds.size > 0;
+      render();
+      return { recordIds: [] };
+    },
+  };
+
   function updateButton() {
     const active = !popup.hidden;
     canvas.setInactiveStackHitTestingBlocked?.('array-tools', active);
+    objectLayer.classList.toggle('array-source-selection-active', mode === 'selecting-sources');
     button?.classList.toggle('active', active);
     button?.setAttribute('aria-pressed', String(active));
   }
@@ -1280,12 +1697,16 @@ export function createArrayTools({ toolbar, canvas }) {
     pendingSourceIds.forEach((id) => recordNode(id)?.classList.add('array-source-selected'));
     (canvas.getDerivedPresentationNodes?.([...pendingSourceIds]) || [])
       .forEach((node) => node.classList.add('array-source-selected'));
+    pendingSourceRefs.forEach((reference) => {
+      derivativeNodeForReference(reference)?.classList.add('array-source-selected');
+    });
   }
 
   function deactivate() {
     mode = popup.hidden ? 'idle' : 'editing';
     activeType = null;
     pendingSourceIds.clear();
+    pendingSourceRefs.clear();
     canvas.setFeatureCommandDelegate(null);
     canvas.clearObjectSnapCandidate?.();
     updateButton();
@@ -1315,7 +1736,11 @@ export function createArrayTools({ toolbar, canvas }) {
     if (mode === 'selecting-sources') return finishSourceSelection();
     mode = 'selecting-sources';
     pendingSourceIds = new Set(editingDraft.sourceIds);
-    canvas.setFeatureCommandDelegate(null);
+    pendingSourceRefs = new Map(editingDraft.sourceRefs.map((reference) => [
+      arraySourceReferenceKey(reference),
+      reference,
+    ]));
+    canvas.setFeatureCommandDelegate(delegate);
     if (canvas.selectRecords) canvas.selectRecords([...pendingSourceIds]);
     else canvas.clearSelection();
     updateButton();
@@ -1324,7 +1749,7 @@ export function createArrayTools({ toolbar, canvas }) {
     return true;
   }
 
-  function sourceBounds(sourceIds) {
+  function sourceBounds(sourceIds, coordinateFrame = null, sourceRefs = []) {
     const group = createSvg('g');
     sourceIds.forEach((id) => {
       const node = recordNode(id);
@@ -1332,23 +1757,37 @@ export function createArrayTools({ toolbar, canvas }) {
     });
     (canvas.getDerivedPresentationNodes?.(sourceIds) || [])
       .forEach((node) => group.appendChild(sanitizeClone(node.cloneNode(true))));
+    normalizeArraySourceReferences(sourceRefs).forEach((reference) => {
+      const node = derivativeNodeForReference(reference);
+      if (node) group.appendChild(sanitizeClone(node.cloneNode(true)));
+    });
     if (!group.childNodes.length) return null;
-    objectLayer.appendChild(group);
+    const holder = createSvg('g');
+    if (coordinateFrame?.rotation) group.setAttribute('transform', `rotate(${-coordinateFrame.rotation * 180 / Math.PI})`);
+    holder.appendChild(group);
+    objectLayer.appendChild(holder);
     let bounds;
-    try { bounds = group.getBBox(); } catch { bounds = null; }
-    group.remove();
+    try { bounds = holder.getBBox(); } catch { bounds = null; }
+    holder.remove();
     return bounds;
   }
 
   function finishSourceSelection() {
     if (mode !== 'selecting-sources') return false;
     editingDraft.sourceIds = [...pendingSourceIds];
-    editingSourceBounds = sourceBounds(editingDraft.sourceIds);
+    editingDraft.sourceRefs = [...pendingSourceRefs.values()];
+    editingSourceBounds = sourceBounds(editingDraft.sourceIds, null, editingDraft.sourceRefs);
     pendingSourceIds.clear();
+    pendingSourceRefs.clear();
     activeType = null;
-    mode = 'editing';
     canvas.setFeatureCommandDelegate(null);
-    canvas.clearSelection();
+    mode = 'editing';
+    preserveArraySelectionDuringCanvasClear = true;
+    try {
+      canvas.clearSelection();
+    } finally {
+      preserveArraySelectionDuringCanvasClear = false;
+    }
     syncSourceHighlights();
     updateButton();
     updatePopupFromDraft();
@@ -1406,7 +1845,7 @@ export function createArrayTools({ toolbar, canvas }) {
     let committed = normalizeArrayDefinition(editingDraft);
     const index = arrays.findIndex(({ id }) => id === committed.id);
     const previous = index >= 0 ? arrays[index] : null;
-    if (previous && !sameSourceIds(previous.sourceIds, committed.sourceIds)) {
+    if (previous && !sameSourceSelection(previous, committed)) {
       applyArrayParentVisibility(previous, { restore: true });
       committed.parentVisibleExpression = null;
       committed.parentVisibleManuallyEnabled = null;
@@ -1434,46 +1873,84 @@ export function createArrayTools({ toolbar, canvas }) {
   }
 
   function deleteSelectedArray() {
-    const index = arrays.findIndex(({ id }) => id === selectedArrayId);
-    if (index < 0) return false;
-    canvas.requestHistoryCheckpoint?.('delete-array');
-    applyArrayParentVisibility(arrays[index], { restore: true });
-    removeOwnedCenterControl(arrays[index]);
-    arrays.splice(index, 1);
-    editingDraft = null;
-    editingSourceBounds = null;
-    editingIsNew = false;
-    editingHistoryCheckpointed = false;
-    selectedArrayId = null;
-    popup.hidden = true;
-    mode = 'idle';
-    pendingSourceIds.clear();
-    canvas.setFeatureCommandDelegate(null);
-    syncSourceHighlights();
-    updateButton();
+    const selectedIds = selectedArrayId ? [selectedArrayId] : [...windowSelectedArrayIds];
+    if (!selectedIds.length) return false;
+    if (selectedIds.length === 1) return removeDefinition(selectedIds[0]);
+    canvas.requestHistoryCheckpoint?.('delete-array-selection');
+    const removed = selectedIds.reduce((changed, id) => (
+      removeDefinition(id, { history: false }) || changed
+    ), false);
+    if (removed) canvas.notifyObjectChange({ history: 'commit' });
+    return removed;
+  }
+
+  function arrayDefinitionAndDependentIds(arrayId) {
+    const removedIds = new Set([String(arrayId)]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      arrays.forEach((definition) => {
+        if (removedIds.has(definition.id)) return;
+        if (!definition.sourceRefs.some((reference) => (
+          reference.kind === 'array-placement' && removedIds.has(reference.arrayId)
+        ))) return;
+        removedIds.add(definition.id);
+        changed = true;
+      });
+    }
+    return removedIds;
+  }
+
+  function removeDefinitionsById(removedIds) {
+    const ids = new Set([...removedIds].map(String));
+    const removed = arrays.filter(({ id }) => ids.has(id));
+    if (!removed.length) return false;
+    const referencesRemovedArray = (value, visited = new Set()) => {
+      if (typeof value === 'string') return false;
+      if (!value || typeof value !== 'object' || visited.has(value)) return false;
+      if (ids.has(value.arrayId)) return true;
+      visited.add(value);
+      return Object.values(value).some((item) => referencesRemovedArray(item, visited));
+    };
+    const annotationIds = (canvas.getDrawingData?.().dimensionAnnotations || [])
+      .filter((annotation) => referencesRemovedArray(annotation))
+      .map(({ id }) => id);
+    const centerControlIds = removed
+      .map((definition) => ownedCenterEntity(definition)?.id)
+      .filter(Boolean);
+    removed.forEach((definition) => applyArrayParentVisibility(definition, { restore: true }));
+    for (let index = arrays.length - 1; index >= 0; index -= 1) {
+      if (ids.has(arrays[index].id)) arrays.splice(index, 1);
+    }
+    if (ids.has(selectedArrayId) || ids.has(editingDraft?.id)) {
+      selectedArrayId = null;
+      editingDraft = null;
+      editingSourceBounds = null;
+      editingIsNew = false;
+      editingHistoryCheckpointed = false;
+      popup.hidden = true;
+      mode = 'idle';
+      pendingSourceIds.clear();
+      pendingSourceRefs.clear();
+      canvas.setFeatureCommandDelegate(null);
+      syncSourceHighlights();
+      updateButton();
+    }
+    ids.forEach((id) => windowSelectedArrayIds.delete(id));
+    const dependentRecordIds = uniqueIds([...annotationIds, ...centerControlIds]);
+    if (dependentRecordIds.length) {
+      canvas.deleteRecords?.(dependentRecordIds, { checkpoint: false, notify: false });
+    }
     renderNow();
-    canvas.notifyObjectChange({ history: 'commit' });
     return true;
   }
 
   function removeDefinition(arrayId, { history = true } = {}) {
-    const index = arrays.findIndex(({ id }) => id === arrayId);
-    if (index < 0) return false;
+    if (!arrays.some(({ id }) => id === arrayId)) return false;
     if (history) canvas.requestHistoryCheckpoint?.('delete-array');
-    applyArrayParentVisibility(arrays[index], { restore: true });
-    removeOwnedCenterControl(arrays[index]);
-    arrays.splice(index, 1);
-    if (selectedArrayId === arrayId) {
-      selectedArrayId = null;
-      editingDraft = null;
-      editingSourceBounds = null;
-      popup.hidden = true;
-      mode = 'idle';
-      updateButton();
-    }
-    renderNow();
-    canvas.notifyObjectChange({ history: history ? 'commit' : 'none' });
-    return true;
+    const removed = removeDefinitionsById(arrayDefinitionAndDependentIds(arrayId));
+    if (removed) canvas.notifyObjectChange({ history: history ? 'commit' : 'none' });
+    return removed;
   }
 
   function setDefinitionStack(arrayId, stackId) {
@@ -1498,48 +1975,109 @@ export function createArrayTools({ toolbar, canvas }) {
     return true;
   }
 
-  function removeStackReferences(stackId, recordIds = []) {
+  function externalDerivativeReferenceExists(reference) {
+    let handled = false;
+    for (const provider of derivativeSourceProviders) {
+      const exists = provider?.hasReference?.(reference);
+      if (typeof exists !== 'boolean') continue;
+      handled = true;
+      if (exists) return true;
+    }
+    return !handled;
+  }
+
+  function removeReferences({ stackId = null, recordIds = [] } = {}) {
     const removedRecordIds = new Set(recordIds.map(String));
-    const removed = arrays.filter((definition) => (
-      definition.stackId === stackId
+    const removeStack = stackId !== null && stackId !== undefined;
+    const initiallyRemoved = arrays.filter((definition) => (
+      (removeStack && definition.stackId === stackId)
       || definition.sourceIds.some((id) => removedRecordIds.has(String(id)))
+      || definition.sourceRefs.some((reference) => (
+        (reference.kind === 'swell-piece' && removedRecordIds.has(reference.ownerId))
+        || (reference.kind === 'seam-line' && reference.sourceFeatures.some((feature) => (
+          removedRecordIds.has(feature.sourceId)
+        )))
+        || (reference.kind === 'array-placement' && !arrays.some(({ id }) => id === reference.arrayId))
+        || (reference.kind === 'linked-copy' && !externalDerivativeReferenceExists(reference))
+      ))
       || removedRecordIds.has(String(definition.centerRef?.recordId || ''))
     ));
-    if (!removed.length) return false;
-    const removedArrayIds = new Set(removed.map(({ id }) => id));
-    const referencesRemovedArray = (value, visited = new Set()) => {
-      if (typeof value === 'string') return false;
-      if (!value || typeof value !== 'object' || visited.has(value)) return false;
-      if (removedArrayIds.has(value.arrayId)) return true;
-      visited.add(value);
-      return Object.values(value).some((item) => referencesRemovedArray(item, visited));
-    };
-    const annotationIds = (canvas.getDrawingData?.().dimensionAnnotations || [])
-      .filter(referencesRemovedArray)
-      .map(({ id }) => id);
-    if (annotationIds.length) canvas.deleteRecords?.(annotationIds, { checkpoint: false, notify: false });
-    removed.forEach((definition) => {
-      applyArrayParentVisibility(definition, { restore: true });
-      removeOwnedCenterControl(definition);
+    if (!initiallyRemoved.length) return false;
+    const removedArrayIds = new Set();
+    initiallyRemoved.forEach(({ id }) => {
+      arrayDefinitionAndDependentIds(id).forEach((dependentId) => removedArrayIds.add(dependentId));
     });
-    for (let index = arrays.length - 1; index >= 0; index -= 1) {
-      if (removedArrayIds.has(arrays[index].id)) arrays.splice(index, 1);
-    }
-    if (removedArrayIds.has(selectedArrayId)) {
-      selectedArrayId = null;
-      editingDraft = null;
-      editingSourceBounds = null;
-      popup.hidden = true;
-      mode = 'idle';
-      updateButton();
-    }
-    renderNow();
-    return true;
+    return removeDefinitionsById(removedArrayIds);
+  }
+
+  function removeOrphanedDefinitions() {
+    const entities = entityMap();
+    const missingRecordIds = uniqueIds(arrays.flatMap((definition) => [
+      ...definition.sourceIds,
+      ...(definition.centerRef?.recordId ? [definition.centerRef.recordId] : []),
+      ...definition.sourceRefs.flatMap((reference) => {
+        if (reference.kind === 'swell-piece') return [reference.ownerId];
+        if (reference.kind === 'seam-line') {
+          return reference.sourceFeatures.map(({ sourceId }) => sourceId);
+        }
+        return [];
+      }),
+    ])).filter((id) => !entities.has(id));
+    return removeReferences({ recordIds: missingRecordIds });
+  }
+
+  function removeStackReferences(stackId, recordIds = []) {
+    return removeReferences({ stackId, recordIds });
+  }
+
+  function removeRecordReferences(recordIds = []) {
+    return removeReferences({ recordIds });
   }
 
   const delegate = {
+    get purpose() {
+      return mode === 'selecting-sources' ? 'array-source-selection' : 'array-center-selection';
+    },
     pointerDown(event) {
-      if (event.button !== 0 || mode !== 'selecting-center' || !editingDraft) return false;
+      if (event.button !== 0 || !editingDraft) return false;
+      if (mode === 'selecting-sources') {
+        const target = event.paramagicSelectionTarget || event.target;
+        const additive = event.ctrlKey || event.metaKey;
+        const reference = derivativeReferenceFromTarget(target);
+        if (reference) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (derivativeReferenceCreatesCycle(reference)) {
+            errorText.textContent = 'An Array cannot use one of its own dependent placements.';
+            return true;
+          }
+          if (!additive) {
+            pendingSourceIds.clear();
+            pendingSourceRefs.clear();
+            canvas.clearSelection();
+          }
+          const key = arraySourceReferenceKey(reference);
+          if (additive && pendingSourceRefs.has(key)) pendingSourceRefs.delete(key);
+          else pendingSourceRefs.set(key, reference);
+          editingDraft.sourceIds = [...pendingSourceIds];
+          editingDraft.sourceRefs = [...pendingSourceRefs.values()];
+          editingSourceBounds = sourceBounds(editingDraft.sourceIds, null, editingDraft.sourceRefs);
+          syncSourceHighlights();
+          updatePopupFromDraft();
+          commitDraft();
+          return true;
+        }
+        const recordId = target?.closest?.('.canvas-record[data-record-id]')?.dataset.recordId;
+        if (!recordId) return false;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!additive) pendingSourceRefs.clear();
+        if (isArrayableEntity(entityMap().get(recordId))) {
+          canvas.selectRecord?.(recordId, { additive });
+        }
+        return true;
+      }
+      if (mode !== 'selecting-center') return false;
       event.preventDefault();
       event.stopPropagation();
       finishCenterSelection(event);
@@ -1740,14 +2278,14 @@ export function createArrayTools({ toolbar, canvas }) {
       return;
     }
     if (
-      selectedArrayId
+      (selectedArrayId || windowSelectedArrayIds.size)
       && !popup.contains(event.target)
       && !menu?.contains(event.target)
       && event.target !== button
       && !event.target.closest?.(
         '[data-preserve-feature-selection], .stack-panel, .constraint-tool, [data-dimension-tool]',
       )
-    ) closeEditor({ deselect: true });
+    ) selectionProvider.clearSelection();
   }, true);
   window.addEventListener('keydown', (event) => {
     if (
@@ -1760,7 +2298,7 @@ export function createArrayTools({ toolbar, canvas }) {
       finishSourceSelection();
       return;
     }
-    if (!selectedArrayId || !['Delete', 'Backspace'].includes(event.key)) return;
+    if ((!selectedArrayId && !windowSelectedArrayIds.size) || !['Delete', 'Backspace'].includes(event.key)) return;
     if (event.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -1783,18 +2321,12 @@ export function createArrayTools({ toolbar, canvas }) {
 
   canvas.onSelectionChange((properties = {}) => {
     if (mode !== 'selecting-sources') return;
-    const entities = entityMap();
-    pendingSourceIds = new Set(arraySourceIdsFromSelection(
+    syncPendingSourceSelection(
       canvas.getSelectedRecordIds?.() || properties.recordIds || [],
-      entities,
-    ));
-    editingDraft.sourceIds = [...pendingSourceIds];
-    editingSourceBounds = sourceBounds(editingDraft.sourceIds);
-    syncSourceHighlights();
-    updatePopupFromDraft();
-    commitDraft();
+    );
   });
   canvas.onObjectsChange(() => {
+    removeOrphanedDefinitions();
     arrays.filter(definitionProcessingEnabled).forEach((definition) => {
       const center = definition.arrayType === 'circular' ? resolveCenter(definition) : null;
       if (center) definition.centerPoint = [...center];
@@ -1803,7 +2335,9 @@ export function createArrayTools({ toolbar, canvas }) {
       const center = resolveCenter(editingDraft);
       if (center) editingDraft.centerPoint = [...center];
     }
-    if (editingDraft) editingSourceBounds = sourceBounds(editingDraft.sourceIds);
+    if (editingDraft) {
+      editingSourceBounds = sourceBounds(editingDraft.sourceIds, null, editingDraft.sourceRefs);
+    }
     render();
     canvas.refreshLinkedDimensions?.();
   });
@@ -1811,17 +2345,21 @@ export function createArrayTools({ toolbar, canvas }) {
   canvas.onStackChange?.(() => render());
   canvas.registerDrawingExtension?.('arrayTools', {
     serialize() {
-      return arrays.length ? { version: 5, arrays: arrays.map(normalizeArrayDefinition) } : null;
+      return arrays.length ? { version: 6, arrays: arrays.map(normalizeArrayDefinition) } : null;
     },
     restore(value) {
       const version = value?.version ?? 1;
       arrays.splice(0, arrays.length, ...(value?.arrays || []).map((definition) => migrateArrayDefinition(definition, version)));
+      removeOrphanedDefinitions();
       arrays.forEach(reconcileCenterControl);
       arrays.forEach((definition) => {
         captureParentVisibility(definition);
         applyArrayParentVisibility(definition);
       });
       selectedArrayId = null;
+      windowSelectedArrayIds.clear();
+      suppressNextOutsideClick = false;
+      preserveArraySelectionDuringCanvasClear = false;
       editingDraft = null;
       editingSourceBounds = null;
       popup.hidden = true;
@@ -1832,6 +2370,9 @@ export function createArrayTools({ toolbar, canvas }) {
     clear() {
       arrays.splice(0);
       selectedArrayId = null;
+      windowSelectedArrayIds.clear();
+      suppressNextOutsideClick = false;
+      preserveArraySelectionDuringCanvasClear = false;
       editingDraft = null;
       editingSourceBounds = null;
       popup.hidden = true;
@@ -1839,6 +2380,8 @@ export function createArrayTools({ toolbar, canvas }) {
       updateButton();
       objectLayer.querySelectorAll('.array-group').forEach((node) => node.remove());
     },
+    removeStackReferences,
+    removeRecordReferences,
   });
   window.addEventListener('paramagic:tool-activated', (event) => {
     if (event.detail?.source === 'array') return;
@@ -1860,13 +2403,15 @@ export function createArrayTools({ toolbar, canvas }) {
     selectArray,
     deleteSelectedArray,
     definitions: () => arrays.map(clone),
-    selectedDefinition: () => clone(arrays.find(({ id }) => id === selectedArrayId) || null),
+    selectedDefinition: () => clone(selectedDefinitionValue()),
     removeDefinition,
     setDefinitionStack,
     reassignStack,
     removeStackReferences,
+    removeRecordReferences,
     derivedDimensionProvider,
     subtractOperandProvider,
+    selectionProvider,
     selectionPropertyProvider,
   };
 }

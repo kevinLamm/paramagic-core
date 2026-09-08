@@ -91,6 +91,10 @@ export class ScopedSketchModel {
     return this.source.derivedEntity(id);
   }
 
+  constraintModel(constraint) {
+    return this.source.constraintModel?.(constraint) || this;
+  }
+
   resolvePoint(ref) {
     return this.source.resolvePoint(ref);
   }

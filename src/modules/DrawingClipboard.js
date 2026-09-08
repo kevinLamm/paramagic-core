@@ -1,3 +1,4 @@
+import { GLOBAL_LAYER_ID } from './StackCoordinates.js';
 import { normalizeDrawingData, normalizeDrawingDataWithIdentityMap } from './DrawingIO.js';
 import { hydratePortableImageAssets } from './ImageSystem.js';
 import { normalizeSeamLineExtension } from './SeamLineSystem.js';
@@ -146,6 +147,38 @@ export function createClipboardPackage(snapshotInput, {
         if (!entityMap.has(id) || includedIds.has(id)) return;
         includedIds.add(id);
         changed = true;
+      });
+      definition.sourceRefs?.forEach((reference) => {
+        if (reference?.kind === 'array-placement') {
+          const sourceArrayId = String(reference.arrayId || '');
+          if (
+            arrayDefinitions.some(({ id }) => id === sourceArrayId)
+            && !includedArrayIds.has(sourceArrayId)
+          ) {
+            includedArrayIds.add(sourceArrayId);
+            changed = true;
+          }
+        }
+        if (reference?.kind === 'linked-copy') {
+          const sourceCopyId = String(reference.copyId || '');
+          if (
+            linkedCopyDefinitions.some(({ id }) => id === sourceCopyId)
+            && !includedLinkedCopyIds.has(sourceCopyId)
+          ) {
+            includedLinkedCopyIds.add(sourceCopyId);
+            changed = true;
+          }
+        }
+        const sourceEntityIds = reference?.kind === 'swell-piece'
+          ? [reference.ownerId]
+          : reference?.kind === 'seam-line'
+            ? (reference.sourceFeatures || []).flatMap((feature) => [feature.sourceId, feature.recordId])
+            : [];
+        sourceEntityIds.filter(Boolean).forEach((id) => {
+          if (!entityMap.has(id) || includedIds.has(id)) return;
+          includedIds.add(id);
+          changed = true;
+        });
       });
       const centerId = definition.centerRef?.recordId;
       if (entityMap.has(centerId) && !includedIds.has(centerId)) {
@@ -655,7 +688,7 @@ export function createDrawingClipboard({
     const insertAsDrawing = drawing.documentContext?.contentKind !== 'stack-export';
     const sourceStackState = normalizeStackArchitectureState(drawing.extensions?.stacks);
     const sourceRoot = sourceStackState.stacks.find(({ parentStackId }) => !parentStackId);
-    if (!insertAsDrawing && sourceRoot?.systemRole === DEFAULT_STACK_ROLE && sourceStackState.stacks.length === 1) {
+    if (!insertAsDrawing && sourceRoot?.systemRole === DEFAULT_STACK_ROLE && sourceStackState.stacks.filter(({ id }) => id !== GLOBAL_LAYER_ID).length === 1) {
       sourceRoot.name = packageValue.label || file.name.replace(/\.(?:paramagic|json)$/i, '');
       drawing.extensions = { ...(drawing.extensions || {}), stacks: sourceStackState };
     }

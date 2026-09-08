@@ -224,8 +224,8 @@ export function imageStrokeSelectionProperties(appearances = [], canEditImageStr
 }
 
 export function imageStrokePropertiesMarkup() {
-  return `<label class="property-row image-stroke-property-row" for="imageStrokeWidthProperty" hidden><span>Image Stroke Width</span><input id="imageStrokeWidthProperty" aria-label="Image stroke repeat width expression" list="imageStrokeParameterNames" type="text" autocomplete="off" spellcheck="false" disabled /></label>
-  <label class="property-row image-stroke-property-row" for="imageStrokeHeightProperty" hidden><span>Image Stroke Height</span><input id="imageStrokeHeightProperty" aria-label="Image stroke height expression" list="imageStrokeParameterNames" type="text" autocomplete="off" spellcheck="false" disabled /><datalist id="imageStrokeParameterNames"></datalist></label>`;
+  return `<label class="property-row image-stroke-property-row" for="imageStrokeWidthProperty" hidden><span>Image Stroke Width</span><input id="imageStrokeWidthProperty" aria-label="Image stroke repeat width expression" data-expression-source="imageStrokeParameterNames" type="text" autocomplete="off" spellcheck="false" disabled /></label>
+  <label class="property-row image-stroke-property-row" for="imageStrokeHeightProperty" hidden><span>Image Stroke Height</span><input id="imageStrokeHeightProperty" aria-label="Image stroke height expression" data-expression-source="imageStrokeParameterNames" type="text" autocomplete="off" spellcheck="false" disabled /><datalist id="imageStrokeParameterNames"></datalist></label>`;
 }
 
 function escapeHtml(value) {
@@ -341,8 +341,13 @@ export function createImageStrokeSystem({ onImageMetrics = () => {} } = {}) {
     if (!record?.node || record.entity?.construction || appearance?.strokeType !== 'image') return false;
     const href = imageFillContentUrl(appearance.strokeImageReference);
     const runtimeInfo = runtimeCatalogImageInfo(appearance.strokeImageReference);
-    const totalLength = Number(record.node.getTotalLength?.());
-    if (!href || !Number.isFinite(totalLength) || totalLength <= 0) return false;
+    const totalLength = Number(record.pathMetrics?.totalLength ?? record.node.getTotalLength?.());
+    const pointAtLength = typeof record.pathMetrics?.pointAtLength === 'function'
+      ? record.pathMetrics.pointAtLength
+      : typeof record.node.getPointAtLength === 'function'
+        ? (distance) => record.node.getPointAtLength(distance)
+        : null;
+    if (!href || !pointAtLength || !Number.isFinite(totalLength) || totalLength <= 0) return false;
     const metrics = metricsByReference.get(appearance.strokeImageReference);
     const aspectRatio = metrics?.aspectRatio || appearance.strokeImageAspectRatio || 4;
     const height = Number(appearance.strokeImageHeight) || Number(appearance.strokeThickness) || 1.5;
@@ -358,9 +363,9 @@ export function createImageStrokeSystem({ onImageMetrics = () => {} } = {}) {
     const tangentProbe = Math.max(1e-5, Math.min(totalLength / 10000, height / 20));
     const safeRecordId = String(record.id || 'stroke').replace(/[^A-Za-z0-9_-]/g, '-');
     slices.forEach((slice, index) => {
-      const center = record.node.getPointAtLength(slice.center);
-      const before = record.node.getPointAtLength(Math.max(0, slice.center - tangentProbe));
-      const after = record.node.getPointAtLength(Math.min(totalLength, slice.center + tangentProbe));
+      const center = pointAtLength(slice.center);
+      const before = pointAtLength(Math.max(0, slice.center - tangentProbe));
+      const after = pointAtLength(Math.min(totalLength, slice.center + tangentProbe));
       const angle = Math.atan2(after.y - before.y, after.x - before.x) * 180 / Math.PI;
       const strip = document.createElementNS(SVG_NS, 'g');
       strip.setAttribute('transform', `translate(${center.x} ${center.y}) rotate(${angle})`);

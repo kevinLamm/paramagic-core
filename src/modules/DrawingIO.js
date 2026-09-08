@@ -1,3 +1,4 @@
+import { GLOBAL_LAYER_ID, stackFrameFor, stackFrameMatrix, transformStackEntity, transformStackPoint } from './StackCoordinates.js';
 import { evaluateFilletedGeometry } from './FilletSystem.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 import {
@@ -29,6 +30,7 @@ import {
   createDxfDimensionPlans,
   DXF_DIMENSION_LAYER,
   DXF_DIMENSION_STYLE,
+  DXF_DIMENSION_SIZE,
 } from './DxfDimensionExport.js';
 import { ParameterRepository } from './solver/ParameterRepository.js';
 import {
@@ -239,8 +241,9 @@ function mergedStackArchitecture(base, inserted, idMap, {
     });
     insertedRootNodeIds.push(drawingContainerId);
   }
-  if (!targetExists) insertedState.stacks.forEach((stack) => idMap.set(stack.id, createStackId()));
-  insertedState.stacks.forEach((stack) => {
+  idMap.set(GLOBAL_LAYER_ID, GLOBAL_LAYER_ID);
+  if (!targetExists) insertedState.stacks.filter(({ id }) => id !== GLOBAL_LAYER_ID).forEach((stack) => idMap.set(stack.id, createStackId()));
+  insertedState.stacks.filter(({ id }) => id !== GLOBAL_LAYER_ID).forEach((stack) => {
     if (targetExists) {
       idMap.set(stack.id, targetStackId);
       return;
@@ -904,7 +907,7 @@ export function serializeDxf(snapshot) {
     pushEntityHeader('TEXT', dimensionLayer, ownerHandle, 'AcDbText');
     push(
       10, x(point[0]), 20, y(point[1]),
-      40, x(3.5), 1, dxfSingleLineContent(picture.text),
+      40, x(DXF_DIMENSION_SIZE), 1, dxfSingleLineContent(picture.text),
       50, dxfNumber(-Number(picture.textAngle || 0)),
       72, alignment,
       11, x(point[0]), 21, y(point[1]),
@@ -916,6 +919,41 @@ export function serializeDxf(snapshot) {
     if (picture.arc) pushArc(picture.arc, dimensionLayer, ownerHandle);
     picture.arrows?.forEach((points) => pushSolid(points, dimensionLayer, ownerHandle));
     pushDimensionText(picture, ownerHandle);
+  };
+  const pushNativeLeader = ({ picture }) => {
+    const annotationHandle = nextDxfHandle();
+    const leaderHandle = nextDxfHandle();
+    const point = picture.textPoint;
+    const angle = Number(picture.textAngle || 0) * Math.PI / 180;
+    const direction = [Math.cos(angle), -Math.sin(angle)];
+    const vertices = [picture.lines[0].start, ...picture.lines.map((line) => line.end)];
+    const last = vertices.at(-1);
+    push(
+      0, 'MTEXT', 5, annotationHandle,
+      102, '{ACAD_REACTORS', 330, leaderHandle, 102, '}',
+      330, modelSpaceHandle, 100, 'AcDbEntity', 8, dimensionLayer, 410, 'Model',
+      100, 'AcDbMText',
+      10, x(point[0]), 20, y(point[1]), 30, 0,
+      40, x(DXF_DIMENSION_SIZE), 41, 0,
+      71, picture.textAlign === 'right' ? 6 : 4, 72, 1,
+      1, dxfSingleLineContent(picture.text), 7, 'STANDARD',
+      11, direction[0], 21, direction[1], 31, 0,
+    );
+    push(
+      0, 'LEADER', 5, leaderHandle, 330, modelSpaceHandle,
+      100, 'AcDbEntity', 8, dimensionLayer, 410, 'Model',
+      100, 'AcDbLeader', 3, DXF_DIMENSION_STYLE,
+      71, 1, 72, 0, 73, 0, 74, picture.textAlign === 'right' ? 0 : 1, 75, 0,
+      40, x(DXF_DIMENSION_SIZE), 41, 0, 76, vertices.length,
+    );
+    vertices.forEach((vertex) => push(10, x(vertex[0]), 20, y(vertex[1]), 30, 0));
+    push(
+      77, 256, 340, annotationHandle,
+      210, 0, 220, 0, 230, 1,
+      211, direction[0], 221, direction[1], 231, 0,
+      212, 0, 222, 0, 232, 0,
+      213, x(last[0] - point[0]), 223, y(last[1] - point[1]), 233, 0,
+    );
   };
   const pushNativeDimension = (plan) => {
     push(
@@ -978,8 +1016,8 @@ export function serializeDxf(snapshot) {
   const dimensionStyleValues = (name, postfix = '', rounding = 0, precision = 3) => [
     2, name, 70, 0,
     3, postfix, 4, '<>%%d',
-    40, 1, 41, x(2.5), 42, x(1.25), 44, x(1.25), 45, rounding,
-    140, x(3.5), 144, 1, 147, x(0.625),
+    40, 1, 41, x(DXF_DIMENSION_SIZE), 42, x(1.25), 44, x(1.25), 45, rounding,
+    140, x(DXF_DIMENSION_SIZE), 144, 1, 147, x(0.625),
     77, 1, 78, 0, 79, 0, 179, 3, 271, precision, 275, 0, 277, 2,
   ];
   const viewportRecords = [symbolRecord('AcDbViewportTableRecord', [
@@ -1019,7 +1057,7 @@ export function serializeDxf(snapshot) {
   ];
   const dimensionStyleRecords = [
     symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues('STANDARD')),
-    ...(nativeDimensionPlans.length ? [
+    ...(dimensionPlans.some((plan) => ['dimension', 'leader'].includes(plan.kind)) ? [
       symbolRecord('AcDbDimStyleTableRecord', dimensionStyleValues(
         DXF_DIMENSION_STYLE,
         dimensionPostfix,
@@ -1105,6 +1143,7 @@ export function serializeDxf(snapshot) {
   });
   dimensionPlans.forEach((plan) => {
     if (plan.kind === 'dimension') pushNativeDimension(plan);
+    else if (plan.kind === 'leader') pushNativeLeader(plan);
     else pushDimensionPicture(plan.picture);
   });
   push(0, 'ENDSEC');
@@ -1481,10 +1520,12 @@ export function materializeDrawingInstances(drawing = {}, {
       const directSources = sourceIds
         .map((id) => evaluatedById.get(id) || rawById.get(id))
         .filter((entity) => definition.type === 'symmetric' ? isMirrorableEntity(entity) : isDuplicableEntity(entity));
-      const sourceBounds = entityDataBounds(presentationBoundsEntities(sourceIds, directSources));
+      const coordinateFrame = stackFrameFor(drawing.stackState, definition.stackId);
+      const sourceBounds = entityDataBounds(presentationBoundsEntities(sourceIds, directSources)
+        .map((entity) => transformStackEntity(entity, coordinateFrame, true)));
       if (!sourceBounds) return;
-      const sourceAnchor = [sourceBounds.x + sourceBounds.width / 2, sourceBounds.y + sourceBounds.height / 2];
-      const matrix = linkedCopyMatrix(definition, sourceAnchor);
+      const sourceAnchor = transformStackPoint([sourceBounds.x + sourceBounds.width / 2, sourceBounds.y + sourceBounds.height / 2], coordinateFrame);
+      const matrix = linkedCopyMatrix(definition, sourceAnchor, coordinateFrame);
       const dependentIds = arrayDependentVisualIds(rawById, sourceIds);
       const sources = [...new Map([
         ...directSources,
@@ -1506,7 +1547,10 @@ export function materializeDrawingInstances(drawing = {}, {
       const dependentIds = arrayDependentVisualIds(rawById, definition.sourceIds || []);
       const sourceIds = [...new Set([...(definition.sourceIds || []), ...dependentIds])];
       const sources = sourceIds.map((id) => evaluatedById.get(id) || rawById.get(id)).filter(Boolean);
-      const sourceBounds = entityDataBounds(presentationBoundsEntities(definition.sourceIds || [], sources));
+      const coordinateFrame = stackFrameFor(drawing.stackState, definition.stackId);
+      const boundsSources = presentationBoundsEntities(definition.sourceIds || [], sources);
+      const sourceBounds = entityDataBounds(definition.arrayType === 'rectangular'
+        ? boundsSources.map((entity) => transformStackEntity(entity, coordinateFrame, true)) : boundsSources);
       if (!sourceBounds) return;
       const centerEntity = rawById.get(definition.centerRef?.recordId);
       const referencedCenter = pointFeature(centerEntity, Number(definition.centerRef?.index) || 0);
@@ -1516,6 +1560,7 @@ export function materializeDrawingInstances(drawing = {}, {
         evaluateLength: (expression) => evaluateLength(expression, definition),
         sourceBounds,
         centerPoint,
+        coordinateFrame,
       });
       if (!result.valid) return;
       result.placements.forEach((placement, placementIndex) => {
@@ -1694,6 +1739,11 @@ function dimensionSegmentMarkup(className, segment, common) {
 }
 
 function dimensionMarkup(entity, scale = 1) {
+  if (entity.coordinateFrame) {
+    const local = transformStackEntity(entity, entity.coordinateFrame, true);
+    delete local.coordinateFrame;
+    return `<g transform="${stackFrameMatrix(entity.coordinateFrame)}">${dimensionMarkup(local, scale)}</g>`;
+  }
   const common = 'fill="none" stroke="#8b3dff" stroke-width="1" vector-effect="non-scaling-stroke"';
   const arrowStyle = 'fill="#8b3dff" stroke="none"';
   const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;

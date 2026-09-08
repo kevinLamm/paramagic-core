@@ -1,3 +1,5 @@
+import { GLOBAL_LAYER_ID, stackFrameFor } from './StackCoordinates.js';
+import { stackRelationshipSolveDomain } from './StackRelationshipSystem.js';
 import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE } from './ArcGeometry.js';
 import { isSelfCoincidentConstraint } from './solver/ConstraintValidation.js';
@@ -66,7 +68,7 @@ function descriptorKey(constraint) {
   return JSON.stringify(constraint);
 }
 
-export function detectAutoConstraints({ entity, recordId, snapRefs = [], existingEntities = [], worldTolerance = 1 }) {
+export function detectAutoConstraints({ entity, recordId, snapRefs = [], existingEntities = [], worldTolerance = 1, coordinateFrame = null }) {
   const constraints = [];
   const keys = new Set();
   const add = (constraint) => {
@@ -107,8 +109,9 @@ export function detectAutoConstraints({ entity, recordId, snapRefs = [], existin
   const existingSegments = existingEntities.flatMap((candidate) => segments(candidate).map((segment) => ({ ...segment, recordId: candidate.id })));
   segments(entity).forEach((segment) => {
     const angle = segmentAngle(segment);
-    const horizontalError = Math.min(angle, Math.PI - angle);
-    const verticalError = Math.abs(angle - Math.PI / 2);
+    const localAngle = ((angle - (coordinateFrame?.rotation || 0)) % Math.PI + Math.PI) % Math.PI;
+    const horizontalError = Math.min(localAngle, Math.PI - localAngle);
+    const verticalError = Math.abs(localAngle - Math.PI / 2);
     if (horizontalError <= angleTolerance) {
       add({ type: 'Horizontal', featureRefs: [{ kind: 'segment', recordId, index: segment.index }], source: 'auto' });
       return;
@@ -154,7 +157,7 @@ export function detectAutoConstraints({ entity, recordId, snapRefs = [], existin
   return constraints;
 }
 
-export function detectAutoConstraintsForEntities({ entries = [], existingEntities = [], worldTolerance = 1 }) {
+export function detectAutoConstraintsForEntities({ entries = [], existingEntities = [], worldTolerance = 1, coordinateFrame = null }) {
   const availableEntities = [...existingEntities];
   const constraints = [];
   entries.forEach(({ entity, snapRefs = [] }) => {
@@ -165,6 +168,7 @@ export function detectAutoConstraintsForEntities({ entries = [], existingEntitie
       snapRefs,
       existingEntities: availableEntities,
       worldTolerance,
+      coordinateFrame,
     }));
     availableEntities.push(entity);
   });
@@ -189,7 +193,7 @@ function autoConstraintBatchOutcome(constraints, outcomes) {
  */
 export function applyAutoConstraints({ solver, ...detectionOptions }) {
   if (!solver) throw new TypeError('Auto constraints require a solver.');
-  const constraints = detectAutoConstraints(detectionOptions);
+  const constraints = detectAutoConstraints({ ...detectionOptions, coordinateFrame: stackFrameFor(solver.stackState, detectionOptions.entity?.stackId) });
   if (!constraints.length) {
     return { committed: true, constraints: [], result: null, snapshot: null };
   }
@@ -226,9 +230,13 @@ const MIN_CONSTRAINT_HELPER_ZOOM = 0.1;
 
 export function constraintHelpersVisible({ requested = true, scale = 1, activeStackId = null } = {}) {
   return Boolean(requested)
-    && Boolean(activeStackId)
     && Number.isFinite(Number(scale))
     && Number(scale) >= MIN_CONSTRAINT_HELPER_ZOOM;
+}
+
+export function constraintRelevantToStackContext(constraint, activeStackId, isRecordInActiveStack) {
+  if (!activeStackId) return constraint?.stackId === GLOBAL_LAYER_ID || constraint?.coordinateSpace === 'global';
+  return constraintReferencesActiveStack(constraint, isRecordInActiveStack);
 }
 
 const constraintIconPaths = {
@@ -334,13 +342,16 @@ function featureRef(feature) {
     return {
       kind: 'point',
       referenceRole: 'canvas-origin',
+      ...(feature.stackId ? { stackId: feature.stackId } : {}),
       entityType: 'canvas-origin',
       pointRole: 'origin',
     };
   }
+  const reference = feature.dimensionReference || feature;
   return {
     kind: feature.kind,
-    recordId: feature.recordId,
+    recordId: reference.recordId,
+    ...(reference.derivedFeature ? { derivedFeature: { ...reference.derivedFeature } } : {}),
     entityType: feature.entityType,
     index: feature.index,
     ...(feature.pointRole ? { pointRole: feature.pointRole } : {}),
@@ -419,16 +430,18 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
     const external = () => [...constraintOperations]
       .map((operation) => operation.resolveFeature?.(ref))
       .find(Boolean);
+    const derived = ref.derivedFeature ? external() : null;
     if (ref.kind === 'point') {
-      const feature = canvas.getPointFeature(ref.recordId, ref.index, { pointRole: ref.pointRole, rendered: true })
+      const feature = derived
+        || canvas.getPointFeature(ref.recordId, ref.index, { pointRole: ref.pointRole, rendered: true })
         || external();
       return feature?.point || null;
     }
     if (ref.kind === 'segment') {
-      const segment = canvas.getSegmentFeature(ref.recordId, ref.index) || external();
+      const segment = derived || canvas.getSegmentFeature(ref.recordId, ref.index) || external();
       return constraintHelperPoint(segment ? { kind: 'segment', ...segment } : null);
     }
-    return constraintHelperPoint(canvas.getEntityFeature(ref.recordId) || external());
+    return constraintHelperPoint(derived || canvas.getEntityFeature(ref.recordId) || external());
   }
 
   function tangentWorldPoint(featureRefs, mode = null) {
@@ -495,8 +508,9 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
       && constraint.featureRefs?.length
       && constraintIconPaths[constraint.type]
       && canvas.isStackRelationshipAvailable?.(constraint) !== false
-      && constraintReferencesActiveStack(
+      && constraintRelevantToStackContext(
         constraint,
+        canvas.getActiveStackId?.(),
         (recordId) => canvas.isRecordInActiveStack?.(recordId) !== false,
       )
       && (constraint.constraintOperation
@@ -677,6 +691,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
         featureRefs: ordered.map(featureRef),
         source: 'geometric',
         stackId: canvas.getActiveStackId?.(),
+        solveDomain: stackRelationshipSolveDomain(canvas.getActiveStackId?.()),
         ...(mode ? { tangentMode: mode } : {}),
       };
       let outcome;

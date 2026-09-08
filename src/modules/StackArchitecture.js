@@ -7,6 +7,7 @@ import {
   stackNameById,
   uniqueStackName,
 } from './NamingSystem.js';
+import { GLOBAL_LAYER_ID, GLOBAL_LAYER_KIND, normalizeStackFrame } from './StackCoordinates.js';
 import { createUuid } from './IdentitySystem.js';
 
 export {
@@ -28,7 +29,7 @@ export {
   userParameterNameError,
 } from './NamingSystem.js';
 
-export const STACK_ARCHITECTURE_VERSION = 5;
+export const STACK_ARCHITECTURE_VERSION = 6;
 export const DEFAULT_STACK_ROLE = 'default-stack';
 export const STACK_NODE_KIND = 'stack';
 export const DRAWING_NODE_KIND = 'drawing';
@@ -74,7 +75,7 @@ function normalizedSiblingOrder(value, fallback) {
 function canonicalStackRecord(item, index, stacks) {
   const id = String(item?.id || '').trim();
   const isDefault = item?.systemRole === DEFAULT_STACK_ROLE || id === LEGACY_DEFAULT_STACK_ID;
-  const kind = item?.kind === DRAWING_NODE_KIND ? DRAWING_NODE_KIND : STACK_NODE_KIND;
+  const kind = id === GLOBAL_LAYER_ID ? GLOBAL_LAYER_KIND : item?.kind === DRAWING_NODE_KIND ? DRAWING_NODE_KIND : STACK_NODE_KIND;
   const fallback = `Stack ${Math.max(1, index + 1)}`;
   const sourceStackId = Object.hasOwn(item || {}, 'sourceStackId')
     ? (item.sourceStackId ? String(item.sourceStackId) : null)
@@ -99,7 +100,8 @@ function canonicalStackRecord(item, index, stacks) {
     visible: item?.visible !== false,
     enabled,
     enabledExpression: expression,
-    removable: true,
+    removable: id !== GLOBAL_LAYER_ID,
+    ...(kind === STACK_NODE_KIND ? { frame: normalizeStackFrame(item?.frame) } : {}),
     ...(isDefault ? { systemRole: DEFAULT_STACK_ROLE } : {}),
   };
   if (normalized.kind === DRAWING_NODE_KIND) {
@@ -145,6 +147,8 @@ function validateStackParents(stacks, { canonical = false } = {}) {
 }
 
 function orderedStackRecords(stacks) {
+  const globalLayer = stacks.find(({ id }) => id === GLOBAL_LAYER_ID);
+  stacks = stacks.filter(({ id }) => id !== GLOBAL_LAYER_ID);
   const sourceIndex = new Map(stacks.map((stack, index) => [stack.id, index]));
   const children = new Map();
   const add = (parentStackId, stack) => {
@@ -165,6 +169,7 @@ function orderedStackRecords(stacks) {
     (children.get(stack.id) || []).forEach(visit);
   };
   (children.get(null) || []).forEach(visit);
+  if (globalLayer) { globalLayer.order = (children.get(null) || []).length; result.push(globalLayer); }
   return result;
 }
 
@@ -193,7 +198,8 @@ export function normalizeStackArchitectureState(value = null) {
       defaultStack = normalized;
     }
   };
-  sourceStacks.forEach(add);
+  sourceStacks.filter(({ id }) => id !== GLOBAL_LAYER_ID).forEach(add);
+  add({ ...sourceStacks.find(({ id }) => id === GLOBAL_LAYER_ID), id: GLOBAL_LAYER_ID, kind: GLOBAL_LAYER_KIND, name: 'Global', enabled: true, parentStackId: null, order: 0 }, stacks.length);
   if (!defaultStack) {
     defaultStack = stacks.find(({ kind }) => kind === STACK_NODE_KIND) || null;
     if (defaultStack) defaultStack.systemRole = DEFAULT_STACK_ROLE;
@@ -219,12 +225,19 @@ export function normalizeStackArchitectureState(value = null) {
   }
   const activeStackId = requestedActiveNode?.kind === STACK_NODE_KIND
     ? requestedActiveNode.id
-    : hasExplicitActiveStack && sourceVersion >= STACK_ARCHITECTURE_VERSION ? null : defaultStack.id;
+    : hasExplicitActiveStack && sourceVersion >= 5 ? null : defaultStack.id;
   return { version: STACK_ARCHITECTURE_VERSION, activeStackId, stacks: orderedStackRecords(stacks) };
 }
 
+export function stackArchitectureStateForDrawingLoad(value = null, {
+  preserveActiveStack = false,
+} = {}) {
+  const state = normalizeStackArchitectureState(value);
+  return preserveActiveStack ? state : { ...state, activeStackId: null };
+}
+
 export function isDrawableStack(stack) {
-  return stack?.kind !== DRAWING_NODE_KIND;
+  return stack?.kind !== DRAWING_NODE_KIND && stack?.kind !== GLOBAL_LAYER_KIND;
 }
 
 export function isDrawingContainer(stack) {
@@ -286,6 +299,7 @@ export function validateStackReparent(stateInput, stackId, parentStackId = null)
   const state = normalizeStackArchitectureState(stateInput);
   const index = createStackTreeIndex(state);
   const stack = index.byId.get(stackId);
+  if (stackId === GLOBAL_LAYER_ID || parentStackId === GLOBAL_LAYER_ID) return { valid: false, error: 'The global layer cannot be reparented or contain Stacks.' };
   if (!stack) return { valid: false, error: `Stack ${stackId} does not exist.` };
   if (parentStackId && !index.byId.has(parentStackId)) {
     return { valid: false, error: `Parent Stack ${parentStackId} does not exist.` };

@@ -69,10 +69,12 @@ export class ConstraintRegistry {
         variablesById,
         columnByVariableId,
       );
-      const evaluateResiduals = () => evaluateConstraint(model, constraint, dimensions);
+      const evaluateResiduals = () => evaluateConstraint(model.constraintModel?.(constraint) || model, constraint, dimensions);
       const residualCount = evaluateResiduals().length;
       if (residualCount === 0) continue;
-      const analyticalJacobian = analyticalJacobianImplementations[constraint.type];
+      const analyticalJacobian = constraint.coordinateSpace === 'global'
+        ? null
+        : analyticalJacobianImplementations[constraint.type];
       blocks.push({
         runtimeKey: `constraint:${constraint.id}`,
         type: constraint.type,
@@ -87,7 +89,7 @@ export class ConstraintRegistry {
         })),
         evaluateResiduals,
         evaluateAnalyticalJacobian: analyticalJacobian
-          ? () => analyticalJacobian({ model, constraint, dimensions, variables: blockVariables })
+          ? () => analyticalJacobian({ model: model.constraintModel?.(constraint) || model, constraint, dimensions, variables: blockVariables })
           : null,
       });
     }
@@ -105,7 +107,7 @@ export class ConstraintRegistry {
     });
     for (const constraint of model.constraints.values()) {
       if (constraint.enabled === false) continue;
-      const residuals = evaluateConstraint(model, constraint, dimensions);
+      const residuals = evaluateConstraint(model.constraintModel?.(constraint) || model, constraint, dimensions);
       residuals.forEach((value, equationIndex) => {
         values.push(value);
         equations.push({ constraintId: constraint.id, equationIndex });
@@ -134,7 +136,7 @@ export class ConstraintRegistry {
         throw new Error(`${constraint.type} requires a non-degenerate segment.`);
       }
     }
-    evaluateConstraint(model, constraint, dimensions);
+    evaluateConstraint(model.constraintModel?.(constraint) || model, constraint, dimensions);
     return true;
   }
 }

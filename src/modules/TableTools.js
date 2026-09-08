@@ -1,3 +1,4 @@
+import { transformStackPoint } from './StackCoordinates.js';
 import {
   deferTextEditUntilPlacementClick,
   normalizeTextVerticalAlign,
@@ -137,7 +138,7 @@ export function tableDimensions(entity) {
 export function tableCornerPoints(entity) {
   const table = normalizeTableEntity(entity);
   const { width, height } = tableDimensions(table);
-  return [[table.x, table.y], [table.x + width, table.y], [table.x + width, table.y + height], [table.x, table.y + height]];
+  return [[0, 0], [width, 0], [width, height], [0, height]].map((point) => transformStackPoint(point, { x: table.x, y: table.y, rotation: (Number(table.rotation) || 0) * Math.PI / 180 }));
 }
 
 export function tableConstraintEntity(entity) {
@@ -146,6 +147,8 @@ export function tableConstraintEntity(entity) {
   return {
     id: table.id,
     type: 'table',
+    ...(table.stackId ? { stackId: table.stackId } : {}),
+    ...(table.rotation ? { rotation: table.rotation } : {}),
     x: table.x,
     y: table.y,
     width,
@@ -176,6 +179,7 @@ export function applyTableConstraintEntity(entity, constraintEntity) {
   const scaleY = current.height ? height / current.height : 1;
   table.x = finite(constraintEntity?.x, table.x);
   table.y = finite(constraintEntity?.y, table.y);
+  if (constraintEntity?.rotation !== undefined) table.rotation = constraintEntity.rotation;
   table.columns = table.columns.map((column) => ({ width: Math.max(24, column.width * scaleX) }));
   table.rows = table.rows.map((row) => ({ height: Math.max(20, row.height * scaleY) }));
   return table;
@@ -1306,6 +1310,7 @@ export function createTableSystem({
       : null;
     const table = normalizeTableEntity(record.entity);
     record.entity = table;
+    record.group.setAttribute('transform', `rotate(${Number(table.rotation) || 0} ${table.x} ${table.y})`);
     record.group.setAttribute('data-stack-id', table.stackId);
     const { width, height } = tableDimensions(table);
     record.group.setAttribute('data-table-width', width);

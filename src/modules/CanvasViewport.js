@@ -2,6 +2,66 @@
 export const MIN_CANVAS_ZOOM = 0.005;
 export const MAX_CANVAS_ZOOM = 32;
 
+export function bindCanvasKeyboardFocus(canvas) {
+  canvas.tabIndex = -1;
+  const focusCanvas = (event) => {
+    if (event.button !== 0 || event.target.closest?.('input, textarea, select, button, [contenteditable], [data-canvas-ui]')) return;
+    canvas.focus({ preventScroll: true });
+  };
+  // Run before geometry drag handlers prevent the browser's default focus change.
+  canvas.addEventListener('pointerdown', focusCanvas, true);
+  return () => canvas.removeEventListener('pointerdown', focusCanvas, true);
+}
+
+export function rotateViewPoint([x, y], rotation = 0) {
+  const c = Math.cos(rotation), s = Math.sin(rotation);
+  return [c * x - s * y, s * x + c * y];
+}
+
+export function cameraWorldToScreen(camera, point) {
+  const [x, y] = rotateViewPoint(point, camera.rotation || 0);
+  return [x * camera.scale + camera.x, y * camera.scale + camera.y];
+}
+
+export function cameraScreenToWorld(camera, point) {
+  return rotateViewPoint([(point[0] - camera.x) / camera.scale, (point[1] - camera.y) / camera.scale], -(camera.rotation || 0));
+}
+
+export function rotateCameraAt(camera, rotation, screenPoint) {
+  const world = cameraScreenToWorld(camera, screenPoint);
+  const next = { ...camera, rotation };
+  const projected = cameraWorldToScreen(next, world);
+  next.x += screenPoint[0] - projected[0];
+  next.y += screenPoint[1] - projected[1];
+  return next;
+}
+
+export function scaleCameraAt(camera, scale, screenPoint) {
+  const world = cameraScreenToWorld(camera, screenPoint);
+  const next = { ...camera, scale: clampCanvasZoom(scale) };
+  const projected = cameraWorldToScreen(next, world);
+  next.x += screenPoint[0] - projected[0];
+  next.y += screenPoint[1] - projected[1];
+  return next;
+}
+
+export function cameraViewportBounds(camera, width, height) {
+  const corners = [[0, 0], [width, 0], [width, height], [0, height]]
+    .map((point) => cameraScreenToWorld(camera, point));
+  return { left: Math.min(...corners.map(p => p[0])), right: Math.max(...corners.map(p => p[0])),
+    top: Math.min(...corners.map(p => p[1])), bottom: Math.max(...corners.map(p => p[1])) };
+}
+
+export function fitCameraBounds(camera, bounds, width, height) {
+  const corners = [[bounds.x, bounds.y], [bounds.x + bounds.width, bounds.y],
+    [bounds.x + bounds.width, bounds.y + bounds.height], [bounds.x, bounds.y + bounds.height]]
+    .map(point => rotateViewPoint(point, camera.rotation || 0));
+  const xs = corners.map(p => p[0]), ys = corners.map(p => p[1]);
+  const left = Math.min(...xs), right = Math.max(...xs), top = Math.min(...ys), bottom = Math.max(...ys);
+  const scale = clampCanvasZoom(Math.min(width / (right - left), height / (bottom - top)) * 0.9);
+  return { ...camera, scale, x: width / 2 - (left + right) * scale / 2, y: height / 2 - (top + bottom) * scale / 2 };
+}
+
 export function clampCanvasZoom(value) {
   const requested = Number(value);
   if (!Number.isFinite(requested)) return 1;

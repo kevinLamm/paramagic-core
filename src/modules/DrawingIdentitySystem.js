@@ -1,3 +1,4 @@
+import { GLOBAL_LAYER_ID } from './StackCoordinates.js';
 import {
   createUuidAllocator,
   isUuid,
@@ -57,6 +58,8 @@ const LIVE_REFERENCE_KEYS = new Set([
   'sourceId',
   'sourceOwnerId',
   'stackId',
+  'referenceStackId',
+  'movingStackId',
   'swellOwnerId',
   'swellPieceId',
   'swellSourceId',
@@ -116,6 +119,8 @@ const CORE_TARGET_KINDS_BY_KEY = Object.freeze({
   parameterId: ['parameter'],
   parentStackId: ['stack'],
   stackId: ['stack'],
+  referenceStackId: ['stack'],
+  movingStackId: ['stack'],
   targetStackId: ['stack'],
   constraintIds: ['constraint', 'linked-position-constraint', 'swell-constraint'],
   dimensionIds: ['parameter'],
@@ -440,7 +445,7 @@ export function remapDrawingIdentityGraph(input = {}, {
 } = {}) {
   const drawing = clone(input || {});
   const compositeReferences = compositeIdentityReferences(drawing);
-  const shared = new Set([...sharedIds].map((value) => normalizeUuid(value)).filter(Boolean));
+  const shared = new Set([GLOBAL_LAYER_ID, ...sharedIds].map((value) => normalizeUuid(value)).filter(Boolean));
   const declarations = coreDeclarations(drawing);
   const allocator = createUuidAllocator([
     ...shared,

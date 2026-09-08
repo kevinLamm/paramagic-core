@@ -1,3 +1,4 @@
+import { GLOBAL_LAYER_ID } from './StackCoordinates.js';
 import {
   DRAWING_NODE_KIND,
   createStackTreeIndex,
@@ -184,7 +185,7 @@ export function createStackTreePanel({
       <div class="stack-tree-item-toolbar" role="toolbar" aria-label="Stack tools" data-stack-toolbar>
         <button type="button" data-stack-add-child title="Add Child Stack" aria-label="Add Child Stack">${icons.addChild}</button>
         <button type="button" class="stack-tree-enabled-switch" role="switch" data-stack-enable aria-checked="false"><span class="stack-tree-switch-track" aria-hidden="true"><span class="stack-tree-switch-thumb"></span></span></button>
-        <label class="stack-tree-toolbar-expression" data-stack-expression-container hidden><span class="sr-only">Enabled expression</span><input type="text" data-stack-expression aria-label="Stack enabled expression" list="stackEnableExpressionSymbols" autocomplete="off" spellcheck="false" placeholder="${STACK_ENABLE_EXPRESSION_PLACEHOLDER}" /></label>
+        <label class="stack-tree-toolbar-expression" data-stack-expression-container hidden><span class="sr-only">Enabled expression</span><input type="text" data-stack-expression aria-label="Stack enabled expression" data-expression-source="stackEnableExpressionSymbols" autocomplete="off" spellcheck="false" placeholder="${STACK_ENABLE_EXPRESSION_PLACEHOLDER}" /></label>
         <button type="button" data-stack-save-as title="Save Stack As" aria-label="Save Stack As">${icons.save}</button>
         <button type="button" class="destructive" data-stack-delete title="Delete Stack" aria-label="Delete Stack">${icons.delete}</button>
       </div>
@@ -204,6 +205,8 @@ export function createStackTreePanel({
       cursor = index.byId.get(cursor.parentStackId);
     }
     const drawingContainer = stack.kind === DRAWING_NODE_KIND;
+    const globalLayer = stack.id === GLOBAL_LAYER_ID;
+    row.draggable = !globalLayer;
     row.style.setProperty('--stack-depth', depth + 1);
     row.classList.toggle('selected', selected);
     row.classList.toggle('active', active);
@@ -232,6 +235,7 @@ export function createStackTreePanel({
     nameEditor.setAttribute('aria-label', `${stack.name} name`);
     if (document.activeElement !== nameEditor) nameEditor.value = stack.name;
     const toolbar = row.querySelector('[data-stack-toolbar]');
+    toolbar.hidden = globalLayer;
     toolbar.setAttribute('aria-label', `${stack.name} tools`);
     row.querySelector('[data-stack-add-child]').hidden = drawingContainer;
     const saveAs = row.querySelector('[data-stack-save-as]');
@@ -320,6 +324,7 @@ export function createStackTreePanel({
   }
 
   function focusNameInput(stackId) {
+    if (stackId === GLOBAL_LAYER_ID) return;
     if (!select(stackId)) return;
     const row = rowById.get(stackId);
     const name = row?.querySelector('[data-stack-name]');
@@ -458,7 +463,7 @@ export function createStackTreePanel({
     }
     if (event.target.closest('[data-stack-name-input]') || !select(stackId)) return;
     const stack = runtimeState.stacks.find(({ id }) => id === stackId);
-    if (stack?.kind !== DRAWING_NODE_KIND) {
+    if (stack?.kind !== DRAWING_NODE_KIND && stackId !== GLOBAL_LAYER_ID) {
       const activeStackId = stackActivationTarget(stackId, runtimeState.activeStackId);
       canvas.setActiveStack?.(activeStackId);
       if (activeStackId) positionItemToolbar(row);
@@ -529,6 +534,7 @@ export function createStackTreePanel({
     else if (event.key === 'End' && visibleIds.at(-1)) select(visibleIds.at(-1), { focus: true });
     else return;
     event.preventDefault();
+    event.stopPropagation();
   });
   tree.addEventListener('pointerover', (event) => {
     const row = event.target.closest?.('[data-stack-id]');

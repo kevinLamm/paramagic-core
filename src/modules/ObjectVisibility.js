@@ -91,7 +91,7 @@ export function objectVisibilityState(entity, evaluate) {
 
 export function objectVisibilityPropertiesMarkup() {
   return `
-    <div class="property-row object-visibility-property-row" hidden><span>Visible</span><div class="property-inline object-visibility-controls"><label class="object-visibility-checkbox"><span class="sr-only">Visible</span><input id="visibleProperty" aria-label="Visible" type="checkbox" disabled /></label><label class="object-visibility-expression" hidden><span class="sr-only">Visible expression</span><input id="visibleExpressionProperty" aria-label="Visible expression" list="visibleExpressionSymbols" type="text" value="" placeholder="FALSE" autocomplete="off" spellcheck="false" disabled /></label><datalist id="visibleExpressionSymbols"></datalist></div></div>
+    <div class="property-row object-visibility-property-row" hidden><span>Visible</span><div class="property-inline object-visibility-controls"><label class="object-visibility-checkbox"><span class="sr-only">Visible</span><input id="visibleProperty" aria-label="Visible" type="checkbox" disabled /></label><label class="object-visibility-expression" hidden><span class="sr-only">Visible expression</span><input id="visibleExpressionProperty" aria-label="Visible expression" data-expression-source="visibleExpressionSymbols" type="text" value="" placeholder="FALSE" autocomplete="off" spellcheck="false" disabled /></label><datalist id="visibleExpressionSymbols"></datalist></div></div>
   `;
 }
 

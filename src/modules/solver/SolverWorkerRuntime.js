@@ -181,6 +181,7 @@ export class SolverWorkerRuntime {
         : [];
       return createSolverWorkerResult(request, {
         status: result.status || 'completed',
+        stackState: structuredClone(this.controller.stackState),
         message: result.message,
         changedEntities,
         changedDimensions: [],

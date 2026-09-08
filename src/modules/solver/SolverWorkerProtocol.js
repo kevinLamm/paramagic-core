@@ -84,6 +84,7 @@ export function createSolverWorkerResult(request, result = {}) {
     type: 'result',
     commandType: request.type,
     status: String(result.status || 'completed'),
+    ...(result.stackState ? { stackState: result.stackState } : {}),
     changedEntities: Array.isArray(result.changedEntities) ? result.changedEntities : [],
     changedDimensions: Array.isArray(result.changedDimensions) ? result.changedDimensions : [],
     changedParameters: Array.isArray(result.changedParameters) ? result.changedParameters : [],

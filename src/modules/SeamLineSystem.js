@@ -17,7 +17,7 @@ registerIdentitySchema('seamLines', {
   liveReferenceKeys: ['regionId', 'recordId', 'sourceId', 'targetId'],
   liveReferenceArrayKeys: ['recordIds'],
   targetKindsByKey: {
-    regionId: ['entity'],
+    regionId: ['entity', 'composite'],
     recordId: ['entity'],
     recordIds: ['entity'],
     sourceId: ['entity'],
@@ -1249,6 +1249,32 @@ export function createSeamLineSystem({
   let propertyFeatures = [];
   let state = normalizeSeamLineExtension();
   const presentationRoots = new Set();
+  let derivedEntities = [];
+
+  const sourceReferenceForEntity = (entity) => ({
+    kind: 'seam-line',
+    sourceFeatures: (entity?.composite?.sourceFeatures || []).map(seamLineEdgeReference),
+  });
+  const sourceReferenceKey = (reference) => (reference?.sourceFeatures || [])
+    .map(seamLineEdgeKey)
+    .sort()
+    .join('::');
+  const derivativeSourceProvider = {
+    referenceFromTarget(target) {
+      const group = target?.closest?.('.seam-line-presentation[data-seam-line-id]');
+      const entity = group && derivedEntities.find(({ id }) => id === group.dataset.seamLineId);
+      return entity ? sourceReferenceForEntity(entity) : null;
+    },
+    nodeForReference(reference) {
+      if (reference?.kind !== 'seam-line') return null;
+      const key = sourceReferenceKey(reference);
+      const entity = derivedEntities.find((candidate) => sourceReferenceKey(sourceReferenceForEntity(candidate)) === key);
+      if (!entity) return null;
+      return [...presentationRoots].flatMap((root) => [...root.children]).find((node) => (
+        node.dataset?.seamLineId === entity.id
+      )) || null;
+    },
+  };
 
   function removePresentationRoots() {
     presentationRoots.forEach((root) => root.remove());
@@ -1424,6 +1450,7 @@ export function createSeamLineSystem({
     } catch {
       entities = [];
     }
+    derivedEntities = entities;
     if (!globalThis.document) return entities;
     const hosts = new Map();
     entities.forEach((entity) => {
@@ -1455,7 +1482,14 @@ export function createSeamLineSystem({
       group.classList.toggle('stack-hidden', !isStackVisible(entity.stackId));
       group.classList.toggle('stack-inactive', Boolean(getActiveStackId()) && !isStackActive(entity.stackId));
       group.style.pointerEvents = 'none';
+      const hit = presentationNode(entity);
+      hit.setAttribute('class', 'seam-line-hit');
+      hit.setAttribute('stroke', 'transparent');
+      hit.setAttribute('stroke-width', '20');
+      hit.setAttribute('stroke-dasharray', 'none');
+      hit.setAttribute('pointer-events', 'none');
       group.appendChild(node);
+      group.appendChild(hit);
       entry.groups.push(group);
     });
     removePresentationRoots();
@@ -1500,6 +1534,7 @@ export function createSeamLineSystem({
   function clear() {
     state = normalizeSeamLineExtension();
     propertyFeatures = [];
+    derivedEntities = [];
     removePresentationRoots();
   }
 
@@ -1514,6 +1549,7 @@ export function createSeamLineSystem({
     refresh,
     setSelectedSeamLine,
     presentationNodesForSourceIds,
+    derivativeSourceProvider,
     removeReferences,
     prepareDrawingLoad,
     extensionProvider: {

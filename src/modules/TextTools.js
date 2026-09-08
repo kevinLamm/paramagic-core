@@ -475,6 +475,7 @@ export function createTextSystem({
 
   function dimensions(record, text, effectiveFontSize) {
     const entity = presentationEntity(record);
+    record.group.setAttribute('transform', `rotate(${Number(entity.rotation) || 0} ${entity.x} ${entity.y})`);
     const lines = entity.multiline ? String(text || ' ').split('\n') : [singleLineText(text || ' ')];
     measureContext.font = `${effectiveFontSize}px ${entity.fontName}`;
     const width = Math.max(24, ...lines.map((line) => measureContext.measureText(line || ' ').width)) + 10;

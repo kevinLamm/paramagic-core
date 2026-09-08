@@ -1,8 +1,10 @@
+import { stackFrameFor, transformStackEntity } from './StackCoordinates.js';
 import { resolveColorExpression, resolveOpacityExpression } from './AppearanceExpressions.js';
 import { clampTranslatedPanelOffset } from './CanvasUIControls.js';
 import { normalizeDrawingData, parseDrawingText, serializeDrawingJson } from './DrawingIO.js';
 import { unitFactors, valueInUnit } from './solver/Units.js';
-import { loadOpenCv, imageWorldToLocalPoint, normalizeImageTraceSettings, prepareImageTrace, tracePreparedImageRegion } from './ImageTrace.js';
+import { createImageTraceSettingsMemory, loadOpenCv, imageWorldToLocalPoint, prepareImageTrace, tracePreparedImageRegion } from './ImageTrace.js';
+import { ARUCO_WARP_REQUIRED_IDS, detectImageWarpMarkers } from './ImageWarpAruco.js';
 import { createUuid } from './IdentitySystem.js';
 
 // --- Image Fill System & References ---
@@ -566,8 +568,8 @@ export function imageFillPropertiesMarkup() {
     <option value="stretch">Stretch</option>
   </select></label>
   <label class="property-row image-fill-property-row" for="imageFillRotationProperty" hidden><span>Image Fill Rotation Angle</span><input id="imageFillRotationProperty" aria-label="Image fill rotation angle" type="number" step="1" value="0" inputmode="decimal" disabled /></label>
-  <label class="property-row image-fill-property-row image-fill-shift-property-row" for="imageFillLeftProperty" hidden><span>Tile Shift Left</span><input id="imageFillLeftProperty" aria-label="Tile shift left expression" list="imageFillParameterNames" type="text" value="0" autocomplete="off" spellcheck="false" disabled /></label>
-  <label class="property-row image-fill-property-row image-fill-shift-property-row" for="imageFillTopProperty" hidden><span>Tile Shift Top</span><input id="imageFillTopProperty" aria-label="Tile shift top expression" list="imageFillParameterNames" type="text" value="0" autocomplete="off" spellcheck="false" disabled /><datalist id="imageFillParameterNames"></datalist></label>`;
+  <label class="property-row image-fill-property-row image-fill-shift-property-row" for="imageFillLeftProperty" hidden><span>Tile Shift Left</span><input id="imageFillLeftProperty" aria-label="Tile shift left expression" data-expression-source="imageFillParameterNames" type="text" value="0" autocomplete="off" spellcheck="false" disabled /></label>
+  <label class="property-row image-fill-property-row image-fill-shift-property-row" for="imageFillTopProperty" hidden><span>Tile Shift Top</span><input id="imageFillTopProperty" aria-label="Tile shift top expression" data-expression-source="imageFillParameterNames" type="text" value="0" autocomplete="off" spellcheck="false" disabled /><datalist id="imageFillParameterNames"></datalist></label>`;
 }
 
 function escapeHtml(value) {
@@ -1420,11 +1422,17 @@ export function rebaseWarpSettings(input = {}, entity = {}) {
   };
 }
 
-export function enableWarpSettings(entity) {
-  return {
+export function enableWarpSettings(entity, rememberedDimensions = null) {
+  const enabled = {
     ...rebaseWarpSettings(entity.warp || {}, entity),
     enabled: true,
     source: entity.warp?.source || entity.source,
+  };
+  if (!rememberedDimensions) return enabled;
+  return {
+    ...enabled,
+    targetWidth: clampTargetDimension(rememberedDimensions.targetWidth, enabled.targetWidth),
+    targetHeight: clampTargetDimension(rememberedDimensions.targetHeight, enabled.targetHeight),
   };
 }
 
@@ -1903,6 +1911,11 @@ function createWarpGuide(addSvg, parent) {
   const warpSides = [0, 1, 2, 3].map((index) => addSvg(warpGuide, 'line', { class: 'image-warp-side', 'data-warp-side': index }));
   const warpVectorLines = [0, 1, 2, 3].map((index) => addSvg(warpGuide, 'line', { class: 'image-warp-vector-line', 'data-warp-vector-line': index }));
   const warpCornerHandles = [0, 1, 2, 3].map((index) => addSvg(warpGuide, 'circle', { class: 'image-warp-handle image-warp-corner-handle point-handle', 'data-warp-corner': index }));
+  const warpCornerLabels = ['TL', 'TR', 'BR', 'BL'].map((label, index) => {
+    const text = addSvg(warpGuide, 'text', { class: 'image-warp-corner-label', 'data-warp-corner-label': index });
+    text.textContent = label;
+    return text;
+  });
   const warpVectorHandles = [0, 1, 2, 3].map((index) => addSvg(warpGuide, 'rect', { class: 'image-warp-handle image-warp-vector-handle', 'data-warp-vector': index }));
   const warpHandles = [...warpCornerHandles, ...warpVectorHandles];
   const warpLabels = [0, 1, 2, 3].map((index) => {
@@ -1916,10 +1929,18 @@ function createWarpGuide(addSvg, parent) {
   const warpApplyContent = document.createElementNS('http://www.w3.org/1999/xhtml', 'div');
   warpApplyContent.className = 'image-warp-apply-content canvas-overlay-button';
   warpApplyContent.innerHTML = `
-    <button type="button" class="image-warp-apply-button" aria-label="Apply Warp" title="Apply Warp">
-      <svg viewBox="0 0 24 24" aria-hidden="true">${toolbarIcons.warp}</svg>
-    </button>
-    <span class="image-warp-status" role="status"></span>`;
+    <strong>Warp Perspective</strong>
+    <p class="image-warp-detection-status" role="status" aria-live="polite"></p>
+    <div class="image-warp-size-fields">
+      <label><span>Height</span><input class="image-warp-height-input" type="text" inputmode="decimal" aria-label="Warp rectangle height" /></label>
+      <label><span>Width</span><input class="image-warp-width-input" type="text" inputmode="decimal" aria-label="Warp rectangle width" /></label>
+    </div>
+    <p class="image-warp-status" role="status" aria-live="polite"></p>
+    <div class="image-warp-actions">
+      <button type="button" class="image-warp-apply-button" aria-label="Apply Warp" title="Apply Warp">
+        <svg viewBox="0 0 24 24" aria-hidden="true">${toolbarIcons.warp}</svg><span>Apply</span>
+      </button>
+    </div>`;
   warpApply.appendChild(warpApplyContent);
 
   const warpEditor = addSvg(warpGuide, 'foreignObject', { class: 'image-warp-dimension-editor' });
@@ -1936,6 +1957,7 @@ function createWarpGuide(addSvg, parent) {
     warpSides,
     warpVectorLines,
     warpCornerHandles,
+    warpCornerLabels,
     warpVectorHandles,
     warpHandles,
     warpLabels,
@@ -1943,12 +1965,39 @@ function createWarpGuide(addSvg, parent) {
     warpApply,
     warpApplyContent,
     warpApplyButton: warpApplyContent.querySelector('.image-warp-apply-button'),
+    warpWidthInput: warpApplyContent.querySelector('.image-warp-width-input'),
+    warpHeightInput: warpApplyContent.querySelector('.image-warp-height-input'),
+    warpDetectionStatus: warpApplyContent.querySelector('.image-warp-detection-status'),
     warpStatus: warpApplyContent.querySelector('.image-warp-status'),
     warpEditor,
     warpEditorContent,
     warpEditorInput: warpEditorContent.querySelector('.image-warp-dimension-input'),
     handles: warpHandles,
   };
+}
+
+function listMarkerIds(ids = []) {
+  return ids.length ? ids.join(', ') : 'none';
+}
+
+function warpDetectionMessage(detection = {}) {
+  if (detection.state === 'scanning') return 'Scanning for ArUCo markers 0–3…';
+  if (detection.state === 'complete') {
+    const positions = detection.orderedMarkers
+      .map((marker, index) => `${['TL', 'TR', 'BR', 'BL'][index]} ${marker.id}`)
+      .join(', ');
+    const extras = detection.extraIds?.length ? ` Extra IDs ${listMarkerIds(detection.extraIds)} were ignored.` : '';
+    return `Markers found: ${positions}. Verify or adjust the guide.${extras}`;
+  }
+  if (detection.state === 'partial') {
+    const duplicates = detection.duplicateIds?.length ? ` Duplicate IDs: ${listMarkerIds(detection.duplicateIds)}.` : '';
+    return `Found ${detection.detectedIds?.filter((id) => ARUCO_WARP_REQUIRED_IDS.includes(id)).length || 0} of 4 required markers (IDs ${listMarkerIds(detection.detectedIds)}). Missing: ${listMarkerIds(detection.missingIds)}.${duplicates} Replace the image or adjust the guide manually.`;
+  }
+  if (detection.state === 'invalid') return 'Markers 0–3 were found, but their centers do not form a valid convex quadrilateral. Adjust the guide manually.';
+  if (detection.state === 'none') return 'No ArUCo markers found. Adjust the four guide points manually.';
+  if (detection.state === 'manual') return 'Manual guide active. Adjust TL, TR, BR, and BL as needed.';
+  if (detection.state === 'error') return detection.message || 'Marker scanning was unavailable. Adjust the guide manually.';
+  return 'The tool will scan for ArUCo markers 0–3.';
 }
 
 function updateWarpGuide(record) {
@@ -1977,6 +2026,13 @@ function updateWarpGuide(record) {
     handle.setAttribute('cy', points[index][1]);
     handle.setAttribute('r', 6 / scale);
     handle.classList.toggle('selected-warp-corner', index === selectedCorner);
+  });
+  record.warpCornerLabels.forEach((label, index) => {
+    const marker = record.warpDetection?.state === 'complete' ? record.warpDetection.orderedMarkers?.[index] : null;
+    label.textContent = marker ? `${['TL', 'TR', 'BR', 'BL'][index]} · ID ${marker.id}` : ['TL', 'TR', 'BR', 'BL'][index];
+    label.setAttribute('x', points[index][0] + 9 / scale);
+    label.setAttribute('y', points[index][1] - 9 / scale);
+    label.setAttribute('font-size', 11 / scale);
   });
   record.warpVectorHandles.forEach((handle, index) => {
     const point = vectorHandles[index];
@@ -2024,14 +2080,19 @@ function updateWarpGuide(record) {
     background.setAttribute('width', bounds.width + paddingX * 2);
     background.setAttribute('height', bounds.height + paddingY * 2);
   });
-  record.warpApply.setAttribute('x', Math.min(...points.map(([x]) => x)));
+  const guideCenterX = (Math.min(...points.map(([x]) => x)) + Math.max(...points.map(([x]) => x))) / 2;
+  record.warpApply.setAttribute('x', guideCenterX - 88 / scale);
   record.warpApply.setAttribute('y', Math.max(...points.map(([, y]) => y)) + 30 / scale);
-  record.warpApply.setAttribute('width', 220 / scale);
-  record.warpApply.setAttribute('height', 56 / scale);
+  record.warpApply.setAttribute('width', 186 / scale);
+  record.warpApply.setAttribute('height', 260 / scale);
   record.warpApplyContent.style.transform = `scale(${1 / scale})`;
   record.warpApplyContent.style.transformOrigin = '0 0';
-  record.warpStatus.textContent = validation.message;
-  record.warpApplyButton.disabled = !validation.valid;
+  if (document.activeElement !== record.warpWidthInput) record.warpWidthInput.value = formatWarpDimension(warp.targetWidth, record.getDrawingUnit());
+  if (document.activeElement !== record.warpHeightInput) record.warpHeightInput.value = formatWarpDimension(warp.targetHeight, record.getDrawingUnit());
+  record.warpDetectionStatus.textContent = warpDetectionMessage(record.warpDetection);
+  record.warpDetectionStatus.dataset.state = record.warpDetection?.state || 'idle';
+  record.warpStatus.textContent = record.warpError || validation.message;
+  record.warpApplyButton.disabled = record.warpBusy || record.warpDetection?.state === 'scanning' || !validation.valid;
   record.warpApplyButton.setAttribute('aria-label', 'Apply Warp');
   record.warpApplyButton.title = 'Apply Warp';
 }
@@ -2063,8 +2124,23 @@ function submitWarpDimensionEditor(record) {
   const warp = normalizeWarpSettings(record.entity.warp || {}, record.entity);
   const fallback = record.warpEditingAxis === 'height' ? warp.targetHeight : warp.targetWidth;
   record.entity.warp = setWarpDimension(record.entity.warp, record.warpEditingAxis, parseWarpDimensionInput(record.warpEditorInput.value, fallback, record.getDrawingUnit()));
+  record.rememberWarpDimensions(record.entity.warp);
   closeWarpDimensionEditor(record);
   finishRecordChange(record);
+}
+
+function commitWarpPanelDimensions(record, notify = true) {
+  const warp = normalizeWarpSettings(record.entity.warp || {}, record.entity);
+  const unit = record.getDrawingUnit();
+  const width = parseWarpDimensionInput(record.warpWidthInput.value, warp.targetWidth, unit);
+  const height = parseWarpDimensionInput(record.warpHeightInput.value, warp.targetHeight, unit);
+  const changed = width !== warp.targetWidth || height !== warp.targetHeight;
+  record.entity.warp = setWarpDimension(setWarpDimension(warp, 'width', width), 'height', height);
+  record.rememberWarpDimensions(record.entity.warp);
+  record.warpError = '';
+  if (!notify) return;
+  if (changed) finishRecordChange(record);
+  else record.updateRecord(record);
 }
 
 function finishRecordChange(record) {
@@ -2074,19 +2150,57 @@ function finishRecordChange(record) {
 
 export function createImageManipulation({ addSvg, parent, screenToWorld, getScale, getDrawingUnit = () => '', evaluateNumeric, onSelect, onMoveStart, onChange, onDelete, onCreateClosedLineChain, canStartDrag = () => true }) {
   let drag = null;
+  let rememberedWarpDimensions = null;
+  const traceSettingsMemory = createImageTraceSettingsMemory();
   const toolbarVisualWidth = 194;
   const toolbarObjectWidth = 300;
 
   function closeTrace(record) {
     record.traceRequest += 1;
-    if (record.traceTimer) clearTimeout(record.traceTimer);
-    record.traceTimer = null;
     record.traceActive = false;
     record.tracePrepared = null;
     record.traceWorldPoint = null;
     record.traceResult = null;
     record.traceError = '';
     record.tracePanel.hidden = true;
+  }
+
+  function useManualWarpGuide(record) {
+    record.warpDetectionRequest += 1;
+    record.warpDetection = { state: 'manual', detectedIds: [], missingIds: [...ARUCO_WARP_REQUIRED_IDS], duplicateIds: [], extraIds: [], orderedMarkers: [] };
+    record.warpError = '';
+  }
+
+  async function scanWarpMarkers(record) {
+    if (!record.entity.warp?.enabled || record.entity.locked) return;
+    const request = ++record.warpDetectionRequest;
+    const source = record.entity.source;
+    record.warpDetection = { state: 'scanning', detectedIds: [], missingIds: [...ARUCO_WARP_REQUIRED_IDS], duplicateIds: [], extraIds: [], orderedMarkers: [] };
+    record.warpError = '';
+    updateRecord(record);
+    try {
+      const detection = await detectImageWarpMarkers(record.entity);
+      if (request !== record.warpDetectionRequest || source !== record.entity.source || !record.entity.warp?.enabled) return;
+      record.warpDetection = detection;
+      if (detection.state === 'complete') {
+        record.entity.warp = normalizeWarpSettings({ ...record.entity.warp, points: detection.points }, record.entity);
+        record.selectedWarpCorner = null;
+        finishChange(record);
+        return;
+      }
+    } catch (error) {
+      if (request !== record.warpDetectionRequest || !record.entity.warp?.enabled) return;
+      record.warpDetection = {
+        state: 'error',
+        message: error.message || 'Marker scanning was unavailable. Adjust the guide manually.',
+        detectedIds: [],
+        missingIds: [...ARUCO_WARP_REQUIRED_IDS],
+        duplicateIds: [],
+        extraIds: [],
+        orderedMarkers: [],
+      };
+    }
+    updateRecord(record);
   }
 
   function updateTracePresentation(record) {
@@ -2140,18 +2254,13 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     updateRecord(record);
   }
 
-  function scheduleTrace(record) {
-    if (!record.traceWorldPoint) return;
-    if (record.traceTimer) clearTimeout(record.traceTimer);
-    record.traceTimer = setTimeout(() => {
-      record.traceTimer = null;
-      runTrace(record);
-    }, 80);
-  }
-
   function toggleTrace(record) {
     if (record.traceActive) closeTrace(record);
     else {
+      record.traceSettings = traceSettingsMemory.recall();
+      record.traceToleranceInput.value = record.traceSettings.tolerance;
+      record.traceDetailInput.value = record.traceSettings.detail;
+      record.traceSmoothingInput.value = record.traceSettings.smoothing;
       record.traceActive = true;
       record.tracePanel.hidden = false;
       window.dispatchEvent(new CustomEvent('paramagic:tool-activated', { detail: { source: 'image-trace' } }));
@@ -2253,6 +2362,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     event.stopPropagation();
     onSelect(record.id, event);
     if (record.entity.locked || event.button !== 0) return;
+    if (record.warpDetection?.state === 'scanning' || mode === 'warp-corner' || mode === 'warp-vector') useManualWarpGuide(record);
     const pointer = screenToWorld(event.clientX, event.clientY);
     drag = {
       mode,
@@ -2332,20 +2442,21 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     tracePanel.hidden = true;
     tracePanel.innerHTML = `
       <strong>Trace Region</strong>
+      <p class="image-trace-instruction">Select a point inside the object to be traced.</p>
       <label><span>Color Tolerance</span><input class="image-trace-tolerance" type="range" min="0" max="100" step="1" value="24" /></label>
       <label><span>Edge Detail</span><input class="image-trace-detail" type="range" min="1" max="10" step="1" value="8" /></label>
       <label><span>Smoothing</span><input class="image-trace-smoothing" type="range" min="0" max="10" step="1" value="1" /></label>
       <p class="image-trace-status" role="status" aria-live="polite">Click inside the object to trace.</p>
       <div class="image-trace-actions">
-        <button type="button" class="image-trace-create" disabled>Create Polygon</button>
-        <button type="button" class="image-trace-cancel">Cancel</button>
+        <button type="button" class="image-trace-create" aria-label="Apply Trace" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true">${toolbarIcons.trace}</svg><span>Apply</span>
+        </button>
       </div>`;
     const traceToleranceInput = tracePanel.querySelector('.image-trace-tolerance');
     const traceDetailInput = tracePanel.querySelector('.image-trace-detail');
     const traceSmoothingInput = tracePanel.querySelector('.image-trace-smoothing');
     const traceStatus = tracePanel.querySelector('.image-trace-status');
     const traceCreateButton = tracePanel.querySelector('.image-trace-create');
-    const traceCancelButton = tracePanel.querySelector('.image-trace-cancel');
     toolbarContent.append(lockButton, horizontalButton, verticalButton, resetButton, warpButton, traceButton, tracePanel);
     toolbar.appendChild(toolbarContent);
     const record = {
@@ -2371,13 +2482,22 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       warpButton,
       traceButton,
       selectedWarpCorner: null,
+      warpDetection: { state: 'idle', detectedIds: [], missingIds: [...ARUCO_WARP_REQUIRED_IDS], duplicateIds: [], extraIds: [], orderedMarkers: [] },
+      warpDetectionRequest: 0,
+      warpBusy: false,
+      warpError: '',
+      rememberWarpDimensions(warp) {
+        rememberedWarpDimensions = {
+          targetWidth: warp.targetWidth,
+          targetHeight: warp.targetHeight,
+        };
+      },
       tracePanel,
       traceToleranceInput,
       traceDetailInput,
       traceSmoothingInput,
       traceStatus,
       traceCreateButton,
-      traceCancelButton,
       tracePreview,
       traceSeed,
       traceActive: false,
@@ -2386,10 +2506,9 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       traceResult: null,
       traceError: '',
       traceRequest: 0,
-      traceTimer: null,
       tracePanelOffset: [0, 0],
       tracePanelDrag: null,
-      traceSettings: normalizeImageTraceSettings(),
+      traceSettings: traceSettingsMemory.recall(),
       updateRecord,
       finishChange,
       getDrawingUnit,
@@ -2409,9 +2528,11 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     record.warpVectorHandles.forEach((handle, index) => handle.addEventListener('pointerdown', (event) => beginDrag(event, record, 'warp-vector', index)));
     group.addEventListener('click', (event) => { event.stopPropagation(); onSelect(record.id, event); });
     toolbarContent.addEventListener('pointerdown', (event) => event.stopPropagation());
+    record.warpApplyContent.addEventListener('pointerdown', (event) => event.stopPropagation());
     lockButton.addEventListener('click', (event) => {
       event.stopPropagation();
       closeTrace(record);
+      record.warpDetectionRequest += 1;
       record.entity.locked = !record.entity.locked;
       finishChange(record);
     });
@@ -2433,6 +2554,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       event.stopPropagation();
       if (record.entity.locked) return;
       closeTrace(record);
+      record.warpDetectionRequest += 1;
       record.entity = resetImageEntity(record.entity);
       finishChange(record);
     });
@@ -2441,9 +2563,16 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       if (record.entity.locked) return;
       closeTrace(record);
       record.entity.warp = toggleWarpSettings(record.entity);
-      if (record.entity.warp.enabled) record.entity.warp = enableWarpSettings(record.entity);
-      else record.selectedWarpCorner = null;
+      if (record.entity.warp.enabled) {
+        record.entity.warp = enableWarpSettings(record.entity, rememberedWarpDimensions);
+        record.warpDetection = { state: 'scanning', detectedIds: [], missingIds: [...ARUCO_WARP_REQUIRED_IDS], duplicateIds: [], extraIds: [], orderedMarkers: [] };
+      } else {
+        record.warpDetectionRequest += 1;
+        record.warpDetection = { state: 'idle', detectedIds: [], missingIds: [...ARUCO_WARP_REQUIRED_IDS], duplicateIds: [], extraIds: [], orderedMarkers: [] };
+        record.selectedWarpCorner = null;
+      }
       finishChange(record);
+      if (record.entity.warp.enabled) scanWarpMarkers(record);
     });
     traceButton.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -2474,14 +2603,14 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       if (record.tracePanelDrag?.pointerId === event.pointerId) record.tracePanelDrag = null;
     });
     [traceToleranceInput, traceDetailInput, traceSmoothingInput].forEach((input) => {
-      input.addEventListener('input', (event) => {
+      input.addEventListener('change', (event) => {
         event.stopPropagation();
-        record.traceSettings = normalizeImageTraceSettings({
+        record.traceSettings = traceSettingsMemory.remember({
           tolerance: traceToleranceInput.value,
           detail: traceDetailInput.value,
           smoothing: traceSmoothingInput.value,
         });
-        scheduleTrace(record);
+        runTrace(record);
       });
     });
     traceCreateButton.addEventListener('click', (event) => {
@@ -2492,11 +2621,6 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       updateRecord(record);
       onCreateClosedLineChain?.(points);
     });
-    traceCancelButton.addEventListener('click', (event) => {
-      event.stopPropagation();
-      closeTrace(record);
-      updateRecord(record);
-    });
     record.warpTexts.forEach((text, index) => {
       text.addEventListener('dblclick', (event) => {
         event.preventDefault();
@@ -2505,22 +2629,40 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       });
       text.addEventListener('click', (event) => event.stopPropagation());
     });
+    [record.warpWidthInput, record.warpHeightInput].forEach((input) => {
+      input.addEventListener('pointerdown', (event) => event.stopPropagation());
+      input.addEventListener('blur', () => commitWarpPanelDimensions(record));
+      input.addEventListener('keydown', (event) => {
+        event.stopPropagation();
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          commitWarpPanelDimensions(record);
+          input.blur();
+        }
+      });
+    });
     record.warpApplyButton.addEventListener('click', async (event) => {
       event.stopPropagation();
       if (record.entity.locked) return;
+      commitWarpPanelDimensions(record, false);
+      record.warpDetectionRequest += 1;
+      record.warpBusy = true;
+      record.warpError = '';
       record.warpApplyButton.disabled = true;
       record.warpApplyButton.setAttribute('aria-label', 'Warping image');
       record.warpApplyButton.title = 'Warping image';
       record.warpStatus.textContent = 'Warping…';
       try {
         record.entity = normalizeImageEntity(await warpImageEntity(record.entity));
+        record.warpDetectionRequest += 1;
+        record.warpDetection = { state: 'idle', detectedIds: [], missingIds: [...ARUCO_WARP_REQUIRED_IDS], duplicateIds: [], extraIds: [], orderedMarkers: [] };
+        record.warpBusy = false;
         updateRecord(record);
         onChange(record);
       } catch (error) {
-        record.warpStatus.textContent = error.message;
-        record.warpApplyButton.disabled = false;
-        record.warpApplyButton.setAttribute('aria-label', 'Apply Warp');
-        record.warpApplyButton.title = 'Apply Warp';
+        record.warpBusy = false;
+        record.warpError = error.message || 'The image could not be warped.';
+        updateRecord(record);
       }
     });
     record.warpEditorInput.addEventListener('keydown', (event) => {
@@ -2561,7 +2703,15 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     return true;
   }
 
-  return { createRecord, updateRecord, syncRecord, setAppearance, pointerMove, pointerUp, isDragging: () => Boolean(drag), deleteRecord: onDelete };
+  function syncStackFrames(records, previousState, nextState) {
+    for (const record of records) {
+      if (record.recordType !== 'image') continue;
+      record.entity = transformStackEntity(transformStackEntity(record.entity,
+        stackFrameFor(previousState, record.entity.stackId), true), stackFrameFor(nextState, record.entity.stackId));
+      updateRecord(record);
+    }
+  }
+  return { syncStackFrames, createRecord, updateRecord, syncRecord, setAppearance, pointerMove, pointerUp, isDragging: () => Boolean(drag), deleteRecord: onDelete };
 }
 
 // --- Portable Image Assets ---

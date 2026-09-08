@@ -1,3 +1,4 @@
+import { transformStackEntity, transformStackPoint, IDENTITY_FRAME } from '../StackCoordinates.js';
 import { isCanvasOriginReference } from '../CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from '../ArcGeometry.js';
 import { createUuid } from '../IdentitySystem.js';
@@ -545,6 +546,7 @@ export function createGeometryBinding(entity) {
 // --- Sketch Graph Model ---
 export class SketchModel {
   constructor() {
+    this.stackFrame = () => IDENTITY_FRAME;
     this.entities = new Map();
     this.derivedEntities = new Map();
     this.constraints = new Map();
@@ -565,20 +567,20 @@ export class SketchModel {
   }
 
   addEntity(entity) {
-    const binding = createGeometryBinding(entity);
+    const binding = createGeometryBinding(transformStackEntity(entity, this.stackFrame(entity.stackId), true));
     if (this.entities.has(binding.id)) throw new Error(`Duplicate entity ID: ${binding.id}`);
     this.entities.set(binding.id, binding);
     this.indexBinding(binding);
-    return binding.toEntity();
+    return this.entity(binding.id);
   }
 
   updateEntity(entity) {
     const binding = this.entities.get(entity.id);
     if (!binding) throw new Error(`Unknown entity: ${entity.id}`);
     const previousVariableIds = binding.allVariables().map((variable) => variable.id);
-    if (!binding.updateFromEntity(entity)) throw new Error(`Invalid ${entity.type} geometry.`);
+    if (!binding.updateFromEntity(transformStackEntity(entity, this.stackFrame(entity.stackId || binding.stackId), true))) throw new Error(`Invalid ${entity.type} geometry.`);
     this.indexBinding(binding, previousVariableIds);
-    return binding.toEntity();
+    return this.entity(binding.id);
   }
 
   removeEntity(entityId, { constraintIds = null } = {}) {
@@ -626,7 +628,7 @@ export class SketchModel {
       const constraint = clone({ ...input, id: input.id || createUuid(), enabled: input.enabled !== false });
       if (constraint.type === 'Fixed' && !constraint.fixedPoint) {
         const pointRef = constraint.featureRefs?.find((ref) => ref.kind === 'point' || ref.type === 'point');
-        const point = pointRef && this.resolvePoint(pointRef);
+        const point = pointRef && this.constraintModel(constraint).resolvePoint(pointRef);
         if (point) constraint.fixedPoint = [...point];
       }
       return constraint;
@@ -671,11 +673,12 @@ export class SketchModel {
   }
 
   entity(entityId) {
-    return this.binding(entityId)?.toEntity() || null;
+    const binding = this.binding(entityId);
+    return binding ? transformStackEntity(binding.toEntity(), this.stackFrame(binding.stackId)) : null;
   }
 
   snapshot() {
-    return [...this.entities.values()].map((binding) => binding.toEntity());
+    return [...this.entities.keys()].map((id) => this.entity(id));
   }
 
   allVariables() {
@@ -690,7 +693,7 @@ export class SketchModel {
     return this.variablesById.get(id) || null;
   }
 
-  resolvePoint(ref) {
+  localPoint(ref) {
     if (!ref) return null;
     if (isCanvasOriginReference(ref)) return [0, 0];
     const binding = this.binding(ref.entityId || ref.recordId);
@@ -712,14 +715,42 @@ export class SketchModel {
     return binding.pointFeature(ref.index || 0, ref.pointRole);
   }
 
-  resolveSegment(ref) {
+  localSegment(ref) {
     if (!ref) return null;
     return this.binding(ref.entityId || ref.recordId)?.segmentFeature(ref.index || 0) || null;
   }
 
-  resolveEntity(ref) {
+  localEntityFeature(ref) {
     if (!ref) return null;
     return this.binding(ref.entityId || ref.recordId)?.entityFeature() || null;
+  }
+
+  frameForReference(ref) {
+    return this.stackFrame(ref?.stackId || this.binding(ref?.entityId || ref?.recordId)?.stackId);
+  }
+
+  resolvePoint(ref) {
+    return transformStackPoint(this.localPoint(ref), this.frameForReference(ref));
+  }
+
+  resolveSegment(ref) {
+    const segment = this.localSegment(ref);
+    return segment ? transformStackEntity(segment, this.frameForReference(ref)) : null;
+  }
+
+  resolveEntity(ref) {
+    const feature = this.localEntityFeature(ref);
+    return feature ? transformStackEntity(feature, this.frameForReference(ref)) : null;
+  }
+
+  constraintModel(constraint) {
+    if (constraint?.coordinateSpace === 'global') return this;
+    const view = Object.create(this);
+    view.resolvePoint = (ref) => this.localPoint(ref);
+    view.resolveSegment = (ref) => this.localSegment(ref);
+    view.resolveEntity = (ref) => this.localEntityFeature(ref);
+    view.entity = (id) => this.binding(id)?.toEntity() || null;
+    return view;
   }
 
   resolveFeature(ref) {

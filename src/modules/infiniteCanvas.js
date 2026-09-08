@@ -1,3 +1,4 @@
+import { updateStackAxes, stackFrameFor } from './StackCoordinates.js';
 import {
   createDimensionLinkManager,
   createDimensionEditPanel,
@@ -5,13 +6,15 @@ import {
   createDimensionValueOnlyPersistence,
   dimensionAnchorRecordIds,
   dimensionHandles,
-  dimensionHiddenInTextMode,
   dimensionMode,
   dimensionParentStates,
   dimensionTextEditable,
   isDimensionEntity,
+  finishDimensionLineMove,
   moveDimensionHandle,
   moveDimensionLine,
+  syncDimensionRecordPresentation,
+  syncDimensionStackFrames,
   updateDimensionNode,
 } from './DimensionSystem.js';
 import { formatParameterFieldValue, formatUnitlessValue, formatUnitValue } from './solver/Units.js';
@@ -34,11 +37,11 @@ import {
 } from './ImageSystem.js';
 import { createGeometryAppearanceSystem } from './GeometryAppearanceSystem.js';
 import { createImageStrokeSystem, imageStrokeMetricsAppearancePatch } from './ImageStrokeSystem.js';
-import { addEditableLineChain, drawingGeometryHitTargetClass } from './DrawingTools.js';
+import { addEditableLineChain, drawingGeometryHitTargetClass, createSegmentSelectionNodes } from './DrawingTools.js';
 import { createFilletSystem } from './FilletSystem.js';
 import { createNotchSystem } from './NotchSystem.js';
 import { isNotchEntity, projectPointToNotchFeature, createNotchBoundaryResolver } from './NotchSystem.js';
-import { createOverlapSelectionCycler, clampCanvasZoom } from './CanvasViewport.js';
+import { bindCanvasKeyboardFocus, createOverlapSelectionCycler, cameraWorldToScreen, cameraScreenToWorld, rotateCameraAt, scaleCameraAt, cameraViewportBounds, fitCameraBounds } from './CanvasViewport.js';
 import {
   canvasOriginPointFeature,
 } from './CanvasOrigin.js';
@@ -54,8 +57,9 @@ import { deleteCurveControlPoint, insertCurveControlPoint } from './DrawingTools
 import { createSeamLineSystem } from './SeamLineSystem.js';
 import { isSubtractableEntity, createSubtractSystem } from './SubtractSystem.js';
 import { createStackSystem, syncInactiveStackHitTesting } from './StackSystem.js';
+import { createStackCanvasInteraction } from './StackCanvasInteraction.js';
 import { createStackProcessingScope } from './StackProcessingScope.js';
-import { subtreeStackIds } from './StackArchitecture.js';
+import { stackArchitectureStateForDrawingLoad, subtreeStackIds } from './StackArchitecture.js';
 import {
   createStackActivationCoordinator,
   createStackActivationSystem,
@@ -72,9 +76,11 @@ import {
 } from './FilletSystem.js';
 import { organizeDerivedPaintNodes } from './CanvasPaintOrder.js';
 import { canvasPointerDragReady } from './CanvasPointerDrag.js';
+import { resolveWindowSelectionIds } from './CanvasSelection.js';
 
 export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver }) {
-  const defaultCamera = () => ({ x: canvas.clientWidth / 2, y: canvas.clientHeight / 2, scale: 1 });
+  bindCanvasKeyboardFocus(canvas);
+  const defaultCamera = () => ({ x: canvas.clientWidth / 2, y: canvas.clientHeight / 2, scale: 1, rotation: 0 });
   let camera = defaultCamera();
   let panStart = null;
   let windowSelect = null;
@@ -114,6 +120,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const derivedDimensionFeatureProviders = new Set();
   const derivedBoundaryFeatureProviders = new Set();
   const derivedPresentationProviders = new Set();
+  const derivativeSourceProviders = new Set();
   const derivedSelectionProviders = new Set();
   const subtractOperandProviders = new Set();
   const selectionPropertyProviders = new Set();
@@ -147,9 +154,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     panel: dimensionEditPanel,
     input: dimensionEditInput,
     labelText: dimensionEditLabelText,
-    options: dimensionEditOptions,
     error: dimensionEditError,
+    closeLookup: closeDimensionEditLookup,
+    resizeInput: resizeDimensionEditInput,
+    setLookupOptions: setDimensionEditLookupOptions,
   } = dimensionEditController;
+  let refreshStackAxes = () => {};
   const stackSystem = createStackSystem({
     records,
     selectedIds,
@@ -163,7 +173,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       if (selectedSegment?.recordId === record.id) selectedSegment = null;
     },
     onChange: ({ history = 'coalesce', reason = '' } = {}) => {
-      solver.setStackState?.(stackSystem.getState());
+      if (reason !== 'activation') solver.setStackState?.(stackSystem.getState());
+      refreshStackAxes();
       const activationResult = reason !== 'activation' ? stackActivationCoordinator?.refresh({
         compile: ['add', 'remove-subtree', 'rename', 'restore', 'enabled', 'enabled-expression'].includes(reason),
         allowRollback: reason !== 'restore',
@@ -183,8 +194,33 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
   const stackProcessingScope = createStackProcessingScope({
     isStackEnabled: stackSystem.isStackEffectivelyEnabled,
-    defaultStackId: () => stackSystem.stackIds()[0] || null,
+    defaultStackId: () => solver.defaultStackId(),
     resolveRelationshipStackIds: (relationship) => solver.relationshipStackIds?.(relationship) || [],
+  });
+  const stackCanvasInteraction = createStackCanvasInteraction({
+    canvasElement: canvas,
+    getActiveStackId: stackSystem.activeStackId,
+    getRecordById: (recordId) => recordById(recordId, { includeFillets: true }),
+    getStackFrame: (stackId) => stackSystem.stack(stackId)?.frame,
+    canMoveStack: (stackId) => (
+      stackSystem.isStackEffectivelyEnabled(stackId)
+      && stackSystem.isStackEffectivelyVisible(stackId)
+    ),
+    isToolInteractionActive: canvasToolInteractionActive,
+    screenToWorld,
+    captureDragSnapshot: () => solver.captureStackPlacementState(),
+    moveStackFrame: (stackId, frame) => {
+      const outcome = solver.setStackFrame(stackId, frame);
+      applySolverSnapshot(outcome.snapshot);
+      return outcome;
+    },
+    restoreDragSnapshot: (snapshot) => {
+      if (!snapshot) return;
+      const outcome = solver.restoreStackPlacementState(snapshot);
+      applySolverSnapshot(outcome.snapshot);
+    },
+    onCommit: () => notifyObjectChange({ history: 'commit' }),
+    onHoveredStackChange: stackSystem.setHoveredStack,
   });
   stackActivationSystem = createStackActivationSystem({
     getStackState: stackSystem.getState,
@@ -491,6 +527,15 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function refreshHoverHighlight() {
     hoverLayer.replaceChildren();
+    const appendHighlight = (node, clone) => {
+      const targetMatrix = hoverLayer.getCTM?.();
+      const sourceMatrix = node.getCTM?.();
+      if (targetMatrix && sourceMatrix) {
+        const matrix = targetMatrix.inverse().multiply(sourceMatrix);
+        clone.setAttribute('transform', `matrix(${matrix.a} ${matrix.b} ${matrix.c} ${matrix.d} ${matrix.e} ${matrix.f})`);
+      }
+      hoverLayer.appendChild(clone);
+    };
     const record = records.find((candidate) => candidate.id === hoveredId);
     const hoveredSegmentIndex = record ? [...(selectedSegments.get(record.id) || [])][0] : null;
     if (record && Number.isInteger(hoveredSegmentIndex)) {
@@ -500,7 +545,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         clone.classList.remove('selected', 'hovered', 'smart-selected', 'overlap-cycle-selected', 'object-snap-target');
         clone.classList.add('hover-highlight-graphic');
         clone.style.pointerEvents = 'none';
-        hoverLayer.appendChild(clone);
+        appendHighlight(segment, clone);
         return;
       }
     }
@@ -510,7 +555,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       clone.classList.add('hover-highlight-graphic');
       clone.removeAttribute('role');
       clone.removeAttribute('aria-label');
-      hoverLayer.appendChild(clone);
+      appendHighlight(hoveredRegion, clone);
       return;
     }
     if (!record || ['image', 'text'].includes(record.recordType)) return;
@@ -519,7 +564,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       clone.classList.remove('selected', 'hovered', 'smart-selected', 'overlap-cycle-selected', 'object-snap-target');
       clone.classList.add('hover-highlight-graphic');
       clone.style.pointerEvents = 'none';
-      hoverLayer.appendChild(clone);
+      appendHighlight(node, clone);
     });
   }
 
@@ -712,11 +757,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function screenToWorld(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
-    return [(clientX - rect.left - camera.x) / camera.scale, (clientY - rect.top - camera.y) / camera.scale];
+    return cameraScreenToWorld(camera, [clientX - rect.left, clientY - rect.top]);
   }
 
   function worldToScreen(point) {
-    return [point[0] * camera.scale + camera.x, point[1] * camera.scale + camera.y];
+    return cameraWorldToScreen(camera, point);
   }
 
   function circleFromThreePoints(a, b, c) {
@@ -793,18 +838,16 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function syncDimensionPresentation(record) {
-    const hideDimension = dimensionHiddenInTextMode(record.entity, dimensionTextMode);
-    const hideForParent = record.dimensionParentsVisible === false;
-    record.group.style.display = hideDimension ? 'none' : '';
-    record.group.classList.toggle('object-visibility-hidden', hideForParent);
-    record.group.setAttribute('data-object-visible', String(!hideForParent));
-    record.group.setAttribute('aria-hidden', String(hideDimension || hideForParent));
+    syncDimensionRecordPresentation(record, {
+      textMode: dimensionTextMode,
+      activeStackId: stackSystem.activeStackId(),
+    });
   }
 
   function syncDimensionDependencyStates() {
     const enabledByDimensionId = new Map();
     const parentState = (recordId, shown) => {
-      const parent = recordById(recordId);
+      const parent = recordById(recordId, { includeFillets: true });
       if (!parent) {
         for (const provider of derivedDimensionFeatureProviders) {
           const derivedState = provider[shown ? 'isRecordShown' : 'isRecordVisible']?.(recordId);
@@ -1371,17 +1414,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       `${record.entity?.construction ? 1 : appearance.strokeThickness}px`,
     );
     record.segmentGroup.replaceChildren();
-    record.segmentNodes = recordSegments(renderedEntity).map((segment) => {
-      const node = add(record.segmentGroup, 'line', {
-        x1: segment.start[0],
-        y1: segment.start[1],
-        x2: segment.end[0],
-        y2: segment.end[1],
-        class: 'segment-select-line selectable-entity',
-        'data-segment-index': segment.index,
-      });
-      return node;
-    });
+    record.segmentNodes = createSegmentSelectionNodes(record.segmentGroup, recordSegments(renderedEntity), add);
   }
 
   function updateRecordNode(record) {
@@ -1454,7 +1487,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function bindRecordEvents(record) {
-    const isDimensionTextTarget = (event) => event.target.closest?.('.dimension-text, .dimension-text-hit');
     const handlePointerDown = (event) => {
       if (!isRecordInteractive(record)) return;
       if (drawingMode || smartDimensionDelegate || featureCommandDelegate) return;
@@ -1462,39 +1494,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       else if (!(event.ctrlKey || event.metaKey)) seamLineSystem.clearPropertyFeature();
       event.stopPropagation();
       if (event.button === 0 && (event.ctrlKey || event.metaKey)) return;
-      if (
-        event.button === 0
-        && record.recordType === 'dimension'
-        && ['dimension-line', 'angle-dimension', 'radius-dimension', 'multi-curve-length-dimension'].includes(record.entity.type)
-        && isDimensionTextTarget(event)
-      ) {
-        const pointerTime = Number(event.timeStamp) || Date.now();
-        const previousPointer = record.lastDimensionTextPointerDown;
-        const isSecondPress = previousPointer
-          && pointerTime - previousPointer.time <= 500
-          && Math.hypot(event.clientX - previousPointer.x, event.clientY - previousPointer.y) <= 8;
-        record.lastDimensionTextPointerDown = { time: pointerTime, x: event.clientX, y: event.clientY };
-        if (
-          dimensionMode(record.entity) === 'driving'
-          && record.entity.dimensionId
-          && (isSecondPress || event.detail > 1)
-        ) {
-          event.stopPropagation();
-          selectOnly(record.id);
-          return;
-        }
-        startDimensionLineDrag(event, record);
-        return;
-      }
-      if (
-        event.button === 0
-        && record.recordType === 'dimension'
-        && ['dimension-line', 'angle-dimension', 'radius-dimension', 'multi-curve-length-dimension'].includes(record.entity.type)
-        && event.target.closest?.('.dimension-path')
-      ) {
-        startDimensionLineDrag(event, record);
-        return;
-      }
       if (event.target.dataset?.segmentIndex !== undefined && startSegmentDrag(event, record)) return;
       if (record.recordType === 'table') {
         startObjectDrag(event, record);
@@ -1505,18 +1504,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const handleClick = (event) => {
       if (!isRecordInteractive(record)) return;
       event.stopPropagation();
-      if (
-        record.recordType === 'dimension'
-        && dimensionMode(record.entity) === 'driving'
-        && record.entity.dimensionId
-        && event.detail >= 2
-        && isDimensionTextTarget(event)
-      ) {
-        suppressRecordClick = false;
-        selectOnly(record.id);
-        openDimensionEditPanel(record);
-        return;
-      }
       if (record.recordType === 'table') {
         if (event.ctrlKey || event.metaKey) toggleSelection(record.id);
         else selectOnly(record.id);
@@ -1541,18 +1528,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         node.addEventListener('pointerdown', handlePointerDown);
         node.addEventListener('click', handleClick);
       });
-    }
-    if (record.recordType === 'dimension' && dimensionMode(record.entity) === 'driving' && record.entity.dimensionId) {
-      const handleDimensionDoubleClick = (event) => {
-        if (!isRecordInteractive(record)) return;
-        if (!isDimensionTextTarget(event)) return;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        selectOnly(record.id);
-        openDimensionEditPanel(record);
-      };
-      // Give the dimension text priority over drag and canvas-level handlers.
-      record.group.addEventListener('dblclick', handleDimensionDoubleClick, { capture: true });
     }
   }
 
@@ -1637,6 +1612,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const constraints = shouldAutoConstrain
       ? detectAutoConstraintsForEntities({
         entries: stagedEntries,
+        coordinateFrame: stackFrameFor(solver.stackState),
         existingEntities,
         worldTolerance: 14 / camera.scale,
       })
@@ -1779,6 +1755,15 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       scale: camera.scale,
       updateRecordHandles,
       bindRecordEvents,
+      canInteract: (candidate) => (
+        isRecordInteractive(candidate)
+        && !drawingMode
+        && !smartDimensionDelegate
+        && !featureCommandDelegate
+      ),
+      canEditText: (candidate) => dimensionTextEditable(candidate.entity, dimensionTextMode),
+      onBeginLineDrag: startDimensionLineDrag,
+      onEditText: openDimensionEditPanel,
       onToggleExport: persistDimensionValueOnly,
     });
     syncDimensionPresentation(record);
@@ -1991,6 +1976,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     solver,
     getPointFeature,
     getSegmentFeature,
+    derivedFeatureDependsOn: derivedDimensionFeatureDependsOn,
     refreshLinkedDimensions,
     reapplySolverSnapshot: applySolverSnapshot,
     getScale: () => camera.scale,
@@ -2028,6 +2014,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     isStackActive: stackSystem.isStackActive,
     getActiveStackId: stackSystem.activeStackId,
   });
+  derivativeSourceProviders.add(seamLineSystem.derivativeSourceProvider);
   registerDrawingExtension('seamLines', seamLineSystem.extensionProvider);
 
   function setPreview(entity) {
@@ -2112,7 +2099,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         const feature = tableTools.featureFromEvent({ target: renderedTarget }, tableRecord);
         if (feature) return feature;
       }
-      return canvasOriginPointFeature(originHandle);
+      return canvasOriginPointFeature(originHandle, solver.stackState);
     }
     const tableRecord = records.find((record) => record.recordType === 'table' && record.id === target.closest?.('.table-record, .table-handle-group')?.dataset.recordId);
     if (tableRecord) {
@@ -2214,15 +2201,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       }));
   }
 
-  function populateExpressionOptions(target, excludeId = null, stackId = null) {
-    target.replaceChildren(...dimensionParameterOptions(excludeId, stackId).map((entry) => {
-      const option = document.createElement('option');
-      option.value = entry.name;
-      option.label = entry.label;
-      return option;
-    }));
-  }
-
   function positionDimensionEditPanel() {
     if (!dimensionEdit || dimensionEditPanel.hidden) return;
     const record = dimensionEdit.record;
@@ -2244,6 +2222,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     dimensionEdit = null;
     dimensionEditPanel.hidden = true;
     dimensionEditPanel.classList.remove('invalid');
+    closeDimensionEditLookup();
     dimensionEditInput.value = '';
     dimensionEditLabelText.textContent = 'Dimension';
     dimensionEditError.textContent = '';
@@ -2262,12 +2241,15 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     selectOnly(record.id);
     dimensionEdit = { record, dimensionId: parameterId };
     dimensionEditLabelText.textContent = record.expressionLabel?.() || 'Dimension';
-    populateExpressionOptions(dimensionEditOptions, parameterId, current.stackId || record.entity.stackId);
+    setDimensionEditLookupOptions(dimensionParameterOptions(
+      parameterId,
+      current.stackId || record.entity.stackId,
+    ));
     dimensionEditInput.value = expressionWithoutUnits(current.expression || '');
     dimensionEditError.textContent = '';
     dimensionEditPanel.classList.remove('invalid');
     dimensionEditPanel.hidden = false;
-    dimensionEditController.resizeInput();
+    resizeDimensionEditInput();
     positionDimensionEditPanel();
     requestAnimationFrame(() => {
       positionDimensionEditPanel();
@@ -2586,10 +2568,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return geometryAppearanceSystem.setSelectedAppearance(patch);
   }
 
-  function setRecordGeometryAppearance(recordIds = [], patch = {}) {
+  function setRecordGeometryAppearance(recordIds = [], patch = {}, options = {}) {
     return geometryAppearanceSystem.setSelectedAppearance(patch, {
       recordIds,
       includeConstruction: true,
+      allowImageFill: options.allowImageFill === true,
     });
   }
 
@@ -2731,6 +2714,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     notchSystem.includeDependentDeletionIds(deletionIds, selectedGeometryIds);
     notchSystem.includeDependentDeletionIds(deletionIds, deletionIds);
     seamLineSystem.removeReferences([...deletionIds]);
+    drawingExtensionProviders.forEach((provider) => {
+      provider.removeRecordReferences?.([...deletionIds]);
+    });
     for (let index = records.length - 1; index >= 0; index -= 1) {
       if (!deletionIds.has(records[index].id)) continue;
       if (['geometry', 'text', 'control', 'table'].includes(records[index].recordType)) solver.removeEntity(records[index].id);
@@ -2855,7 +2841,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     notifyObjectChange();
   }
 
-  function loadDrawingData(snapshot, { zoomToFit = true, history = 'coalesce' } = {}) {
+  function loadDrawingData(snapshot, {
+    zoomToFit = true,
+    history = 'coalesce',
+    preserveStackActivation = false,
+  } = {}) {
     const preparedSnapshot = seamLineSystem.prepareDrawingLoad(snapshot || {});
     if (solveFrame !== null) cancelAnimationFrame(solveFrame);
     solveFrame = null;
@@ -2863,7 +2853,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     pendingSolveRecords.clear();
     clearDrawingExtensions();
     loadedDrawingExtensions = cloneEntity(preparedSnapshot.extensions || {});
-    stackSystem.restore(loadedDrawingExtensions.stacks);
+    const loadedStackState = stackArchitectureStateForDrawingLoad(loadedDrawingExtensions.stacks, {
+      preserveActiveStack: preserveStackActivation,
+    });
+    loadedDrawingExtensions.stacks = loadedStackState;
+    stackSystem.restore(loadedStackState);
     classSystem.restore(preparedSnapshot, { notify: true, propagate: false });
     records.splice(0).forEach(removeRecordNodes);
     imageFillSystem.clear();
@@ -2892,6 +2886,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     ];
     solver.loadSketch({
       ...preparedSnapshot,
+      stackState: loadedStackState,
       dimensionAnnotations,
       entities: solverEntities.filter((entity) => (
         entity.type !== 'image'
@@ -2930,6 +2925,15 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         scale: camera.scale,
         updateRecordHandles,
         bindRecordEvents,
+        canInteract: (candidate) => (
+          isRecordInteractive(candidate)
+          && !drawingMode
+          && !smartDimensionDelegate
+          && !featureCommandDelegate
+        ),
+        canEditText: (candidate) => dimensionTextEditable(candidate.entity, dimensionTextMode),
+        onBeginLineDrag: startDimensionLineDrag,
+        onEditText: openDimensionEditPanel,
         onToggleExport: persistDimensionValueOnly,
       });
       syncDimensionPresentation(record);
@@ -2956,7 +2960,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function insertDrawingData(snapshot) {
-    return loadDrawingData(mergeDrawingData(drawingSnapshot(), snapshot));
+    return loadDrawingData(mergeDrawingData(drawingSnapshot(), snapshot), {
+      preserveStackActivation: true,
+    });
   }
 
   function pasteDrawingData(snapshot, {
@@ -2977,7 +2983,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       ...inserted.entities.map(({ id }) => id),
       ...inserted.dimensionAnnotations.map(({ id }) => id),
     ].map((id) => idMap.get(id)).filter(Boolean);
-    loadDrawingData(drawing, { zoomToFit: false, history: 'commit' });
+    loadDrawingData(drawing, {
+      zoomToFit: false,
+      history: 'commit',
+      preserveStackActivation: true,
+    });
     selectRecords(insertedIds);
     return { count: insertedIds.length, recordIds: insertedIds, idMap, insertedRootNodeIds };
   }
@@ -3241,6 +3251,10 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
 
   function applySolverSnapshot(snapshot = null, { incremental = false } = {}) {
+    syncDimensionStackFrames(records, stackSystem.getState(), solver.stackState);
+    imageTools.syncStackFrames(records, stackSystem.getState(), solver.stackState);
+    stackSystem.syncCoordinateFrames(solver.stackState);
+    refreshStackAxes();
     const resolvedSnapshot = snapshot || solver.getGeometrySnapshot(
       stackProcessingScope.records(records).map(({ id }) => id),
     );
@@ -3327,6 +3341,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
 
   function setDimensionTextMode(mode) {
     if (!['expression', 'named-value', 'value'].includes(mode)) return;
+    const changed = dimensionTextMode !== mode;
     dimensionTextMode = mode;
     records.forEach((record) => {
       if (record.recordType === 'geometry' || record.recordType === 'fillet' || record.recordType === 'notch') {
@@ -3341,6 +3356,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     });
     notchSystem.setValueOnly(mode === 'value');
     syncScreenInvariantSizing();
+    if (changed) presentationChangeListeners.forEach((listener) => listener({ dimensionTextMode: mode }));
   }
 
   function solveEditedRecords(editedEntries, lockedVariableIds = []) {
@@ -3414,7 +3430,16 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       const point = tableTools.cornerPoints(table.entity)[cornerIndex >= 0 ? cornerIndex : index];
       return point ? { kind: 'point', recordId, entityType: 'table', index, point: [...point] } : null;
     }
-    return dimensionLinkManager.getPointFeature(recordId, index, options);
+    const derivedRequest = {
+      kind: 'point',
+      recordId,
+      index,
+      ...(options.pointRole ? { pointRole: options.pointRole } : {}),
+      ...(options.derivedFeature ? { derivedFeature: options.derivedFeature } : {}),
+    };
+    if (options.derivedFeature) return resolveDerivedDimensionFeature(derivedRequest);
+    return dimensionLinkManager.getPointFeature(recordId, index, options)
+      || resolveDerivedDimensionFeature(derivedRequest);
   }
 
   function getDimensionFeatureSet(recordId, options = {}) {
@@ -3766,16 +3791,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     if (record) records.push(record);
   });
 
+  refreshStackAxes = () => {
+    updateStackAxes({ axisX, axisY, originPoint, state: solver.stackState,
+      bounds: cameraViewportBounds(camera, canvas.clientWidth, canvas.clientHeight) });
+  };
+
   function render() {
-    g.setAttribute('transform', `translate(${camera.x} ${camera.y}) scale(${camera.scale})`);
-    const worldLeft = -camera.x / camera.scale;
-    const worldRight = (canvas.clientWidth - camera.x) / camera.scale;
-    const worldTop = -camera.y / camera.scale;
-    const worldBottom = (canvas.clientHeight - camera.y) / camera.scale;
-    axisX.setAttribute('x1', worldLeft);
-    axisX.setAttribute('x2', worldRight);
-    axisY.setAttribute('y1', worldTop);
-    axisY.setAttribute('y2', worldBottom);
+    g.setAttribute('transform', `translate(${camera.x} ${camera.y}) rotate(${(camera.rotation || 0) * 180 / Math.PI}) scale(${camera.scale})`);
+    refreshStackAxes();
     records.forEach((record) => {
       if (record.recordType === 'dimension') {
         applyManagedDimensionText(record.entity);
@@ -3846,16 +3869,15 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       windowSelect = null;
       return;
     }
-    derivedSelectionProviders.forEach((provider) => provider.clearSelection?.());
-    selectedIds.clear();
-    selectedSegment = null;
-    selectedSegments.clear();
-    seamLineSystem.clearPropertyFeature();
+    const selectionWindow = windowSelect;
+    const additive = Boolean(selectionWindow.additive);
+    if (!additive) derivedSelectionProviders.forEach((provider) => provider.clearSelection?.());
+    const matchedRecordIds = [];
     records.forEach((record) => {
       if (!isRecordInteractive(record)) return;
       const targets = recordInteractionTargets(record);
-      if (windowSelect.bottomUp) {
-        if (targets.some((target) => intersects(target.getBoundingClientRect(), windowSelect.rect))) selectedIds.add(record.id);
+      if (selectionWindow.bottomUp) {
+        if (targets.some((target) => intersects(target.getBoundingClientRect(), selectionWindow.rect))) matchedRecordIds.push(record.id);
         return;
       }
       const visibleTargets = targets.filter((target) => (
@@ -3863,21 +3885,38 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         && !target.classList.contains('segment-select-line')
       ));
       const containmentTargets = visibleTargets.length ? visibleTargets : targets;
-      if (containmentTargets.length > 0 && containmentTargets.every((target) => containedBy(target.getBoundingClientRect(), windowSelect.rect))) {
-        selectedIds.add(record.id);
+      if (containmentTargets.length > 0 && containmentTargets.every((target) => containedBy(target.getBoundingClientRect(), selectionWindow.rect))) {
+        matchedRecordIds.push(record.id);
       }
     });
+    const nextSelectedIds = resolveWindowSelectionIds(selectedIds, matchedRecordIds, additive);
+    selectedIds.clear();
+    nextSelectedIds.forEach((id) => selectedIds.add(id));
+    if (!additive) {
+      selectedSegment = null;
+      selectedSegments.clear();
+      seamLineSystem.clearPropertyFeature();
+    } else {
+      const matchedSet = new Set(matchedRecordIds);
+      matchedSet.forEach((id) => selectedSegments.delete(id));
+      if (selectedSegment && matchedSet.has(selectedSegment.recordId)) {
+        selectedSegment = [...selectedSegments.entries()].flatMap(([recordId, values]) => (
+          [...values].map((index) => ({ recordId, index }))
+        )).at(-1) || null;
+      }
+    }
     const matchesNode = (node) => {
       const bounds = node?.getBoundingClientRect?.();
       if (!bounds) return false;
-      return windowSelect.bottomUp
-        ? intersects(bounds, windowSelect.rect)
-        : containedBy(bounds, windowSelect.rect);
+      return selectionWindow.bottomUp
+        ? intersects(bounds, selectionWindow.rect)
+        : containedBy(bounds, selectionWindow.rect);
     };
     [...derivedSelectionProviders].forEach((provider) => {
       const selection = provider.selectWindow?.({
-        rect: { ...windowSelect.rect },
-        bottomUp: windowSelect.bottomUp,
+        rect: { ...selectionWindow.rect },
+        bottomUp: selectionWindow.bottomUp,
+        additive,
         matchesNode,
       });
       (selection?.recordIds || []).forEach((recordId) => {
@@ -3959,10 +3998,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const rect = canvas.getBoundingClientRect();
     const cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
     const zoom = Math.exp(-event.deltaY * 0.0012);
-    const nextScale = clampCanvasZoom(camera.scale * zoom);
-    const worldX = (cursor.x - camera.x) / camera.scale;
-    const worldY = (cursor.y - camera.y) / camera.scale;
-    camera = { scale: nextScale, x: cursor.x - worldX * nextScale, y: cursor.y - worldY * nextScale };
+    camera = scaleCameraAt(camera, camera.scale * zoom, [cursor.x, cursor.y]);
     render();
   }, { passive: false });
 
@@ -4019,7 +4055,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       return;
     }
     if (event.button === 0 && !event.target.closest?.('.canvas-record, .point-handle, .closed-constrained-region, .dimension-edit-panel, [data-canvas-ui]')) {
-      windowSelect = { startX: event.clientX, startY: event.clientY, rect: null };
+      windowSelect = {
+        startX: event.clientX,
+        startY: event.clientY,
+        rect: null,
+        additive: Boolean(event.ctrlKey || event.metaKey),
+      };
       canvas.setPointerCapture(event.pointerId);
       updateSelectionBox(event);
     }
@@ -4093,7 +4134,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       syncState();
     }
     if (dimensionLineDrag) {
+      const moved = finishDimensionLineMove(dimensionLineDrag.record, solver);
       dimensionLineDrag = null;
+      if (moved) notifyObjectChange({ history: 'commit' });
       syncState();
     }
     panStart = null;
@@ -4134,6 +4177,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
   document.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented) return;
     // Editing a property or text field must never invoke canvas commands.
     // In particular, Backspace/Delete in the Fill Color expression used to
     // fall through here and delete the selected drawing object.
@@ -4169,13 +4213,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       render();
       return;
     }
-    const fitScale = Math.min(canvas.clientWidth / bounds.width, canvas.clientHeight / bounds.height) * 0.9;
-    const nextScale = clampCanvasZoom(fitScale);
-    camera = {
-      scale: nextScale,
-      x: canvas.clientWidth / 2 - (bounds.x + bounds.width / 2) * nextScale,
-      y: canvas.clientHeight / 2 - (bounds.y + bounds.height / 2) * nextScale,
-    };
+    camera = fitCameraBounds(camera, bounds, canvas.clientWidth, canvas.clientHeight);
     render();
   }
 
@@ -4210,6 +4248,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     addFillet: filletSystem.addFillet,
     addNotch: notchSystem.addNotch,
     addDimension,
+    suppressNextCanvasSelectionClear() {
+      suppressNextCanvasClick = true;
+    },
     clearDrawing,
     getDrawingData: drawingSnapshot,
     getProcessingDrawingData: processingDrawingSnapshot,
@@ -4221,11 +4262,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     setTablePreview: tableTools.setPreview,
     screenToWorld,
     worldToScreen,
+    rotateView(rotation) {
+      camera = rotateCameraAt(camera, rotation, [canvas.clientWidth / 2, canvas.clientHeight / 2]);
+      render();
+    },
     getCanvasElement() {
       return canvas;
     },
     getObjectLayer() {
       return objectLayer;
+    },
+    getDimensionTextMode() {
+      return dimensionTextMode;
     },
     getHandleLayer() {
       return handleLayer;
@@ -4377,7 +4425,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         ...(rewritten.extensions || {}),
         stacks: rewriteQualifiedDimensionReferences(stackSystem.getState(), renames),
       };
-      loadDrawingData(rewritten, { zoomToFit: false, history: 'commit' });
+      loadDrawingData(rewritten, {
+        zoomToFit: false,
+        history: 'commit',
+        preserveStackActivation: true,
+      });
       stackSystem.setSelectedStack(stackId);
       return true;
     },
@@ -4520,6 +4572,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       const record = records.find((candidate) => candidate.id === recordId);
       return record ? cloneEntity(geometryAppearanceSystem.appearance(record.entity)) : null;
     },
+    getImageFillPaint(entity, appearance, bounds = null, instanceKey = null) {
+      return imageFillSystem.paintFor(entity, appearance, bounds, instanceKey);
+    },
+    renderImageStroke(record, appearance, rerender = null) {
+      return imageStrokeSystem.render(record, appearance, rerender);
+    },
     setPointFeaturePosition,
     setSelectedSeamLine: seamLineSystem.setSelectedSeamLine,
     setBoundaryPropertyFeatureFromEvent: seamLineSystem.setPropertyFeatureFromEvent,
@@ -4560,6 +4618,9 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         setSmartDimensionFeatureSelection([]);
       }
       syncState();
+    },
+    getFeatureCommandPurpose() {
+      return featureCommandDelegate?.purpose || null;
     },
     setInactiveStackHitTestingBlocked(owner, blocked) {
       const key = String(owner || '').trim();
@@ -4633,6 +4694,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
         seamLineSystem.refresh();
         syncState();
       };
+    },
+    registerDerivativeSourceProvider(provider) {
+      if (!provider || typeof provider !== 'object') return () => {};
+      derivativeSourceProviders.add(provider);
+      return () => derivativeSourceProviders.delete(provider);
+    },
+    getDerivativeSourceProviders() {
+      return [...derivativeSourceProviders];
     },
     registerDerivedSelectionProvider(provider) {
       if (!provider || typeof provider !== 'object') return () => {};

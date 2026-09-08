@@ -1,4 +1,5 @@
 import { resolveVectorDrawingPoint } from './DrawingTools.js';
+import { IDENTITY_FRAME, inverseStackFrame, stackFrameMatrix, stackFrameFor, transformStackPoint } from './StackCoordinates.js';
 import { dimensionFeatureDistance, nearestDimensionFeature, resolveDimensionFeatureSet, transformDimensionFeatureSet } from './DimensionSystem.js';
 import { isSwellEntity } from './SwellGeometry.js';
 import {
@@ -10,6 +11,8 @@ import { replaceTableCellForeignObjects } from './TableTools.js';
 import { prepareNotchDerivativePresentationClone } from './NotchSystem.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 import { registerIdentitySchema } from './DrawingIdentitySystem.js';
+import { constructionHiddenInValueOnly } from './CanvasPresentation.js';
+import { resolveWindowSelectionIds } from './CanvasSelection.js';
 
 registerIdentitySchema('linkedCopyTools', {
   declarations: (value) => [
@@ -45,10 +48,30 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const uniqueIds = (values = []) => [...new Set(values.filter(Boolean).map(String))];
 
+export function linkedCopyDimensionReference(copyId, sourceId) {
+  return {
+    recordId: String(sourceId),
+    derivedFeature: {
+      provider: 'linked-copy',
+      copyId: String(copyId),
+      sourceId: String(sourceId),
+    },
+  };
+}
+
+function portableFeatureReference(feature = {}) {
+  const reference = feature.dimensionReference || feature;
+  return {
+    recordId: String(reference.recordId),
+    ...(reference.derivedFeature ? { derivedFeature: clone(reference.derivedFeature) } : {}),
+  };
+}
+
 function linkedConstraintPointReference(feature) {
+  const reference = portableFeatureReference(feature);
   return {
     kind: 'point',
-    recordId: String(feature.recordId),
+    ...reference,
     index: Number(feature.index),
     ...(feature.pointRole ? { pointRole: feature.pointRole } : {}),
   };
@@ -56,8 +79,30 @@ function linkedConstraintPointReference(feature) {
 
 export function normalizeLinkedPositionConstraint(value = {}) {
   const target = value.externalDrivingTarget || {};
-  if (!target.copyId || !target.sourceId || !target.recordId || !target.otherAnchor?.recordId) return null;
+  if (!target.copyId || !target.sourceId || !target.otherAnchor?.recordId) return null;
   const stackId = value.stackId ? String(value.stackId) : null;
+  const targetReference = linkedCopyDimensionReference(target.copyId, target.sourceId);
+  const legacyTargetRecordId = String(target.recordId || '');
+  let assignedDerivedReference = false;
+  const featureRefs = (value.featureRefs || []).map((feature) => {
+    const selector = feature?.dimensionReference?.derivedFeature || feature?.derivedFeature;
+    const matchesSelector = selector?.provider === 'linked-copy'
+      && String(selector.copyId) === String(target.copyId)
+      && String(selector.sourceId || feature.recordId) === String(target.sourceId);
+    const matchesLegacyTarget = !assignedDerivedReference
+      && legacyTargetRecordId
+      && String(feature?.recordId) === legacyTargetRecordId
+      && Number(feature?.index) === Number(target.pointIndex);
+    if (matchesSelector || matchesLegacyTarget) {
+      assignedDerivedReference = true;
+      return linkedConstraintPointReference({
+        ...feature,
+        dimensionReference: targetReference,
+      });
+    }
+    return linkedConstraintPointReference(feature);
+  });
+  const otherAnchorReference = portableFeatureReference(target.otherAnchor);
   return {
     id: String(value.id || createUuid()),
     ...(value.sourceRelationshipId ? { sourceRelationshipId: String(value.sourceRelationshipId) } : {}),
@@ -66,16 +111,16 @@ export function normalizeLinkedPositionConstraint(value = {}) {
     source: 'geometric',
     stackId,
     participantStackIds: uniqueIds(value.participantStackIds).filter((id) => id !== stackId),
-    featureRefs: (value.featureRefs || []).map(linkedConstraintPointReference),
+    featureRefs,
     externalDrivingTarget: {
       type: 'linked-position',
-      recordId: String(target.recordId),
+      ...targetReference,
       copyId: String(target.copyId),
       sourceId: String(target.sourceId),
       pointIndex: Number(target.pointIndex),
       otherAnchor: {
         type: 'point',
-        recordId: String(target.otherAnchor.recordId),
+        ...otherAnchorReference,
         index: Number(target.otherAnchor.index),
         ...(target.otherAnchor.pointRole ? { pointRole: target.otherAnchor.pointRole } : {}),
       },
@@ -146,6 +191,7 @@ export function normalizeLinkedCopyDefinition(value = {}) {
     sourceIds: uniqueIds(value.sourceIds),
     anchor: finitePoint(value.anchor),
     linear: finiteLinear(value.linear),
+    ...(value.coordinateFrame ? { coordinateFrame: { ...value.coordinateFrame } } : {}),
     stackId,
     visible: visibleManuallyEnabled
       ? true
@@ -234,8 +280,25 @@ export function reflectionMatrix(start, end) {
   return { a, b, c, d, e: start[0] - a * start[0] - c * start[1], f: start[1] - b * start[0] - d * start[1] };
 }
 
-export function linkedCopyMatrix(definition, sourceAnchor) {
+export function linkedCopyInFrame(definition, frame) {
   const copy = normalizeLinkedCopyDefinition(definition);
+  if (frame) {
+    const previous = copy.coordinateFrame || IDENTITY_FRAME;
+    copy.anchor = transformStackPoint(transformStackPoint(copy.anchor, previous, true), frame);
+    const angle = frame.rotation - previous.rotation;
+    const cosine = Math.cos(angle), sine = Math.sin(angle);
+    const { a, b, c, d } = copy.linear;
+    const ra = cosine * a - sine * b, rb = sine * a + cosine * b;
+    const rc = cosine * c - sine * d, rd = sine * c + cosine * d;
+    copy.linear = { a: ra * cosine - rc * sine, b: rb * cosine - rd * sine,
+      c: ra * sine + rc * cosine, d: rb * sine + rd * cosine };
+    copy.coordinateFrame = { ...frame };
+  }
+  return copy;
+}
+
+export function linkedCopyMatrix(definition, sourceAnchor, frame = null) {
+  const copy = linkedCopyInFrame(definition, frame);
   const [x, y] = finitePoint(sourceAnchor);
   const [targetX, targetY] = copy.anchor;
   const { a, b, c, d } = copy.linear;
@@ -287,15 +350,17 @@ export function linkedCoincidentPositionTarget(derived, reference) {
     || !reference.recordId
     || !Number.isInteger(reference.index)
   ) return null;
+  const derivedReference = linkedCopyDimensionReference(derived.linkedCopyId, derived.linkedSourceId);
+  const otherReference = portableFeatureReference(reference);
   return {
     type: 'linked-position',
-    recordId: derived.recordId,
+    ...derivedReference,
     copyId: derived.linkedCopyId,
     sourceId: derived.linkedSourceId,
     pointIndex: derived.index,
     otherAnchor: {
       type: 'point',
-      recordId: reference.recordId,
+      ...otherReference,
       index: reference.index,
       ...(reference.pointRole ? { pointRole: reference.pointRole } : {}),
     },
@@ -451,8 +516,25 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
   const escaped = (value) => globalThis.CSS?.escape ? CSS.escape(String(value)) : String(value).replace(/["\\]/g, '\\$&');
   const recordNode = (id) => svg.querySelector(`.canvas-record[data-record-id="${escaped(id)}"]`);
   const accepts = (entity, type) => type === 'symmetric' ? isMirrorableEntity(entity) : isDuplicableEntity(entity);
+  const derivativeSourceProvider = {
+    referenceFromTarget(target) {
+      const group = target?.closest?.('.linked-copy-group[data-linked-copy-id]');
+      return group ? { kind: 'linked-copy', copyId: group.dataset.linkedCopyId } : null;
+    },
+    nodeForReference(reference) {
+      if (reference?.kind !== 'linked-copy') return null;
+      return [...objectLayer.children].find((node) => (
+        node.classList?.contains?.('linked-copy-group')
+        && node.dataset?.linkedCopyId === String(reference.copyId)
+      )) || null;
+    },
+    hasReference(reference) {
+      if (reference?.kind !== 'linked-copy') return undefined;
+      return definitions.some(({ id }) => id === String(reference.copyId));
+    },
+  };
 
-  function sourceBounds(sourceIds) {
+  function sourceBounds(sourceIds, frame = null) {
     const holder = createSvg('g');
     sourceIds.forEach((id) => {
       const node = recordNode(id);
@@ -461,16 +543,21 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     (canvas.getDerivedPresentationNodes?.(sourceIds) || [])
       .forEach((node) => holder.appendChild(sanitizeClone(node.cloneNode(true), 'duplicate')));
     if (!holder.childNodes.length) return null;
-    objectLayer.appendChild(holder);
+    const outer = createSvg('g');
+    if (frame) holder.setAttribute('transform', stackFrameMatrix(inverseStackFrame(frame)));
+    outer.appendChild(holder);
+    objectLayer.appendChild(outer);
     let bounds = null;
-    try { bounds = holder.getBBox(); } catch { /* Source is not renderable yet. */ }
-    holder.remove();
+    try { bounds = outer.getBBox(); } catch { /* Source is not renderable yet. */ }
+    outer.remove();
     return bounds && ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(bounds[key])) ? bounds : null;
   }
 
   function definitionMatrix(definition) {
-    const center = boundsCenter(sourceBounds(definition.sourceIds));
-    return center ? linkedCopyMatrix(definition, center) : null;
+    const frame = stackFrameFor(canvas.getStackState?.(), definition.stackId);
+    Object.assign(definition, linkedCopyInFrame(definition, frame));
+    const center = boundsCenter(sourceBounds(definition.sourceIds, frame));
+    return center ? linkedCopyMatrix(definition, transformStackPoint(center, frame)) : null;
   }
 
   function linkedPositionAnnotations() {
@@ -547,6 +634,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       .filter((node) => !derivedPresentationNodes.some((presentation) => presentation.contains(node)))
       .forEach((node) => template.appendChild(sanitizeClone(node.cloneNode(true), definition.type)));
     dependentSourceIds.forEach((id) => {
+      if (constructionHiddenInValueOnly(entities.get(id), canvas.getDimensionTextMode?.())) return;
       const source = recordNode(id);
       if (!source) return;
       const sourceClone = source.cloneNode(true);
@@ -560,6 +648,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
   }
 
   function sourcePresentationClone(definition, entities, sourceId) {
+    if (constructionHiddenInValueOnly(entities.get(sourceId), canvas.getDimensionTextMode?.())) return null;
     const source = recordNode(sourceId);
     if (!source) return null;
     const sourceClone = source.cloneNode(true);
@@ -703,6 +792,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       const scale = Math.max(.000001, Number(canvas.getScale?.()) || 1);
       definition = normalizeLinkedCopyDefinition({ id: createUuid(), type: 'duplicate', sourceIds: [...pendingSourceIds], anchor: [center[0] + 30 / scale, center[1] + 30 / scale], linear: { a: 1, b: 0, c: 0, d: 1 }, stackId: canvas.getActiveStackId?.() });
     }
+    definition.coordinateFrame = { ...stackFrameFor(canvas.getStackState?.(), definition.stackId) };
     definition.zIndex = canvas.nextObjectZIndex?.(definition.stackId) ?? definition.zIndex;
     canvas.requestHistoryCheckpoint?.(`add-${activeType}`);
     definitions.push(definition); selectedCopyId = definition.id;
@@ -744,15 +834,16 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     return true;
   }
 
-  function removeStackReferences(stackId, recordIds = []) {
+  function removeReferences({ stackId = null, recordIds = [] } = {}) {
     const removedRecordIds = new Set(recordIds.map(String));
+    const removeStack = stackId !== null && stackId !== undefined;
     const removedDefinitions = definitions.filter((definition) => (
-      definition.stackId === stackId
+      (removeStack && definition.stackId === stackId)
       || definition.sourceIds.some((id) => removedRecordIds.has(String(id)))
     ));
     if (!removedDefinitions.length && !positionConstraints.some((constraint) => (
-      constraint.stackId === stackId
-      || constraint.participantStackIds?.includes(stackId)
+      (removeStack && constraint.stackId === stackId)
+      || (removeStack && constraint.participantStackIds?.includes(stackId))
       || (constraint.featureRefs || []).some(({ recordId }) => removedRecordIds.has(String(recordId)))
     ))) return false;
     const removedDefinitionIds = new Set(removedDefinitions.map(({ id }) => id));
@@ -764,8 +855,8 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       const constraint = positionConstraints[index];
       if (
         removedDefinitionIds.has(constraint.externalDrivingTarget?.copyId)
-        || constraint.stackId === stackId
-        || constraint.participantStackIds?.includes(stackId)
+        || (removeStack && constraint.stackId === stackId)
+        || (removeStack && constraint.participantStackIds?.includes(stackId))
         || (constraint.featureRefs || []).some(({ recordId }) => removedRecordIds.has(String(recordId)))
       ) positionConstraints.splice(index, 1);
     }
@@ -776,6 +867,14 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     if (removedDefinitionIds.has(selectedCopyId)) selectedCopyId = null;
     renderNow();
     return true;
+  }
+
+  function removeStackReferences(stackId, recordIds = []) {
+    return removeReferences({ stackId, recordIds });
+  }
+
+  function removeRecordReferences(recordIds = []) {
+    return removeReferences({ recordIds });
   }
 
   function derivedRecordId(definition, sourceId) {
@@ -801,6 +900,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     const transformed = transformDimensionFeatureSet(source, (point) => applyMatrix(matrix, point), derivedRecordId(definition, sourceId), node);
     transformed.features = (transformed.features || []).map((feature) => ({
       ...feature,
+      dimensionReference: linkedCopyDimensionReference(definition.id, sourceId),
       linkedCopyId: definition.id,
       linkedCopyType: definition.type,
       linkedSourceId: sourceId,
@@ -824,7 +924,13 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       return { ...feature, node: handle || feature.node };
     },
     resolveFeature(request) {
-      const parsed = parseLinkedId(request?.recordId);
+      const selector = request?.derivedFeature;
+      const parsed = selector?.provider === 'linked-copy' && selector.copyId
+        ? {
+          copyId: String(selector.copyId),
+          sourceId: String(selector.sourceId || request.recordId),
+        }
+        : parseLinkedId(request?.recordId);
       const definition = parsed && definitions.find(({ id }) => id === parsed.copyId);
       const matrix = definition && definitionMatrix(definition);
       if (!definition || !matrix) return null;
@@ -861,12 +967,20 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     const reference = canvas.getPointFeature?.(
       target?.otherAnchor?.recordId,
       target?.otherAnchor?.index,
-      { pointRole: target?.otherAnchor?.pointRole, rendered: true },
+      {
+        pointRole: target?.otherAnchor?.pointRole,
+        rendered: true,
+        ...(target?.otherAnchor?.derivedFeature
+          ? { derivedFeature: target.otherAnchor.derivedFeature }
+          : {}),
+      },
     )?.point;
     const derived = definition && derivedDimensionProvider.resolveFeature({
       kind: 'point',
       recordId: target.recordId,
       index: target.pointIndex,
+      derivedFeature: target.derivedFeature
+        || linkedCopyDimensionReference(target.copyId, target.sourceId).derivedFeature,
     });
     if (!definition || !reference || !derived?.point) return { valid: false, changed: false };
     const anchor = linkedPositionAnchorUpdate(definition, derived.point, reference, target, value);
@@ -1023,13 +1137,17 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       render();
       return true;
     },
-    selectWindow({ matchesNode } = {}) {
-      selectedCopyId = null;
-      windowSelectedCopyIds.clear();
-      linkedCopyIdsFromWindow(
+    selectWindow({ matchesNode, additive = false } = {}) {
+      const matchedIds = linkedCopyIdsFromWindow(
         objectLayer.querySelectorAll('.linked-copy-group[data-linked-copy-id]'),
         matchesNode,
-      ).forEach((id) => windowSelectedCopyIds.add(id));
+      );
+      const currentIds = [...windowSelectedCopyIds];
+      if (selectedCopyId) currentIds.push(selectedCopyId);
+      const nextIds = resolveWindowSelectionIds(currentIds, matchedIds, additive);
+      selectedCopyId = null;
+      windowSelectedCopyIds.clear();
+      nextIds.forEach((id) => windowSelectedCopyIds.add(id));
       suppressNextOutsideClick = windowSelectedCopyIds.size > 0;
       render();
       return { recordIds: [] };
@@ -1122,6 +1240,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       mode !== 'idle'
       || event.button !== 0
       || canvas.getSmartDimensionMode?.()
+      || canvas.getFeatureCommandPurpose?.() === 'array-source-selection'
       || canvasElement.classList.contains('constraint-selection-active')
     ) return;
     const group = event.target.closest?.('.linked-copy-group[data-linked-copy-id]');
@@ -1171,7 +1290,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     event.preventDefault(); event.stopImmediatePropagation(); removeDefinition(selectedCopyId);
   }, true);
   window.addEventListener('click', (event) => {
-    if (mode !== 'idle') return;
+    if (mode !== 'idle' || canvas.getFeatureCommandPurpose?.() === 'array-source-selection') return;
     const action = linkedCopyOutsideClickAction({
       suppressNextOutsideClick,
       hasSelection: Boolean(selectedCopyId || windowSelectedCopyIds.size),
@@ -1222,9 +1341,9 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
 
   canvas.registerDrawingExtension?.('linkedCopyTools', {
     serialize: () => definitions.length ? {
-      version: 3,
+      version: 4,
       copies: definitions.map(normalizeLinkedCopyDefinition),
-      positionConstraints: positionConstraints.map(clone),
+      positionConstraints: positionConstraints.map(normalizeLinkedPositionConstraint).filter(Boolean),
     } : null,
     restore(value) {
       definitions.splice(0, definitions.length, ...(value?.copies || []).map(normalizeLinkedCopyDefinition));
@@ -1245,6 +1364,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       selectedCopyId = null; windowSelectedCopyIds.clear(); suppressNextOutsideClick = false; stop(); applyLinkedPositionConstraints(); render();
     },
     removeStackReferences,
+    removeRecordReferences,
     clear() { definitions.splice(0); positionConstraints.splice(0); selectedCopyId = null; windowSelectedCopyIds.clear(); suppressNextOutsideClick = false; stop(); objectLayer.querySelectorAll('.linked-copy-group').forEach((node) => node.remove()); },
   });
   window.addEventListener('paramagic:tool-activated', (event) => { if (event.detail?.source !== activeType && mode !== 'idle') cancel(); });
@@ -1255,7 +1375,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     definitions: () => definitions.map(clone),
     selectedDefinition: () => clone(definitions.find(({ id }) => id === selectedCopyId) || null),
     selectedCenterlineId: () => null,
-    removeDefinition, setDefinitionStack, reassignStack, removeStackReferences, derivedDimensionProvider, constraintOperation, selectionProvider, selectionPropertyProvider,
+    removeDefinition, setDefinitionStack, reassignStack, removeStackReferences, removeRecordReferences, derivedDimensionProvider, constraintOperation, selectionProvider, selectionPropertyProvider, derivativeSourceProvider,
   };
 }
 

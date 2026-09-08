@@ -1233,6 +1233,23 @@ export function notchDependsOnRecordIds(notchEntity, changedRecordIds = null) {
   ].some((recordId) => recordId && changedRecordIds.has(recordId));
 }
 
+export function notchDrivingDimensionDependsOn(
+  notchEntity,
+  target,
+  changedRecordIds = null,
+  derivedFeatureDependsOn = () => false,
+) {
+  if (!changedRecordIds || notchDependsOnRecordIds(notchEntity, changedRecordIds)) return true;
+  const referenceRecordId = target?.otherAnchor?.recordId || target?.otherSegment?.recordId;
+  return Boolean(
+    referenceRecordId
+    && (
+      changedRecordIds.has(referenceRecordId)
+      || derivedFeatureDependsOn(referenceRecordId, changedRecordIds)
+    )
+  );
+}
+
 export function createNotchSystem({
   records,
   addSvg,
@@ -1250,6 +1267,7 @@ export function createNotchSystem({
   solver,
   getPointFeature,
   getSegmentFeature,
+  derivedFeatureDependsOn = () => false,
   refreshLinkedDimensions,
   reapplySolverSnapshot,
   getScale = () => 1,
@@ -1377,7 +1395,12 @@ export function createNotchSystem({
     const point = getPointFeature(
       target?.otherAnchor?.recordId,
       target?.otherAnchor?.index,
-      { rendered: true },
+      {
+        rendered: true,
+        ...(target?.otherAnchor?.derivedFeature
+          ? { derivedFeature: target.otherAnchor.derivedFeature }
+          : {}),
+      },
     )?.point;
     return point ? { kind: 'point', point } : null;
   }
@@ -1388,6 +1411,7 @@ export function createNotchSystem({
 
   function applyDrivingDimensions(changedRecordIds = null) {
     const dimensionedNotchIds = new Set();
+    const affectedNotchIds = new Set();
     records.filter((record) => (
       record.recordType === 'dimension'
       && isRecordProcessingEnabled(record)
@@ -1398,7 +1422,12 @@ export function createNotchSystem({
           candidate.recordType === 'notch'
           && candidate.id === record.entity.externalDrivingTarget.recordId
         ));
-        return notchDependsOnRecordIds(notch?.entity, changedRecordIds);
+        return notchDrivingDimensionDependsOn(
+          notch?.entity,
+          record.entity.externalDrivingTarget,
+          changedRecordIds,
+          derivedFeatureDependsOn,
+        );
       })())
     )).forEach((record) => {
       const notch = records.find((candidate) => (
@@ -1406,6 +1435,7 @@ export function createNotchSystem({
         && isRecordProcessingEnabled(candidate)
         && candidate.id === record.entity.externalDrivingTarget.recordId
       ));
+      if (notch) affectedNotchIds.add(notch.id);
       const feature = notch && featureForHost(notch.entity.host, notch.entity);
       const entry = solver.dimensions.get(record.entity.dimensionId);
       if (entry?.enabled === false) {
@@ -1443,7 +1473,10 @@ export function createNotchSystem({
       record.recordType === 'notch'
       && isRecordProcessingEnabled(record)
       && record.entity.locationMemory
-      && notchDependsOnRecordIds(record.entity, changedRecordIds)
+      && (
+        notchDependsOnRecordIds(record.entity, changedRecordIds)
+        || affectedNotchIds.has(record.id)
+      )
     ))
       .forEach((record) => {
         record.entity.locationMemory.forceProportional = dimensionedNotchIds.has(record.id);

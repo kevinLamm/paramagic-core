@@ -1,3 +1,4 @@
+import { GLOBAL_LAYER_ID } from './StackCoordinates.js';
 import {
   isCanvasPresentationSourceNode,
   mountCanvasPresentationSvg,
@@ -128,77 +129,24 @@ export function bindCanvasStackInteractions({
   getActiveStackId = () => null,
   hasStack = () => false,
   selectStack = () => false,
-  activateStack = () => false,
   isToolInteractionActive = () => false,
   resolveInteractionStackId = (event) => stackIdForCanvasInteractionTarget(event?.target, canvasElement),
 } = {}) {
   if (!canvasElement?.addEventListener) return () => {};
-  let pendingPointerDown = null;
 
-  const toolOwnsCanvasInteraction = () => Boolean(isToolInteractionActive());
-
-  const isRepeatedStackPress = (event, stackId) => {
-    if (!pendingPointerDown || pendingPointerDown.stackId !== stackId) return false;
-    const elapsed = Number(event.timeStamp) - pendingPointerDown.timeStamp;
-    const distance = Math.hypot(
-      Number(event.clientX || 0) - pendingPointerDown.clientX,
-      Number(event.clientY || 0) - pendingPointerDown.clientY,
-    );
-    return elapsed >= 0 && elapsed <= 500 && distance <= 6;
-  };
-
-  const handle = (event, action, resolvedStackId = undefined) => {
-    if (toolOwnsCanvasInteraction()) return;
-    const requestedStackId = resolvedStackId === undefined
-      ? resolveInteractionStackId(event)
-      : resolvedStackId;
-    const stackId = String(requestedStackId || '').trim() || null;
-    if (!stackId || !hasStack(stackId) || stackId === getActiveStackId()) return;
-    const handled = action(stackId);
-    if (handled === false) return;
+  const handleClick = (event) => {
+    if (isToolInteractionActive()) return;
+    if (!getActiveStackId()) return;
+    const stackId = String(resolveInteractionStackId(event) || '').trim() || null;
+    if (!stackId || !hasStack(stackId) || stackId === GLOBAL_LAYER_ID || stackId === getActiveStackId()) return;
+    if (selectStack(stackId) === false) return;
     event.preventDefault?.();
     event.stopImmediatePropagation?.();
   };
-  const handlePointerDown = (event) => {
-    if (Number(event.button) !== 0) return;
-    if (toolOwnsCanvasInteraction()) {
-      pendingPointerDown = null;
-      return;
-    }
-    const stackId = String(resolveInteractionStackId(event) || '').trim() || null;
-    if (
-      !stackId
-      || !hasStack(stackId)
-      || stackId === getActiveStackId()
-    ) {
-      pendingPointerDown = null;
-      return;
-    }
-    const repeated = Number(event.detail) >= 2 || isRepeatedStackPress(event, stackId);
-    pendingPointerDown = repeated ? null : {
-      stackId,
-      timeStamp: Number.isFinite(Number(event.timeStamp)) ? Number(event.timeStamp) : 0,
-      clientX: Number(event.clientX || 0),
-      clientY: Number(event.clientY || 0),
-    };
-    if (repeated) handle(event, activateStack, stackId);
-  };
-  const handleClick = (event) => {
-    if (toolOwnsCanvasInteraction()) return;
-    const stackId = String(resolveInteractionStackId(event) || '').trim() || null;
-    const activate = Number(event.detail) >= 2;
-    handle(event, activate ? activateStack : selectStack, stackId);
-  };
-  const handleDoubleClick = (event) => handle(event, activateStack);
 
-  canvasElement.addEventListener('pointerdown', handlePointerDown, true);
   canvasElement.addEventListener('click', handleClick, true);
-  canvasElement.addEventListener('dblclick', handleDoubleClick, true);
   return () => {
-    pendingPointerDown = null;
-    canvasElement.removeEventListener?.('pointerdown', handlePointerDown, true);
     canvasElement.removeEventListener?.('click', handleClick, true);
-    canvasElement.removeEventListener?.('dblclick', handleDoubleClick, true);
   };
 }
 
@@ -379,6 +327,13 @@ export function createStackSystem({
     return getState();
   }
 
+  function syncCoordinateFrames(nextState) {
+    for (const next of nextState?.stacks || []) {
+      const current = stack(next.id);
+      if (current && next.frame) current.frame = clone(next.frame);
+    }
+  }
+
   function clear() {
     replaceState(createNewDrawingStackState());
     selectedStackId = state.activeStackId;
@@ -407,7 +362,7 @@ export function createStackSystem({
     const result = clone(entity || {});
     const requested = String(requestedStackId || '');
     const requestedStack = treeIndex.byId.get(requested);
-    result.stackId = requestedStack && isDrawableStack(requestedStack)
+    result.stackId = requestedStack && (isDrawableStack(requestedStack) || (requested === GLOBAL_LAYER_ID && entity?.coordinateSpace === 'global'))
       ? requested
       : defaultStackId(state);
     return result;
@@ -428,7 +383,7 @@ export function createStackSystem({
   }
 
   function isStackActive(stackId) {
-    return stackId === state.activeStackId;
+    return stackId === GLOBAL_LAYER_ID || stackId === state.activeStackId;
   }
 
   function setHoveredStack(stackId = null) {
@@ -471,7 +426,7 @@ export function createStackSystem({
       && isEntityVisible(entity)
       && (
         isEntityActive(entity)
-        || (Boolean(state.activeStackId) && inactiveStackInteractionAllowed(canvasElement))
+        || inactiveStackInteractionAllowed(canvasElement)
       );
   }
 
@@ -518,7 +473,7 @@ export function createStackSystem({
       const relationshipEnabled = isEntityRelationshipEnabled(record.entity);
       const enabled = relationshipEnabled
         && visible
-        && (active || (hasActiveStack && interactionOverride));
+        && (active || interactionOverride);
       syncNode(record.group, id, { visible, active, effectiveEnabled: relationshipEnabled });
       syncNode(record.handleGroup, id, { visible, active, effectiveEnabled: relationshipEnabled });
       if (!enabled && recordEnabledState.get(record) !== false) {
@@ -579,7 +534,7 @@ export function createStackSystem({
   function addStack(options = '') {
     const request = typeof options === 'string' ? { name: options } : (options || {});
     const parentStackId = request.parentStackId || null;
-    if (parentStackId && !stack(parentStackId)) return null;
+    if (parentStackId && (!stack(parentStackId) || parentStackId === GLOBAL_LAYER_ID)) return null;
     const id = createStackId();
     const automaticName = nextAutomaticStackName(state);
     const requestedName = normalizedStackName(request.name, automaticName);
@@ -617,7 +572,7 @@ export function createStackSystem({
 
   function renameStack(stackId, name, { notify = true } = {}) {
     const target = stack(stackId);
-    if (!target) return false;
+    if (!target || stackId === GLOBAL_LAYER_ID) return false;
     const requested = normalizedStackName(name, target.name);
     if (stackNameError(requested)) return false;
     const next = uniqueStackName(requested, state.stacks, { excludeId: stackId, fallback: target.name });
@@ -662,7 +617,7 @@ export function createStackSystem({
 
   function setStackEnabled(stackId, enabled) {
     const target = stack(stackId);
-    if (!target) return false;
+    if (!target || stackId === GLOBAL_LAYER_ID) return false;
     const next = Boolean(enabled);
     if (target.enabled === next) return true;
     target.enabled = next;
@@ -674,7 +629,7 @@ export function createStackSystem({
 
   function setStackEnabledExpression(stackId, expression) {
     const target = stack(stackId);
-    if (!target) return false;
+    if (!target || stackId === GLOBAL_LAYER_ID) return false;
     const next = String(expression ?? '').trim();
     if (target.enabledExpression === next) return true;
     target.enabledExpression = next;
@@ -699,7 +654,7 @@ export function createStackSystem({
 
   function moveStack(stackId, direction) {
     const targetStack = stack(stackId);
-    if (!targetStack) return false;
+    if (!targetStack || stackId === GLOBAL_LAYER_ID) return false;
     const delta = direction === 'up' ? -1 : direction === 'down' ? 1 : 0;
     return delta ? reorderStack(stackId, targetStack.order + delta) : false;
   }
@@ -722,7 +677,7 @@ export function createStackSystem({
 
   function reorderStack(stackId, siblingIndex) {
     const target = stack(stackId);
-    if (!target) return false;
+    if (!target || stackId === GLOBAL_LAYER_ID) return false;
     const next = reorderStackState(state, stackId, siblingIndex);
     if (JSON.stringify(next) === JSON.stringify(state)) return true;
     replaceState(next);
@@ -785,7 +740,6 @@ export function createStackSystem({
     getActiveStackId: activeStackId,
     hasStack: (stackId) => Boolean(stack(stackId)),
     selectStack: setSelectedStack,
-    activateStack: setActiveStack,
     isToolInteractionActive: isCanvasToolActive
       || (() => inactiveStackInteractionAllowed(canvasElement)),
     resolveInteractionStackId: resolveCanvasInteractionStackId
@@ -794,6 +748,7 @@ export function createStackSystem({
 
   return {
     getState,
+    syncCoordinateFrames,
     getRuntimeState,
     restore,
     clear,

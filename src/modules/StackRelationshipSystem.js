@@ -19,6 +19,25 @@ registerIdentitySchema('stackRelationships', {
 });
 
 export const STACK_RELATIONSHIP_VERSION = 1;
+export const ENTITY_RELATIONSHIP_SOLVE_DOMAIN = 'entity';
+export const STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN = 'stack-frame';
+
+export function stackRelationshipSolveDomain(activeStackId = null) {
+  return activeStackId
+    ? ENTITY_RELATIONSHIP_SOLVE_DOMAIN
+    : STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN;
+}
+
+export function normalizedStackRelationshipSolveDomain(value) {
+  return value === ENTITY_RELATIONSHIP_SOLVE_DOMAIN
+    ? ENTITY_RELATIONSHIP_SOLVE_DOMAIN
+    : STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN;
+}
+
+export function isStackFrameRelationship(value) {
+  return value?.coordinateSpace === 'global'
+    && normalizedStackRelationshipSolveDomain(value?.solveDomain) === STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN;
+}
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const unique = (values = []) => [...new Set(values.filter(Boolean).map(String))];
@@ -385,7 +404,7 @@ function materializeTemplate(drawing, template, stackBinding, candidates, bindin
       drawing.extensions.linkedCopyTools.positionConstraints.push(constraint);
     }
     if (template.extensionKey === 'swell') {
-      drawing.extensions.swell ||= { version: 1, constraints: [] };
+      drawing.extensions.swell ||= { version: 2, constraints: [] };
       drawing.extensions.swell.constraints ||= [];
       drawing.extensions.swell.constraints.push(constraint);
     }

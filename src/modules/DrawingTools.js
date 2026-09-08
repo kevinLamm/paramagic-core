@@ -1,6 +1,24 @@
+import { stackFrameFor, transformStackPoint, IDENTITY_FRAME } from './StackCoordinates.js';
 import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { arcDirectionFromPoints } from './ArcGeometry.js';
 import { createUuid } from './IdentitySystem.js';
+
+export function createSegmentSelectionNodes(group, segments, add) {
+  return segments.map((segment) => {
+    const coordinates = {
+      x1: segment.start[0], y1: segment.start[1],
+      x2: segment.end[0], y2: segment.end[1],
+    };
+    const hit = add(group, 'line', {
+      ...coordinates,
+      class: 'segment-select-line selectable-entity',
+      'data-segment-index': segment.index,
+    });
+    // Keep the thin selection graphic separate from the invariant hit stroke.
+    add(group, 'line', { ...coordinates, class: 'segment-select-visual', 'aria-hidden': 'true' });
+    return hit;
+  });
+}
 
 export function drawingArcFromPoints(start, arcPoint, end) {
   const ccw = arcDirectionFromPoints(start, arcPoint, end);
@@ -95,13 +113,15 @@ const pointDistance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 const angleSnapStep = Math.PI / 6;
 const angleSnapTolerance = Math.PI / 24;
 
-function rectanglePoints(a, b) {
+function rectanglePoints(a, b, frame = IDENTITY_FRAME) {
+  a = transformStackPoint(a, frame, true);
+  b = transformStackPoint(b, frame, true);
   return [
     [a[0], a[1]],
     [b[0], a[1]],
     [b[0], b[1]],
     [a[0], b[1]],
-  ];
+  ].map((point) => transformStackPoint(point, frame));
 }
 
 export function addEditableLineChain({
@@ -174,13 +194,13 @@ function normalizeAngleDelta(delta) {
   return Math.atan2(Math.sin(delta), Math.cos(delta));
 }
 
-function snapToAngle(anchor, point) {
+function snapToAngle(anchor, point, rotation = 0) {
   const dx = point[0] - anchor[0];
   const dy = point[1] - anchor[1];
   const length = Math.hypot(dx, dy);
   if (length < 0.0001) return point;
   const angle = Math.atan2(dy, dx);
-  const snappedAngle = Math.round(angle / angleSnapStep) * angleSnapStep;
+  const snappedAngle = Math.round((angle - rotation) / angleSnapStep) * angleSnapStep + rotation;
   if (Math.abs(normalizeAngleDelta(angle - snappedAngle)) > angleSnapTolerance) return point;
   return [anchor[0] + Math.cos(snappedAngle) * length, anchor[1] + Math.sin(snappedAngle) * length];
 }
@@ -190,10 +210,11 @@ export function resolveVectorDrawingPoint({
   anchor = null,
   event = null,
   getNearestObjectPoint = null,
+  rotation = 0,
 }) {
   const snap = getNearestObjectPoint?.(rawPoint, 14) || null;
   if (snap) return { point: [...snap.point], snap };
-  if (anchor && !event?.altKey) return { point: snapToAngle(anchor, rawPoint), snap: null };
+  if (anchor && !event?.altKey) return { point: snapToAngle(anchor, rawPoint, rotation), snap: null };
   return { point: rawPoint, snap: null };
 }
 
@@ -311,6 +332,7 @@ export function createDrawingTools({
       anchor: usesAngleSnap(activeTool) ? anchor : null,
       event,
       getNearestObjectPoint: canvas.getNearestObjectPoint,
+      rotation: stackFrameFor(canvas.getStackState?.()).rotation,
     });
   }
 
@@ -366,7 +388,7 @@ export function createDrawingTools({
       addPoint(result.point, result.snap);
       if (points.length === 2) {
         const completedTool = activeTool;
-        addLineChain(rectanglePoints(points[0], points[1]), {
+        addLineChain(rectanglePoints(points[0], points[1], stackFrameFor(canvas.getStackState?.())), {
           closed: true,
           kind: 'rectangle',
           snaps: [pointSnaps[0], null, pointSnaps[1], null],
@@ -442,7 +464,7 @@ export function createDrawingTools({
     }
     if (activeTool === 'Line') setDrawingPreview({ type: 'line', start: points[0], end: point });
     if (activeTool === 'Circle') setDrawingPreview({ type: 'circle', center: points[0], radius: Math.max(8, pointDistance(points[0], point)) });
-    if (activeTool === 'Rectangle') setDrawingPreview({ type: 'polygon', points: rectanglePoints(points[0], point) });
+    if (activeTool === 'Rectangle') setDrawingPreview({ type: 'polygon', points: rectanglePoints(points[0], point, stackFrameFor(canvas.getStackState?.())) });
     if (activeTool === 'Arc' && points.length === 1) setDrawingPreview({ type: 'polyline', points: [points[0], point] });
     if (activeTool === 'Arc' && points.length === 2) setDrawingPreview(drawingArcFromPoints(points[0], points[1], point));
     if (activeTool === 'Polyline') {

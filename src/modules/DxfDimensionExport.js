@@ -5,9 +5,12 @@ import {
   mclDimensionLayout,
   radiusDimensionLayout,
 } from './DimensionSystem.js';
+import { transformStackEntity, transformStackPoint } from './StackCoordinates.js';
 
 export const DXF_DIMENSION_LAYER = 'Dimensions';
 export const DXF_DIMENSION_STYLE = 'PARAMAGIC';
+// Match the existing dimension layout arrow length at export scale 1.
+export const DXF_DIMENSION_SIZE = 12;
 
 const finitePoint = (point) => Array.isArray(point)
   && point.length >= 2
@@ -203,7 +206,9 @@ export function createDxfDimensionPlans(drawing = {}, {
   let nativeIndex = 0;
   return annotations
     .filter((entity) => !dimensionExcludedFromExport(entity))
-    .map((entity) => {
+    .map((worldEntity) => {
+      const frame = worldEntity.coordinateFrame;
+      const entity = frame ? transformStackEntity(worldEntity, frame, true) : worldEntity;
       const text = valueOnlyText(entity, resolveValueText, precision);
       let plan = null;
       if (entity.type === 'dimension-line') plan = distancePlan(entity, nativeIndex, text);
@@ -217,6 +222,19 @@ export function createDxfDimensionPlans(drawing = {}, {
         };
       }
       if (plan?.kind === 'dimension') nativeIndex += 1;
+      if (plan && frame) {
+        const point = (value) => transformStackPoint(value, frame);
+        for (const key of ['definitionPoint', 'textPoint', 'extensionA', 'extensionB', 'radialPoint', 'vertex']) {
+          if (plan[key]) plan[key] = point(plan[key]);
+        }
+        if (Number.isFinite(plan.rotation)) plan.rotation += frame.rotation * 180 / Math.PI;
+        const picture = plan.picture;
+        picture.lines = picture.lines.map(({ start, end }) => ({ start: point(start), end: point(end) }));
+        picture.arrows = picture.arrows.map((triangle) => triangle.map(point));
+        if (picture.arc) picture.arc = transformStackEntity(picture.arc, frame);
+        picture.textPoint = point(picture.textPoint);
+        picture.textAngle += frame.rotation * 180 / Math.PI;
+      }
       return plan;
     })
     .filter(Boolean);

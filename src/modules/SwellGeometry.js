@@ -7,7 +7,7 @@ registerIdentitySchema('swell', {
     object, key: 'id', value: object.id, path: ['extensions', 'swell', 'constraints', String(index), 'id'], kind: 'swell-constraint',
   })),
   liveReferenceKeys: [
-    'stackId', 'recordId', 'targetId', 'ownerId', 'ownerRecordId', 'swellOwnerId', 'swellPieceId', 'swellSourceId',
+    'stackId', 'recordId', 'sourceId', 'targetId', 'ownerId', 'ownerRecordId', 'swellOwnerId', 'swellPieceId', 'swellSourceId',
   ],
   liveReferenceArrayKeys: ['participantStackIds', 'recordIds', 'sourceIds', 'sourceRecordIds'],
   lineageReferenceKeys: ['sourceRelationshipId', 'sourceRecordId', 'sourceStackId'],
@@ -15,6 +15,7 @@ registerIdentitySchema('swell', {
     stackId: ['stack'],
     participantStackIds: ['stack'],
     recordId: ['entity'],
+    sourceId: ['entity'],
     recordIds: ['entity'],
     sourceIds: ['entity'],
     sourceRecordIds: ['entity'],
@@ -220,6 +221,7 @@ function featurePiece(ownerId, segmentIndex, role, entity, ordinal) {
     ownerId,
     segmentIndex,
     role,
+    ordinal: Number.isInteger(ordinal) ? ordinal : 0,
     entity,
   };
 }

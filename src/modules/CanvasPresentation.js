@@ -54,6 +54,10 @@ export function valueOnlyDimensionText(value) {
   return String(value ?? '').replace(/^.*?=\s*/, '');
 }
 
+export function constructionHiddenInValueOnly(entity, dimensionTextMode = 'named-value') {
+  return dimensionTextMode === 'value' && entity?.construction === true;
+}
+
 export function isCanvasPresentationSourceNode(node, stackId = null, {
   dimensionTextMode = 'value',
 } = {}) {
