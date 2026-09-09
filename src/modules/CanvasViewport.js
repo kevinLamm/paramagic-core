@@ -1,3 +1,5 @@
+import { canvasPointHandleHitDistance } from './CanvasSelection.js';
+
 // --- Canvas Zoom Constraints ---
 export const MIN_CANVAS_ZOOM = 0.005;
 export const MAX_CANVAS_ZOOM = 32;
@@ -73,7 +75,7 @@ const candidateKey = (candidate) => candidate.kind === 'handle'
   ? `handle:${candidate.recordId}:${candidate.handleIndex}`
   : `stroke:${candidate.recordId}:${candidate.segmentIndex ?? 'entity'}`;
 
-export function advanceOverlapCycle(previous, candidates, point, tolerance = 4) {
+export function advanceOverlapCycle(previous, candidates, point, tolerance = 8, direction = 1) {
   const keys = candidates.map(candidateKey);
   const samePoint = previous
     && Math.hypot(previous.x - point.x, previous.y - point.y) <= tolerance;
@@ -81,10 +83,10 @@ export function advanceOverlapCycle(previous, candidates, point, tolerance = 4) 
     && previous.keys.length === keys.length
     && previous.keys.every((key, index) => key === keys[index]);
   return {
-    x: point.x,
-    y: point.y,
+    x: sameCandidates ? previous.x : point.x,
+    y: sameCandidates ? previous.y : point.y,
     keys,
-    index: sameCandidates ? (previous.index + 1) % candidates.length : 0,
+    index: sameCandidates ? (previous.index + direction + candidates.length) % candidates.length : 0,
   };
 }
 
@@ -94,9 +96,20 @@ export function createOverlapSelectionCycler({
   indicatorLayer = null,
   records,
   isRecordCandidate = () => true,
+  canCycleHandles = () => true,
+  isCandidateAllowed = () => true,
+  selectCandidate = null,
   selectRecord,
 }) {
   let cycleState = null;
+  const canvas = objectLayer.closest?.('.canvas');
+  const status = canvas?.ownerDocument.createElement('div');
+  if (status) {
+    status.className = 'overlap-cycle-status';
+    status.setAttribute('role', 'status');
+    status.hidden = true;
+    canvas.appendChild(status);
+  }
   const candidateLayers = [...new Set([objectLayer, handleLayer].filter(Boolean))];
 
   function clearIndicators() {
@@ -108,12 +121,14 @@ export function createOverlapSelectionCycler({
   function clear() {
     cycleState = null;
     clearIndicators();
+    if (status) status.hidden = true;
   }
 
   function candidatesAt(clientX, clientY) {
     const result = [];
     const seen = new Set();
     const addCandidate = (candidate) => {
+      if (!isCandidateAllowed(candidate, { clientX, clientY })) return;
       const key = candidateKey(candidate);
       if (seen.has(key)) return;
       seen.add(key);
@@ -121,11 +136,8 @@ export function createOverlapSelectionCycler({
     };
 
     candidateLayers.flatMap((layer) => [...layer.querySelectorAll('.point-handle')]).reverse().forEach((handle) => {
-      if (typeof getComputedStyle === 'function' && getComputedStyle(handle).pointerEvents === 'none') return;
-      const rect = handle.getBoundingClientRect();
-      const centerX = rect.left + rect.width / 2;
-      const centerY = rect.top + rect.height / 2;
-      if (Math.hypot(clientX - centerX, clientY - centerY) > 9) return;
+      // Hover controls direct hit testing, not eligibility for overlap selection.
+      if (!canCycleHandles() || !Number.isFinite(canvasPointHandleHitDistance(handle, clientX, clientY))) return;
       const group = handle.closest('.canvas-record, .canvas-handle-group');
       const record = records.find((candidate) => candidate.id === group?.dataset.recordId);
       const handleIndex = Number(handle.dataset.handleIndex);
@@ -145,7 +157,7 @@ export function createOverlapSelectionCycler({
           ...(Number.isInteger(Number(selectable?.dataset?.segmentIndex))
             ? { segmentIndex: Number(selectable.dataset.segmentIndex) }
             : {}),
-          node: selectable?.classList?.contains('hit-target') ? record.node : selectable,
+          node: selectable,
         });
       }
     });
@@ -154,6 +166,10 @@ export function createOverlapSelectionCycler({
       record.segmentNodes?.forEach((node) => {
         const rect = node.getBoundingClientRect();
         if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return;
+        if (node.isPointInStroke && node.getScreenCTM?.()) {
+          const local = new DOMPoint(clientX, clientY).matrixTransform(node.getScreenCTM().inverse());
+          if (!node.isPointInStroke(local)) return;
+        }
         addCandidate({
           kind: 'stroke',
           recordId: record.id,
@@ -164,11 +180,17 @@ export function createOverlapSelectionCycler({
         });
       });
     });
-    return result;
+    // A painted entity and its segment hit area represent the same edge.
+    // Keep the precise segment target instead of offering duplicate choices.
+    return result.filter(candidate => candidate.kind !== 'stroke'
+      || Number.isInteger(candidate.segmentIndex)
+      || !result.some(other => other.kind === 'stroke'
+        && other.recordId === candidate.recordId && Number.isInteger(other.segmentIndex)));
   }
 
   function cycle(event) {
-    const candidates = candidatesAt(event.clientX, event.clientY);
+    const nearby = cycleState && Math.hypot(event.clientX - cycleState.x, event.clientY - cycleState.y) <= 8;
+    const candidates = nearby ? cycleState.candidates : candidatesAt(event.clientX, event.clientY);
     if (!candidates.length) {
       clear();
       return null;
@@ -177,13 +199,22 @@ export function createOverlapSelectionCycler({
       cycleState,
       candidates,
       { x: event.clientX, y: event.clientY },
+      8,
+      event.shiftKey ? -1 : 1,
     );
     const selected = candidates[nextState.index];
-    cycleState = { ...nextState, candidate: selected };
+    cycleState = { ...nextState, candidates, candidate: selected };
     clearIndicators();
     selected.node?.classList.add('overlap-cycle-selected');
     if (indicatorLayer && selected.node) {
       const indicator = selected.node.cloneNode(true);
+      const sourceMatrix = selected.node.getScreenCTM?.();
+      const layerMatrix = indicatorLayer.getScreenCTM?.();
+      if (sourceMatrix && layerMatrix) {
+        const matrix = layerMatrix.inverse().multiply(sourceMatrix);
+        indicator.setAttribute('transform', `matrix(${matrix.a} ${matrix.b} ${matrix.c} ${matrix.d} ${matrix.e} ${matrix.f})`);
+      }
+      indicator.classList.remove('hit-target');
       indicator.classList.add('overlap-cycle-indicator');
       indicator.style.pointerEvents = 'none';
       indicator.removeAttribute('role');
@@ -194,20 +225,54 @@ export function createOverlapSelectionCycler({
       }
       indicatorLayer.appendChild(indicator);
     }
+    if (status) {
+      const record = records.find((item) => item.id === selected.recordId);
+      const feature = selected.kind === 'handle' ? `Point ${selected.handleIndex + 1}` : 'Edge';
+      const label = record?.entity?.name || `${record?.entity?.type || 'Object'} ${records.indexOf(record) + 1}`;
+      status.textContent = `${nextState.index + 1}/${candidates.length} · ${feature} · ${label} — Alt-click / Tab: next · Shift: previous · Click / Enter: select · Esc: cancel`;
+      status.hidden = false;
+    }
     return selected;
   }
 
-  function commit({ additive = false } = {}) {
+  function commit({ additive = false, event = null } = {}) {
     const selected = cycleState?.candidate || null;
     if (!selected) return null;
-    selectRecord(selected.recordId, {
+    const point = { clientX: cycleState.x, clientY: cycleState.y };
+    clear();
+    if (selectCandidate) selectCandidate(selected, { additive, event, ...point });
+    else selectRecord(selected.recordId, {
       additive,
       segmentIndex: Number.isInteger(selected.segmentIndex) ? selected.segmentIndex : null,
+      handleIndex: selected.handleIndex ?? null,
     });
     return selected;
   }
 
-  return { clear, cycle, commit };
+  function acceptPointer(event) {
+    if (!cycleState || event.button !== 0 || event.altKey) return false;
+    if (Math.hypot(event.clientX - cycleState.x, event.clientY - cycleState.y) > 8) {
+      clear();
+      return false;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    commit({ additive: event.ctrlKey || event.metaKey, event });
+    return true;
+  }
+
+  function keyDown(event) {
+    if (!cycleState) return false;
+    if (!['Escape', 'Enter', 'Tab'].includes(event.key)) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === 'Escape') clear();
+    else if (event.key === 'Enter') commit({ additive: event.ctrlKey || event.metaKey, event });
+    else cycle({ clientX: cycleState.x, clientY: cycleState.y, shiftKey: event.shiftKey });
+    return true;
+  }
+
+  return { clear, cycle, commit, acceptPointer, keyDown };
 }
 
 // --- Drawing Hint Display ---

@@ -925,6 +925,28 @@ function tangentRoundRound(model, constraint, references) {
   return normalizedDifference(centerDistanceSquared, squareScalar(targetDistance));
 }
 
+function tangentJoinedArcs(model, constraint, references) {
+  const rounds = references.map(reference => roundGeometry(model, reference));
+  const joint = pointValueAndDerivatives(model, constraint.tangentPoint);
+  if (!joint || rounds.some(round => !round)) return null;
+  const radials = rounds.map(round => vectorBetween(joint, round.center));
+  const lengths = radials.map(lengthScalar);
+  if (lengths.some(value => !value)) return null;
+  const scale = productScalar(...lengths);
+  if (scale.value <= 1e-12) return null;
+  const alignment = quotientScalar(bilinearScalar(...radials, 'cross'), scale);
+  const otherIndex = constraint.tangentPoint.recordId === references[0].recordId ? 1 : 0;
+  const contact = normalizedDifference(lengths[otherIndex], rounds[otherIndex].radius);
+  const side = quotientScalar(bilinearScalar(...radials, 'dot'), scale);
+  if (!alignment || !contact || !side) return null;
+  const orientation = constraint.tangentMode === 'internal' ? 1 : -1;
+  if (Math.abs(side.value) < DIFFERENTIABILITY_EPSILON) return null;
+  const branch = side.value * orientation < 0
+    ? { value: side.value * orientation, gradient: new Map([...side.gradient].map(([id, value]) => [id, value * orientation])) }
+    : { value: 0, gradient: new Map() };
+  return [alignment, contact, branch];
+}
+
 function tangent({ model, constraint, variables }) {
   const references = constraint.featureRefs || [];
   const lineReference = references.find((reference) => reference.kind === 'segment');
@@ -932,7 +954,9 @@ function tangent({ model, constraint, variables }) {
   const residuals = lineReference && roundReferences.length === 1
     ? tangentLineRound(model, constraint, lineReference, roundReferences[0])
     : !lineReference && roundReferences.length === 2
-      ? [tangentRoundRound(model, constraint, roundReferences)]
+      ? constraint.tangentPoint && roundReferences.every(ref => ref.kind === 'arc')
+        ? tangentJoinedArcs(model, constraint, roundReferences)
+        : [tangentRoundRound(model, constraint, roundReferences)]
       : null;
   return residuals?.every(Boolean)
     ? matrixFromRows(residuals.map((residual) => residual.gradient), variables)

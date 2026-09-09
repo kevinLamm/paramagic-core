@@ -1,3 +1,4 @@
+import { DrawingDependencyIndex } from './DrawingUpdateCoordinator.js';
 import { resolveVectorDrawingPoint } from './DrawingTools.js';
 import { IDENTITY_FRAME, stackFrameFor } from './StackCoordinates.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
@@ -876,9 +877,37 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
     return new Map(arrays.map((definition) => [definition.id, definition]));
   }
 
+  const dependencies = new DrawingDependencyIndex();
+  const renderCache = new Map();
+  const targetCache = new Map();
+  const dirtyDefinitions = new Set();
+  let cachedEntities = null;
+  let cacheContext = null;
+
+  function invalidateRenderData({ changedRecordIds = null } = {}) {
+    cachedEntities = null;
+    targetCache.clear();
+    const affected = changedRecordIds === null ? null : dependencies.affected(changedRecordIds);
+    for (const definition of definitionsForCache()) {
+      if (!affected || affected.has(definition.id)) {
+        renderCache.delete(definition.id);
+        dirtyDefinitions.add(definition.id);
+      }
+    }
+  }
+  function definitionsForCache() { return editingDraft ? [...arrays, editingDraft] : arrays; }
   function entityMap() {
-    const drawing = canvas.getProcessingDrawingData?.() || canvas.getDrawingData();
-    return new Map((drawing.entities || []).map((entity) => [entity.id, entity]));
+    const context = JSON.stringify([canvas.getParameters?.(), canvas.getStackState?.(),
+      canvas.getDrawingUnit?.(), canvas.getDimensionTextMode?.()]);
+    if (context !== cacheContext) {
+      cacheContext = context;
+      invalidateRenderData();
+    }
+    if (!cachedEntities) {
+      const drawing = canvas.getProcessingDrawingData?.() || canvas.getDrawingData();
+      cachedEntities = new Map((drawing.entities || []).map((entity) => [entity.id, entity]));
+    }
+    return cachedEntities;
   }
 
   const definitionProcessingEnabled = (definition) => (
@@ -1001,7 +1030,10 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
 
   const subtractOperandProvider = {
     owners(baseOwners = []) {
-      return arrays.filter(definitionProcessingEnabled).flatMap((definition) => {
+      return arrays.filter(definitionProcessingEnabled).filter((definition) => baseOwners.some((owner) =>
+        (owner.entity?.subtract === true || owner.entity?.subtractFrom?.length)
+        && owner.recordIds?.every((id) => definition.sourceIds.includes(id))
+      )).flatMap((definition) => {
         const bounds = sourceBounds(definition.sourceIds, null, definition.sourceRefs);
         const evaluated = evaluateDefinition(definition, bounds);
         if (!evaluated.valid) return [];
@@ -1234,6 +1266,23 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
   }
 
   function definitionRenderData(definition, entities) {
+    const signature = JSON.stringify(definition);
+    const cached = renderCache.get(definition.id);
+    if (cached?.signature === signature) return cached.value;
+    const sources = [...definition.sourceIds, ...arrayDependentVisualIds(entities, definition.sourceIds),
+      definition.centerRef?.recordId, ...definition.sourceRefs.flatMap((ref) => [
+        ref.arrayId, ref.ownerId, ref.copyId,
+        ...(ref.sourceFeatures || []).map((feature) => feature.sourceId || feature.recordId),
+      ])].filter(Boolean);
+    dependencies.set(definition.id, sources);
+    // Install an empty entry first so invalid cyclic references cannot recurse.
+    const entry = { signature, value: null };
+    renderCache.set(definition.id, entry);
+    entry.value = buildDefinitionRenderData(definition, entities);
+    return entry.value;
+  }
+
+  function buildDefinitionRenderData(definition, entities) {
     const center = definition.arrayType === 'circular' ? resolveCenter(definition) : null;
     if (definition.arrayType === 'circular' && !center) return null;
     const template = templateFor(definition, entities);
@@ -1340,18 +1389,30 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
 
   function renderNow() {
     renderFrame = null;
-    objectLayer.querySelectorAll('.array-group').forEach((node) => node.remove());
     const entities = entityMap();
     const { ordered, cyclicIds } = orderArrayDefinitionsByDependencies(definitionsForRender());
-    ordered
-      .filter((definition) => !cyclicIds.has(String(definition.id)))
-      .forEach((definition) => renderDefinition(definition, entities));
+    const activeIds = new Set(ordered.filter((definition) => !cyclicIds.has(String(definition.id))).map(({ id }) => id));
+    objectLayer.querySelectorAll(':scope > .array-group').forEach((node) => {
+      if (!activeIds.has(node.dataset.arrayId)) node.remove();
+    });
+    ordered.filter((definition) => activeIds.has(definition.id)).forEach((definition) => {
+      const existing = objectLayer.querySelector(`:scope > .array-group[data-array-id="${escaped(definition.id)}"]`);
+      const cached = renderCache.get(definition.id);
+      if (!existing || dirtyDefinitions.has(definition.id) || cached?.signature !== JSON.stringify(definition)) {
+        existing?.remove();
+        renderCache.delete(definition.id);
+        renderDefinition(definition, entities);
+      }
+    });
+    dirtyDefinitions.clear();
     syncSourceHighlights();
     syncCenterHandle();
     canvas.syncGeometryStacking?.();
   }
 
   function render() {
+    invalidateRenderData();
+    if (canvas.requestDrawingUpdate) { canvas.requestDrawingUpdate(); return; }
     if (renderFrame !== null) cancelAnimationFrame(renderFrame);
     renderFrame = requestAnimationFrame(renderNow);
   }
@@ -1390,6 +1451,8 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
     const legacy = parseArrayDerivedRecordId(recordId);
     if (legacy) return legacy;
     const entities = entityMap();
+    if (!recordId || entities.has(recordId)) return null;
+    if (targetCache.has(recordId)) return targetCache.get(recordId);
     for (const definition of arrays) {
       const renderData = definitionRenderData(definition, entities);
       if (!renderData) continue;
@@ -1397,11 +1460,14 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
       for (let placementIndex = 0; placementIndex < renderData.evaluated.placements.length; placementIndex += 1) {
         for (const sourceId of sourceIds) {
           if (arrayDerivedRecordId(definition.id, placementIndex, sourceId) === recordId) {
-            return { arrayId: definition.id, placementIndex, sourceId };
+            const target = { arrayId: definition.id, placementIndex, sourceId };
+            targetCache.set(recordId, target);
+            return target;
           }
         }
       }
     }
+    targetCache.set(recordId, null);
     return null;
   }
 
@@ -2308,12 +2374,8 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
     if (!popup.hidden) positionPopup();
   });
   canvasElement.addEventListener('pointermove', (event) => {
-    if ((event.buttons & 1) && arrays.length) render();
     const hovered = event.target.closest?.('.array-group[data-array-id]');
     objectLayer.querySelectorAll('.array-group').forEach((group) => group.classList.toggle('hovered', group === hovered));
-  });
-  canvasElement.addEventListener('pointerup', () => {
-    if (arrays.length) render();
   });
   canvasElement.addEventListener('pointerleave', () => {
     objectLayer.querySelectorAll('.array-group.hovered').forEach((group) => group.classList.remove('hovered'));
@@ -2325,7 +2387,7 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
       canvas.getSelectedRecordIds?.() || properties.recordIds || [],
     );
   });
-  canvas.onObjectsChange(() => {
+  function updateArraySources() {
     removeOrphanedDefinitions();
     arrays.filter(definitionProcessingEnabled).forEach((definition) => {
       const center = definition.arrayType === 'circular' ? resolveCenter(definition) : null;
@@ -2338,10 +2400,19 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
     if (editingDraft) {
       editingSourceBounds = sourceBounds(editingDraft.sourceIds, null, editingDraft.sourceRefs);
     }
-    render();
-    canvas.refreshLinkedDimensions?.();
-  });
-  canvas.onPresentationChange?.(() => render());
+  }
+
+  if (canvas.registerDrawingUpdateStage) {
+    canvas.onDrawingInvalidated(invalidateRenderData);
+    canvas.registerDrawingUpdateStage('arrays', (change) => {
+      invalidateRenderData(change);
+      if (change.objectsChanged) updateArraySources();
+      renderNow();
+    }, 40);
+  } else {
+    canvas.onObjectsChange(() => { updateArraySources(); render(); canvas.refreshLinkedDimensions?.(); });
+    canvas.onPresentationChange?.(render);
+  }
   canvas.onStackChange?.(() => render());
   canvas.registerDrawingExtension?.('arrayTools', {
     serialize() {

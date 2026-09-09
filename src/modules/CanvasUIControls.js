@@ -1185,8 +1185,8 @@ export function createControlTools({
   }
 
   function notifyMutation(reason, history = 'commit', outcome = null) {
-    canvas.applySolverSnapshot?.(outcome?.snapshot);
-    canvas.notifyObjectChange?.({ history });
+    const changedRecordIds = canvas.applySolverSnapshot?.(outcome?.snapshot);
+    canvas.notifyObjectChange?.({ history, changedRecordIds });
     if (history === 'commit') activeEdit = null;
   }
 

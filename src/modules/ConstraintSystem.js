@@ -1,3 +1,4 @@
+import { canvasFeatureFromEvent } from './CanvasSelection.js';
 import { GLOBAL_LAYER_ID, stackFrameFor } from './StackCoordinates.js';
 import { stackRelationshipSolveDomain } from './StackRelationshipSystem.js';
 import { isCanvasOriginReference } from './CanvasOrigin.js';
@@ -393,8 +394,11 @@ export function setConstraintPointAffordances(canvas, constraint) {
   return acceptsPoints;
 }
 
-export function constraintFeatureFromEvent(canvas, event) {
-  return canvas.getFeatureFromEvent(event, { rendered: true });
+export function constraintFeatureFromEvent(canvas, event, constraint = null) {
+  return canvasFeatureFromEvent(canvas, event, {
+    rendered: true,
+    preferPoints: featureAllowed(constraint, { kind: 'point' }),
+  });
 }
 
 export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
@@ -731,9 +735,12 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
 
   const delegate = {
     allowInactiveStackInteraction: true,
+    acceptsSelection(event) {
+      return featureAllowed(activeConstraint, constraintFeatureFromEvent(canvas, event));
+    },
     pointerDown(event) {
       if (!activeConstraint || event.button !== 0) return false;
-      const feature = constraintFeatureFromEvent(canvas, event);
+      const feature = constraintFeatureFromEvent(canvas, event, activeConstraint);
       event.preventDefault();
       event.stopPropagation();
       addSelection(feature);

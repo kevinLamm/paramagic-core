@@ -41,6 +41,15 @@ export class SolverWorkerRuntime {
         this.interactiveBaseline = null;
         this.interactiveRequest = null;
         return this.controller.loadSketch(payload.snapshot || {});
+      case 'apply-geometry':
+        return this.controller.applyAuthoritativeEntities(payload.entities, payload.result || {});
+      case 'update-model': {
+        for (const update of payload.updates) {
+          this.controller[update.method](...update.args);
+          if (update.parameters?.length) this.controller.dimensions.restoreEntries(update.parameters, { emit: false });
+        }
+        return { status: 'completed', changedEntityIds: [] };
+      }
       case 'get-snapshot':
         return { status: 'completed', snapshot: this.controller.getSketchSnapshot(), changedEntityIds: [] };
       case 'solve':

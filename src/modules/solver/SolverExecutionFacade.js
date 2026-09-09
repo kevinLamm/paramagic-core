@@ -1,3 +1,4 @@
+import { solverModelUpdateMethods } from './SolverWorkerProtocol.js';
 import { createSolverController } from './SolverController.js';
 import { SolverMutationJournal } from './SolverMutationJournal.js';
 import { createBrowserSolverWorkerClient } from './SolverWorkerClient.js';
@@ -104,6 +105,8 @@ export class SolverExecutionFacade {
     this.executionListeners = new Set();
     this.dragVariableIds = new Set();
     this.forwardedMethods = new Map();
+    this.pendingModelUpdates = new Map();
+    this.modelUpdateScheduled = false;
     if (this.workerClient) {
       const checkpoint = this.mutationJournal.checkpointSnapshot();
       this.enqueueWorker(() => this.workerClient.loadSketch(checkpoint.snapshot), null, checkpoint.revision);
@@ -150,6 +153,7 @@ export class SolverExecutionFacade {
   }
 
   recordWorkerCommand(type, payload, { coalesceKey = null } = {}) {
+    if (type !== 'update-model') this.flushModelUpdates();
     const revision = this.recordMutation();
     this.mutationJournal.record({ revision, type, payload, coalesceKey });
     return revision;
@@ -288,6 +292,7 @@ export class SolverExecutionFacade {
   }
 
   async verifyWorkerParity() {
+    this.flushModelUpdates();
     if (this.restartPromise) await this.restartPromise;
     if (!this.workerClient) return { matched: false, reason: 'worker-disabled' };
     try {
@@ -304,6 +309,7 @@ export class SolverExecutionFacade {
   }
 
   loadSketch(snapshot) {
+    this.supersedeInteractivePreview();
     const result = this.controller.loadSketch(snapshot);
     this.resyncWorker();
     return result;
@@ -493,6 +499,7 @@ export class SolverExecutionFacade {
 
   setDimensionEnabledStates(states) {
     const result = this.controller.setDimensionEnabledStates(states);
+    if (!result.changed) return result;
     const serializedStates = [...states];
     const revision = this.recordWorkerCommand('set-dimension-enabled-states', { states: serializedStates });
     this.enqueueWorker(() => this.workerClient.setDimensionEnabledStates(states), (workerResult) => this.compareDelta(workerResult, result), revision);
@@ -501,7 +508,9 @@ export class SolverExecutionFacade {
 
   setEnabledStackIds(stackIds = null) {
     const serializedStackIds = stackIds === null ? null : [...stackIds];
+    const previousFiltering = this.controller.activationFiltering;
     const result = this.controller.setEnabledStackIds(serializedStackIds);
+    if (!result.changed && previousFiltering === this.controller.activationFiltering) return result;
     const revision = this.recordWorkerCommand('set-enabled-stack-ids', { stackIds: serializedStackIds });
     this.enqueueWorker(() => this.workerClient.setEnabledStackIds(serializedStackIds), null, revision);
     return result;
@@ -514,6 +523,17 @@ export class SolverExecutionFacade {
 
   updateEntities(entities, options = {}) {
     const result = this.controller.updateEntities(entities, options);
+    if (this.mode === 'worker-drag' && !this.dragVariableIds.size && this.workerClient?.applyGeometry) {
+      // This synchronous API has already committed on the main controller.
+      // Replicate its accepted geometry; a second solve can choose a different
+      // placement for a free-floating component.
+      const payload = { entities: result.snapshot || [], result: {
+        status: resultStatus(result, this.controller), stackState: this.controller.stackState,
+      } };
+      const revision = this.recordWorkerCommand('apply-geometry', payload);
+      this.enqueueWorker(() => this.workerClient.applyGeometry(payload.entities, payload.result), null, revision);
+      return result;
+    }
     const lockedVariableIds = [...new Set([...this.dragVariableIds, ...(options.lockedVariableIds || [])])];
     const previewConstraintTolerance = options.previewConstraintTolerance;
     const interactive = this.dragVariableIds.size > 0;
@@ -529,6 +549,10 @@ export class SolverExecutionFacade {
       : () => this.workerClient.updateEntities(entities, { lockedVariableIds });
     this.enqueueWorker(send, (workerResult) => this.compareDelta(workerResult, result), revision);
     return result;
+  }
+
+  supersedeInteractivePreview() {
+    this.workerClient?.supersedeInteractivePreview?.();
   }
 
   updateEntitiesInteractive(entities, options = {}) {
@@ -610,11 +634,43 @@ export class SolverExecutionFacade {
     }
   }
 
+  flushModelUpdates() {
+    this.modelUpdateScheduled = false;
+    if (!this.pendingModelUpdates.size) return;
+    const updates = [...this.pendingModelUpdates.values()];
+    this.pendingModelUpdates.clear();
+    const revision = this.recordWorkerCommand('update-model', { updates });
+    this.enqueueWorker(() => this.workerClient.updateModel(updates), null, revision);
+  }
+
   invokeController(method, args) {
+    const incremental = solverModelUpdateMethods.has(method) && this.workerClient?.updateModel;
+    const readValue = () => {
+      if (method === 'updateDimensionAnnotation') return this.controller.dimensionAnnotations.get(args[0]);
+      if (method === 'setDerivedEntity') return this.controller.model.derivedEntities.get(args[0]?.id);
+      if (method === 'updateEntity') return this.controller.getEntity(args[0]?.id);
+      if (method === 'setStackState') return this.controller.stackState;
+      if (method === 'setExternalStackRelationships') return this.controller.externalStackRelationships;
+      return null;
+    };
+    const before = incremental ? JSON.stringify(readValue()) : null;
     const result = this.controller[method](...args);
-    if (resyncMethods.has(method)) {
-      this.resyncWorker();
-    }
+    if (incremental) {
+      const annotation = method === 'updateDimensionAnnotation';
+      const parameter = annotation ? this.controller.dimensions.get(args[0]) : null;
+      const key = `${method}:${annotation ? args[0] : args[0]?.id || ''}`;
+      if (before !== JSON.stringify(readValue()) || parameter) {
+        const wireArgs = method === 'setExternalStackRelationships' ? [readValue()] : args;
+        this.pendingModelUpdates.delete(key);
+        this.pendingModelUpdates.set(key, structuredClone({ method, args: wireArgs,
+          ...(parameter ? { parameters: [parameter] } : {}),
+        }));
+        if (!this.modelUpdateScheduled) {
+          this.modelUpdateScheduled = true;
+          queueMicrotask(() => this.flushModelUpdates());
+        }
+      }
+    } else if (resyncMethods.has(method)) this.resyncWorker();
     return result;
   }
 

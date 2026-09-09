@@ -12,7 +12,7 @@ import { prepareNotchDerivativePresentationClone } from './NotchSystem.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 import { registerIdentitySchema } from './DrawingIdentitySystem.js';
 import { constructionHiddenInValueOnly } from './CanvasPresentation.js';
-import { resolveWindowSelectionIds } from './CanvasSelection.js';
+import { resolveWindowSelectionIds, canvasPointHandleHitDistance } from './CanvasSelection.js';
 
 registerIdentitySchema('linkedCopyTools', {
   declarations: (value) => [
@@ -406,6 +406,18 @@ export function nearestLinkedHoverSource(featureSets, point, tolerance) {
   return nearest && nearest.distance <= limit ? nearest.sourceId || null : null;
 }
 
+export function syncLinkedCopyHandleHover(groups, event, enabled = true) {
+  let hoveredCount = 0;
+  groups.forEach(group => {
+    group.querySelectorAll('.linked-copy-driving-handle').forEach(handle => {
+      const hovered = enabled && Number.isFinite(canvasPointHandleHitDistance(handle, event.clientX, event.clientY));
+      handle.classList.toggle('hovered', hovered);
+      if (hovered) hoveredCount++;
+    });
+  });
+  return hoveredCount;
+}
+
 function derivedRecordUuid(kind, copyId, sourceId) {
   return deriveUuidForKey('linked-copy-derived', copyId, kind, sourceId);
 }
@@ -734,15 +746,23 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
 
   function renderNow() {
     renderFrame = null;
-    objectLayer.querySelectorAll('.linked-copy-group').forEach((node) => node.remove());
+    // Nested copies belong to their Array's retained presentation. Only replace
+    // this module's direct groups; its consumers update in the following stage.
+    const changedIds = new Set(definitions.map(({ id }) => id));
+    objectLayer.querySelectorAll(':scope > .linked-copy-group').forEach((node) => {
+      changedIds.add(node.dataset.linkedCopyId);
+      node.remove();
+    });
     const entities = entityMap();
     definitions
       .filter((definition) => canvas.isStackEnabled?.(definition?.stackId) !== false)
       .forEach((definition) => renderDefinition(definition, entities));
     syncSourceHighlights();
     canvas.syncGeometryStacking?.();
+    return changedIds;
   }
   function render() {
+    if (canvas.requestDrawingUpdate) { canvas.requestDrawingUpdate(); return; }
     if (renderFrame !== null) cancelAnimationFrame(renderFrame);
     renderFrame = requestAnimationFrame(renderNow);
   }
@@ -1271,10 +1291,11 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
       group.classList.remove('hovered');
       group.querySelectorAll('.linked-copy-driving-handles.hovered').forEach((handles) => handles.classList.remove('hovered'));
     });
+    syncLinkedCopyHandleHover(groups, event,
+      canvasElement.contains(event.target) && !canvasElement.classList.contains('point-handles-disabled'));
     const hovered = event.target.closest?.('.linked-copy-group[data-linked-copy-id]');
     if (!drivingDimensionActive) {
       groups.forEach((group) => group.classList.toggle('hovered', group === hovered));
-      return;
     }
     const definition = hovered && definitions.find(({ id }) => id === hovered.dataset.linkedCopyId);
     const matrix = definition && definitionMatrix(definition);
@@ -1309,7 +1330,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     (properties.recordIds || properties.ids || []).filter((id) => accepts(entities.get(id), activeType)).forEach((id) => pendingSourceIds.add(id));
     syncSourceHighlights();
   });
-  canvas.onObjectsChange(() => {
+  function updateLinkedSources() {
     const entities = entityMap();
     for (let index = definitions.length - 1; index >= 0; index -= 1) {
       definitions[index].sourceIds = definitions[index].sourceIds.filter((id) => accepts(entities.get(id), definitions[index].type));
@@ -1329,13 +1350,18 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     }
     applyLinkedPositionDimensions();
     applyLinkedPositionConstraints();
-    render(); canvas.refreshLinkedDimensions?.();
-  });
-  canvas.onPresentationChange?.(() => {
-    applyLinkedPositionDimensions();
-    applyLinkedPositionConstraints();
-    render();
-  });
+  }
+
+  if (canvas.registerDrawingUpdateStage) {
+    canvas.registerDrawingUpdateStage('linked-copies', (change) => {
+      if (change.objectsChanged) updateLinkedSources();
+      else { applyLinkedPositionDimensions(); applyLinkedPositionConstraints(); }
+      renderNow().forEach((id) => change.changedRecordIds?.add(id));
+    }, 30);
+  } else {
+    canvas.onObjectsChange(() => { updateLinkedSources(); render(); canvas.refreshLinkedDimensions?.(); });
+    canvas.onPresentationChange?.(() => { applyLinkedPositionDimensions(); applyLinkedPositionConstraints(); render(); });
+  }
   canvas.onStackChange?.(render);
   canvasElement.addEventListener('pointerleave', () => objectLayer.querySelectorAll('.linked-copy-group.hovered').forEach((group) => group.classList.remove('hovered')));
 
@@ -1365,7 +1391,7 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     },
     removeStackReferences,
     removeRecordReferences,
-    clear() { definitions.splice(0); positionConstraints.splice(0); selectedCopyId = null; windowSelectedCopyIds.clear(); suppressNextOutsideClick = false; stop(); objectLayer.querySelectorAll('.linked-copy-group').forEach((node) => node.remove()); },
+    clear() { definitions.splice(0); positionConstraints.splice(0); selectedCopyId = null; windowSelectedCopyIds.clear(); suppressNextOutsideClick = false; stop(); objectLayer.querySelectorAll(':scope > .linked-copy-group').forEach((node) => node.remove()); },
   });
   window.addEventListener('paramagic:tool-activated', (event) => { if (event.detail?.source !== activeType && mode !== 'idle') cancel(); });
 

@@ -1,5 +1,5 @@
 import {
-  deriveSwellGeometry,
+  createSwellGeometryEvaluator,
   isSwellEntity,
   normalizeSwellDefinition,
   SWELL_DEFAULT_EXPRESSIONS,
@@ -606,6 +606,9 @@ export function createSwellTools({
   let applyingExternalConstraints = false;
   let derivedByPieceId = new Map();
   let derivedByOwnerId = new Map();
+  const evaluateGeometry = createSwellGeometryEvaluator();
+  const ownerPresentationKeys = new Map();
+  let boundaryPresentationKey = null;
   let derivedBoundaries = [];
   let externalConstraints = [];
   let creationExpressions = rememberSwellCreationExpressions();
@@ -681,6 +684,8 @@ export function createSwellTools({
   }
 
   function removeRenderedGroups() {
+    ownerPresentationKeys.clear();
+    boundaryPresentationKey = null;
     objectLayer?.querySelectorAll?.(':scope > .swell-derived-group, :scope > .swell-derived-fill-group')
       .forEach((node) => node.remove());
     handleLayer?.querySelectorAll?.(':scope > .swell-derived-handle-group')
@@ -872,7 +877,7 @@ export function createSwellTools({
     });
   }
 
-  function applyExternalConstraint(constraint, { history = 'none' } = {}) {
+  function applyExternalConstraint(constraint, { history = 'none', updates = null } = {}) {
     const derived = derivedDimensionProvider.resolveFeature(constraint.externalTarget?.derivedRef);
     const movable = constraint.externalTarget?.movableRef;
     if (!derived || !movable) return false;
@@ -891,6 +896,7 @@ export function createSwellTools({
     if (!finitePoint(target)) return false;
     const currentPoint = constraint.type === 'Concentric' ? current?.center : current?.point;
     if (finitePoint(currentPoint) && pointDistance(currentPoint, target) <= 1e-7) return true;
+    if (updates) { updates.push({ reference: movable, world: target }); return true; }
     return canvas.setPointFeaturePosition?.(movable, target, { history })?.success === true;
   }
 
@@ -898,13 +904,15 @@ export function createSwellTools({
     if (applyingExternalConstraints || !externalConstraints.length) return false;
     applyingExternalConstraints = true;
     let changed = false;
+    const updates = [];
     try {
       externalConstraints = externalConstraints.filter((constraint) => {
         if (canvas.isStackRelationshipAvailable?.(constraint) === false) return true;
         const valid = Boolean(derivedDimensionProvider.resolveFeature(constraint.externalTarget?.derivedRef));
-        if (valid) changed = applyExternalConstraint(constraint) || changed;
+        if (valid) changed = applyExternalConstraint(constraint, { updates: canvas.setPointFeaturePositions ? updates : null }) || changed;
         return valid;
       });
+      if (updates.length) changed = canvas.setPointFeaturePositions(updates, { history: 'none' })?.success === true;
     } finally {
       applyingExternalConstraints = false;
     }
@@ -914,28 +922,61 @@ export function createSwellTools({
   function renderNow() {
     renderFrame = null;
     if (!objectLayer) return;
-    removeRenderedGroups();
-    derivedByPieceId = new Map();
     const drawing = snapshot();
-    derivedByOwnerId = deriveSwellGeometry({
+    const next = evaluateGeometry({
       entities: drawing.entities || [],
       constraints: drawing.constraints || [],
       evaluateLength: (expression) => canvas.evaluateLengthExpression?.(expression) ?? Number(expression),
     });
+    const changedOwners = new Set();
+    const removeOwner = (ownerId) => {
+      for (const layer of [objectLayer, handleLayer]) {
+        [...(layer?.children || [])].filter((node) => node.dataset.swellOwnerId === ownerId).forEach((node) => node.remove());
+      }
+      for (const [pieceId, entry] of derivedByPieceId) {
+        if (entry.piece.ownerId === ownerId) derivedByPieceId.delete(pieceId);
+      }
+    };
+    for (const ownerId of ownerPresentationKeys.keys()) {
+      if (!next.has(ownerId)) {
+        removeOwner(ownerId);
+        ownerPresentationKeys.delete(ownerId);
+        changedOwners.add(ownerId);
+      }
+    }
+    derivedByOwnerId = next;
+    next.forEach((result, ownerId) => {
+      const key = JSON.stringify([result.sourceEntity, result.pieces, sourceAppearance(ownerId), canvas.getWorldTolerance?.(6)]);
+      if (ownerPresentationKeys.get(ownerId) !== key) {
+        removeOwner(ownerId);
+        renderOwner(result);
+        ownerPresentationKeys.set(ownerId, key);
+        changedOwners.add(ownerId);
+      } else {
+        for (const layer of [objectLayer, handleLayer]) {
+          [...(layer?.children || [])].filter((node) => node.dataset.swellOwnerId === ownerId)
+            .forEach((node) => syncGroupPresentation(node, ownerId));
+        }
+      }
+    });
     derivedBoundaries = swellBoundariesFromDerived(derivedByOwnerId);
-    renderClosedBoundaryFills(derivedBoundaries);
-    derivedByOwnerId.forEach(renderOwner);
+    const boundaryKey = JSON.stringify([derivedBoundaries, [...next.keys()].map(sourceAppearance)]);
+    if (boundaryKey !== boundaryPresentationKey) {
+      objectLayer.querySelectorAll(':scope > .swell-derived-fill-group').forEach((node) => node.remove());
+      renderClosedBoundaryFills(derivedBoundaries);
+      boundaryPresentationKey = boundaryKey;
+    }
     externalConstraints = externalConstraints.map((constraint) => normalizeSwellExternalConstraint(
-      constraint,
-      (request) => derivedDimensionProvider.resolveFeature(request),
+      constraint, (request) => derivedDimensionProvider.resolveFeature(request),
     ));
-    canvas.syncGeometryStacking?.();
     syncDerivedSelection();
     applyExternalConstraints();
-    canvas.notifyDerivedFeatureChange?.();
+    if (!canvas.registerDrawingUpdateStage) canvas.notifyDerivedFeatureChange?.(changedOwners);
+    return changedOwners;
   }
 
   function render() {
+    if (canvas.requestDrawingUpdate) { canvas.requestDrawingUpdate(); return; }
     if (renderFrame !== null) cancelAnimationFrame(renderFrame);
     renderFrame = requestAnimationFrame(renderNow);
   }
@@ -1294,8 +1335,14 @@ export function createSwellTools({
   canvas.registerDerivedDimensionFeatureProvider?.(derivedDimensionProvider);
   canvas.registerDerivedBoundaryFeatureProvider?.(derivedBoundaryProvider);
   canvas.registerSelectionPropertyProvider?.(selectionPropertyProvider);
-  canvas.onObjectsChange?.(render);
-  canvas.onPresentationChange?.(render);
+  if (canvas.registerDrawingUpdateStage) {
+    canvas.registerDrawingUpdateStage('swell', (change) => {
+      renderNow().forEach((id) => change.changedRecordIds?.add(id));
+    }, 20);
+  } else {
+    canvas.onObjectsChange?.(render);
+    canvas.onPresentationChange?.(render);
+  }
   canvas.onSelectionChange?.(syncDerivedSelection);
   mountProperties();
   render();

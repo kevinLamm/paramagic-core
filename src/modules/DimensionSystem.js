@@ -5,6 +5,8 @@ import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from './ArcGeometry.js';
 import { stackRelationshipSolveDomain } from './StackRelationshipSystem.js';
 import { createExpressionBoxLookup, expressionBoxLookupMarkup } from './ExpressionBox.js';
+import { canvasPointerDragReady } from './CanvasPointerDrag.js';
+import { canvasFeatureFromEvent } from './CanvasSelection.js';
 
 export const DIMENSION_EDIT_INPUT_MINIMUM_HEIGHT = 54;
 export const DIMENSION_EDIT_INPUT_MAXIMUM_HEIGHT = 180;
@@ -60,18 +62,53 @@ export function bindDimensionRecordInteractions(record, {
 } = {}) {
   if (!record?.group?.addEventListener) return () => {};
   let lastTextPress = null;
-  let editOpenedOnSecondPress = false;
+  let editOpenedForGesture = false;
+  let editOnClick = false;
+  let pendingPress = null;
+  const pointerSurface = record.group.ownerDocument || record.group;
+  const clearPendingPress = () => {
+    pendingPress = null;
+    pointerSurface.removeEventListener?.('pointermove', handlePendingMove, true);
+    pointerSurface.removeEventListener?.('pointerup', handlePendingEnd, true);
+    pointerSurface.removeEventListener?.('pointercancel', handlePendingCancel, true);
+  };
+  const handlePendingEnd = (event) => {
+    if (event.pointerId !== pendingPress?.pointerId) return;
+    clearPendingPress();
+  };
+  const handlePendingCancel = (event) => {
+    if (event.pointerId !== pendingPress?.pointerId) return;
+    lastTextPress = null;
+    editOnClick = false;
+    clearPendingPress();
+  };
+  const handlePendingMove = (event) => {
+    if (!pendingPress || event.pointerId !== pendingPress.pointerId) return;
+    if (!canvasPointerDragReady({
+      startClientX: pendingPress.clientX, startClientY: pendingPress.clientY,
+    }, event)) return;
+    const press = pendingPress;
+    clearPendingPress();
+    lastTextPress = null;
+    editOnClick = false;
+    // Capture only once this is a drag. Capturing on the first press retargets
+    // click/dblclick to the group and loses the dimension text hit target.
+    if (canInteract(record)) beginLineDrag(press, record);
+  };
 
   const handlePointerDown = (event) => {
+    editOnClick = false;
     if (
       event.button !== 0
       || event.ctrlKey
       || event.metaKey
+      || event.altKey
       || !canInteract(record)
     ) return;
     const textTarget = dimensionInteractionTarget(event, '.dimension-text, .dimension-text-hit');
     const pathTarget = dimensionInteractionTarget(event, '.dimension-path');
     if (!textTarget && !pathTarget) return;
+    clearPendingPress();
 
     if (textTarget) {
       const time = Number(event.timeStamp) || Date.now();
@@ -83,37 +120,54 @@ export function bindDimensionRecordInteractions(record, {
       if (
         record.entity?.dimensionId
         && canEditText(record)
-        && (isSecondPress || event.detail > 1)
+        && isSecondPress
       ) {
         lastTextPress = null;
-        editOpenedOnSecondPress = true;
-        consumeDimensionInteraction(event);
-        editText(record, event);
-        return;
-      }
-      lastTextPress = press;
+        editOnClick = true;
+      } else lastTextPress = press;
     } else {
       lastTextPress = null;
     }
 
-    editOpenedOnSecondPress = false;
-    beginLineDrag(event, record);
-    event.stopImmediatePropagation?.();
+    editOpenedForGesture = false;
+    pendingPress = event;
+    pointerSurface.addEventListener('pointermove', handlePendingMove, true);
+    pointerSurface.addEventListener('pointerup', handlePendingEnd, true);
+    pointerSurface.addEventListener('pointercancel', handlePendingCancel, true);
+    consumeDimensionInteraction(event);
+  };
+
+  const handleClick = (event) => {
+    if (!editOnClick || !canInteract(record) || !canEditText(record)) return;
+    editOnClick = false;
+    clearPendingPress();
+    consumeDimensionInteraction(event);
+    // Finish the click before changing layout/focus. Opening on pointerdown
+    // can place the popup under pointerup, retargeting click to the canvas,
+    // whose blank-area selection handler immediately closes the editor.
+    editOpenedForGesture = true;
+    editText(record, event);
   };
 
   const handleDoubleClick = (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (!record.entity?.dimensionId || !canInteract(record) || !canEditText(record)) return;
     if (!dimensionInteractionTarget(event, '.dimension-text, .dimension-text-hit')) return;
     consumeDimensionInteraction(event);
-    if (!editOpenedOnSecondPress) editText(record, event);
-    editOpenedOnSecondPress = false;
+    clearPendingPress();
+    if (!editOpenedForGesture) editText(record, event);
+    editOpenedForGesture = false;
+    editOnClick = false;
     lastTextPress = null;
   };
 
   record.group.addEventListener('pointerdown', handlePointerDown, { capture: true });
+  record.group.addEventListener('click', handleClick, { capture: true });
   record.group.addEventListener('dblclick', handleDoubleClick, { capture: true });
   return () => {
+    clearPendingPress();
     record.group.removeEventListener?.('pointerdown', handlePointerDown, { capture: true });
+    record.group.removeEventListener?.('click', handleClick, { capture: true });
     record.group.removeEventListener?.('dblclick', handleDoubleClick, { capture: true });
   };
 }
@@ -1830,7 +1884,6 @@ export function createDimensionLinkManager({
         Object.assign(record.entity, next);
         record.entity.coordinateFrame = { ...dimensionFrame };
       } finally { dimensionFrame = null; }
-      if (record.entity.dimensionId) solver.updateDimensionAnnotation?.(record.entity.dimensionId, record.entity);
       if (record.entity.dimensionMode === 'driven' && record.entity.dimensionId) {
         solver.dimensions.setComputedValue(
           record.entity.dimensionId,
@@ -1838,6 +1891,7 @@ export function createDimensionLinkManager({
           computedDimensionUnit(record.entity),
         );
       }
+      if (record.entity.dimensionId) solver.updateDimensionAnnotation?.(record.entity.dimensionId, record.entity);
       applyManagedDimensionText(record.entity);
       updateDimensionNode(record, getScale());
       updateRecordHandles(record);
@@ -2672,7 +2726,8 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
           return true;
         }
       }
-      const feature = canvas.getFeatureFromEvent(event, {
+      const feature = canvasFeatureFromEvent(canvas, event, {
+        preferPoints: !(activeMode === 'driven' && (event.ctrlKey || ctrlMcl)),
         rendered: true,
         dimensionMode: activeMode,
       });

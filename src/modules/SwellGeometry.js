@@ -834,6 +834,55 @@ function orientedResultPieces(result) {
     : result.pieces;
 }
 
+// Cache complete connected source components. Endpoint joins, composite normals,
+// and fillet transitions can affect neighbours, so an individual line is not a
+// sufficient cache boundary.
+export function createSwellGeometryEvaluator() {
+  let cache = new Map();
+  return ({ entities = [], constraints = [], evaluateLength = Number } = {}) => {
+    const sources = entities.filter(isSwellEntity);
+    const parents = new Map(sources.map(({ id }) => [id, id]));
+    const find = (id) => {
+      if (!parents.has(id)) return null;
+      let root = id;
+      while (parents.get(root) !== root) root = parents.get(root);
+      return root;
+    };
+    const join = (ids) => {
+      const roots = ids.map(find).filter(Boolean);
+      roots.slice(1).forEach((root) => parents.set(root, roots[0]));
+    };
+    sourceTopology(sources, constraints).groups.forEach((group) => join(group.map(({ recordId }) => recordId)));
+    compositeGroups(sources).forEach((group) => join(group.map(({ id }) => id)));
+    constraints.forEach((constraint) => join((constraint.featureRefs || []).map(({ recordId }) => recordId)));
+    const groups = new Map();
+    sources.forEach((entity) => {
+      const id = find(entity.id);
+      if (!groups.has(id)) groups.set(id, []);
+      groups.get(id).push(entity);
+    });
+    const nextCache = new Map();
+    const result = new Map();
+    groups.forEach((group, id) => {
+      const ids = new Set(group.map(({ id: recordId }) => recordId));
+      const related = constraints.filter((constraint) => (constraint.featureRefs || []).some(({ recordId }) => ids.has(recordId)));
+      const evaluated = group.flatMap((entity) => {
+        const segments = lineSegmentsForEntity(entity);
+        return (segments.length ? segments.map(({ segmentIndex }) => segmentIndex) : [null])
+          .map((index) => evaluatedDefinition(swellDefinitionForEntity(entity, index), evaluateLength, entity));
+      });
+      const key = JSON.stringify([group, related, evaluated]);
+      const previous = cache.get(id);
+      const value = previous?.key === key ? previous.value
+        : deriveSwellGeometry({ entities: group, constraints: related, evaluateLength });
+      nextCache.set(id, { key, value });
+      value.forEach((entry, ownerId) => result.set(ownerId, entry));
+    });
+    cache = nextCache;
+    return result;
+  };
+}
+
 export function deriveSwellGeometry({ entities = [], constraints = [], evaluateLength = Number } = {}) {
   const sourceEntities = entities.filter(isSwellEntity);
   const sourceById = new Map(sourceEntities.map((entity) => [entity.id, entity]));

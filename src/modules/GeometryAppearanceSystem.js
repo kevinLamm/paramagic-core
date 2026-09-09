@@ -67,8 +67,16 @@ export function createGeometryAppearanceSystem({
   const evaluateNumericFor = (entity, expression) => solver.evaluateParameterExpression(expression, { stackId: entity?.stackId });
   const evaluateLengthFor = (entity, expression) => solver.evaluateDrawingLengthExpression(expression, { stackId: entity?.stackId });
 
+  const appearanceCache = new Map();
+  const paintedStates = new WeakMap();
+  const invalidate = () => appearanceCache.clear();
+  solver.subscribe?.(invalidate);
+  solver.dimensions?.subscribe?.(invalidate);
+
   function appearance(entity = {}) {
     const sourceAppearance = resolveEntityAppearance(entity) || {};
+    const cacheKey = JSON.stringify([entity.stackId, sourceAppearance]);
+    if (appearanceCache.has(cacheKey)) return appearanceCache.get(cacheKey);
     const rawZIndex = sourceAppearance.zIndex;
     const zIndex = Number(rawZIndex);
     const strokeThickness = Number(sourceAppearance.strokeThickness);
@@ -91,7 +99,7 @@ export function createGeometryAppearanceSystem({
     let strokeOpacityError = null;
     try { fillOpacity = resolveOpacityExpression(fillOpacityExpression, (expression) => evaluateNumericFor(entity, expression)); } catch (error) { fillOpacityError = error.message; }
     try { strokeOpacity = resolveOpacityExpression(strokeOpacityExpression, (expression) => evaluateNumericFor(entity, expression)); } catch (error) { strokeOpacityError = error.message; }
-    return {
+    const result = {
       fillExpression,
       fillType: resolvedFill.fillType,
       fillImageReference: resolvedFill.fillImageReference,
@@ -148,6 +156,8 @@ export function createGeometryAppearanceSystem({
         imageStrokeHeight: resolvedStroke.imageStrokeHeightError,
       },
     };
+    appearanceCache.set(cacheKey, result);
+    return result;
   }
 
   function featureTarget() {
@@ -252,8 +262,24 @@ export function createGeometryAppearanceSystem({
     };
   }
 
+  function paintKey(record) {
+    return JSON.stringify([record.entity, record.renderEntity, appearance(record.entity)]);
+  }
+
+  function refreshPresentation() {
+    const changed = new Set();
+    records.filter((record) => ['geometry', 'fillet'].includes(record.recordType)).forEach((record) => {
+      const previous = paintedStates.get(record);
+      if (previous?.node === record.node && previous.key === paintKey(record)) return;
+      apply(record);
+      changed.add(record.id);
+    });
+    return changed;
+  }
+
   function apply(record) {
     if (!record?.node) return;
+    paintedStates.set(record, { node: record.node, key: paintKey(record) });
     if (record.entity.construction) {
       imageStrokeSystem?.clear(record);
       record.node.style.setProperty('--original-stroke-width', '1px');
@@ -461,6 +487,8 @@ export function createGeometryAppearanceSystem({
   }
 
   return {
+    invalidate,
+    refreshPresentation,
     appearance,
     apply,
     resolvedBoundaryAppearance,

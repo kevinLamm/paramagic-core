@@ -1,3 +1,4 @@
+import { createDrawingUpdateCoordinator } from './DrawingUpdateCoordinator.js';
 import { updateStackAxes, stackFrameFor } from './StackCoordinates.js';
 import {
   createDimensionLinkManager,
@@ -53,7 +54,7 @@ import {
   rememberTextDefaults,
 } from './TextTools.js';
 import { createTableSystem, normalizeTableEntity, tableCornerPoints, tableCornerIndexFromSolverIndex, tableSolverCornerIndex } from './TableTools.js';
-import { deleteCurveControlPoint, insertCurveControlPoint } from './DrawingTools.js';
+import { deleteCurveControlPoint, insertCurveControlPoint, isCurvePointDeleteGesture } from './DrawingTools.js';
 import { createSeamLineSystem } from './SeamLineSystem.js';
 import { isSubtractableEntity, createSubtractSystem } from './SubtractSystem.js';
 import { createStackSystem, syncInactiveStackHitTesting } from './StackSystem.js';
@@ -76,7 +77,7 @@ import {
 } from './FilletSystem.js';
 import { organizeDerivedPaintNodes } from './CanvasPaintOrder.js';
 import { canvasPointerDragReady } from './CanvasPointerDrag.js';
-import { resolveWindowSelectionIds } from './CanvasSelection.js';
+import { resolveWindowSelectionIds, canvasPointHandleHitDistance } from './CanvasSelection.js';
 
 export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver }) {
   bindCanvasKeyboardFocus(canvas);
@@ -113,6 +114,18 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const selectedIds = new Set();
   const records = [];
   const objectChangeListeners = new Set();
+  let drawingReadCache = null;
+  const drawingUpdates = createDrawingUpdateCoordinator({
+    beforeFlush: () => { drawingReadCache = new Map(); },
+    afterFlush: () => { drawingReadCache = null; },
+    publish(change) {
+      presentationChangeListeners.forEach((listener) => listener(change));
+      if (change.objectsChanged) objectChangeListeners.forEach((listener) => listener({
+        ...change, count: records.length,
+      }));
+    },
+  });
+
   const presentationChangeListeners = new Set();
   const selectionChangeListeners = new Set();
   const canvasHoverListeners = new Set();
@@ -1346,6 +1359,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function evaluatedGeometryMap() {
+    if (!drawingReadCache) return computeEvaluatedGeometryMap();
+    if (!drawingReadCache.has('evaluatedGeometryMap')) drawingReadCache.set('evaluatedGeometryMap', computeEvaluatedGeometryMap());
+    return drawingReadCache.get('evaluatedGeometryMap');
+  }
+
+  function computeEvaluatedGeometryMap() {
     const entities = records
       .filter((record) => (
         record.recordType === 'geometry' || record.recordType === 'fillet'
@@ -1775,20 +1794,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return record;
   }
 
-  function notifyObjectChange({ history = 'coalesce' } = {}) {
-    refreshStackActivation();
-    stackProcessingScope.records(records)
-      .filter((record) => record.recordType === 'geometry')
-      .forEach(geometryAppearanceSystem.apply);
-    stackProcessingScope.records(records)
-      .filter((record) => record.recordType === 'text')
-      .forEach(textTools.updateRecord);
-    subtractSystem.refreshPresentation();
-    renderClosedRegions();
-    notchSystem.refresh();
-    seamLineSystem.refresh();
-    syncState();
-    objectChangeListeners.forEach((listener) => listener({ count: records.length, history }));
+  function notifyObjectChange({ history = 'coalesce', changedRecordIds = null } = {}) {
+    drawingUpdates.invalidate({
+      changedRecordIds,
+      objectsChanged: true,
+      history,
+    });
   }
 
   function refreshStackActivation(options = {}) {
@@ -1867,6 +1878,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
 
   function currentClosedCycles() {
+    if (!drawingReadCache) return computeCurrentClosedCycles();
+    if (!drawingReadCache.has('currentClosedCycles')) drawingReadCache.set('currentClosedCycles', computeCurrentClosedCycles());
+    return drawingReadCache.get('currentClosedCycles');
+  }
+
+  function computeCurrentClosedCycles() {
     const topologyEntities = closedGeometryTopologyEntities(stackProcessingScope.records(records)
       .filter((record) => record.recordType === 'geometry' || record.recordType === 'fillet')
       .map((record) => record.entity));
@@ -1878,6 +1895,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function currentResolvedBoundaries() {
+    if (!drawingReadCache) return computeCurrentResolvedBoundaries();
+    if (!drawingReadCache.has('currentResolvedBoundaries')) drawingReadCache.set('currentResolvedBoundaries', computeCurrentResolvedBoundaries());
+    return drawingReadCache.get('currentResolvedBoundaries');
+  }
+
+  function computeCurrentResolvedBoundaries() {
     const topologyEntities = closedGeometryTopologyEntities(stackProcessingScope.records(records)
       .filter((record) => record.recordType === 'geometry' || record.recordType === 'fillet')
       .map((record) => record.entity));
@@ -2551,9 +2574,24 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     indicatorLayer: overlapCycleLayer,
     records,
     isRecordCandidate: isRecordInteractive,
-    selectRecord: (recordId, options = {}) => {
-      if (options.additive) toggleSelection(recordId, options);
-      else selectOnly(recordId, options);
+    canCycleHandles: () => !canvas.classList.contains('point-handles-disabled'),
+    isCandidateAllowed: (candidate, point) => featureCommandDelegate?.acceptsSelection?.({
+      target: candidate.node, paramagicSelectionTarget: candidate.node, ...point,
+    }) ?? true,
+    selectCandidate: (candidate, { additive, event, clientX, clientY }) => {
+      const selectionEvent = {
+        target: candidate.node,
+        paramagicSelectionTarget: candidate.node,
+        button: 0, clientX, clientY,
+        ctrlKey: additive, metaKey: false, altKey: false, shiftKey: false,
+        preventDefault: () => event?.preventDefault?.(),
+        stopPropagation: () => event?.stopPropagation?.(),
+      };
+      if (featureCommandDelegate?.pointerDown?.(selectionEvent)) return;
+      if (smartDimensionDelegate?.pointerDown?.(selectionEvent)) return;
+      const options = { segmentIndex: candidate.segmentIndex ?? null };
+      if (additive) toggleSelection(candidate.recordId, options);
+      else selectOnly(candidate.recordId, options);
     },
   });
 
@@ -2993,7 +3031,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function drawingSnapshot() {
-    const snapshot = solver.getSketchSnapshot();
+    const { derivedEntities: _derivedEntities, ...snapshot } = solver.getSketchSnapshot();
     const drawing = {
       ...snapshot,
       ...classSystem.getState(),
@@ -3162,47 +3200,59 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     return entity;
   }
 
-  function setPointFeaturePosition(reference = {}, world, { history = 'commit' } = {}) {
-    if (!Array.isArray(world) || world.length < 2 || !world.slice(0, 2).every(Number.isFinite)) {
-      return { success: false, error: 'A finite target point is required.' };
+  function setPointFeaturePosition(reference, world, options) {
+    return setPointFeaturePositions([{ reference, world }], options);
+  }
+
+  function setPointFeaturePositions(updates, { history = 'commit' } = {}) {
+    const entitiesById = new Map();
+    const locks = new Set();
+    for (const { reference, world } of updates) {
+      if (!Array.isArray(world) || world.length < 2 || !world.slice(0, 2).every(Number.isFinite)) {
+        return { success: false, error: 'A finite target point is required.' };
+      }
+      const record = records.find((candidate) => candidate.id === reference.recordId && candidate.recordType === 'geometry');
+      if (!record) return { success: false, error: 'The target geometry no longer exists.' };
+      const startEntity = cloneEntity(entitiesById.get(record.id) || record.entity);
+      let nextEntity;
+      let lockedVariableIds;
+      if (reference.pointRole === 'center' && record.entity.type === 'arc') {
+        const center = record.entity.center || circleFromThreePoints(record.entity.start, record.entity.arcPoint, record.entity.end)?.center;
+        if (!center) return { success: false, error: 'The arc center could not be resolved.' };
+        const delta = [world[0] - center[0], world[1] - center[1]];
+        nextEntity = cloneEntity(startEntity);
+        nextEntity.start = addPoints(nextEntity.start, delta);
+        nextEntity.arcPoint = addPoints(nextEntity.arcPoint, delta);
+        nextEntity.end = addPoints(nextEntity.end, delta);
+        nextEntity.center = [...world];
+        lockedVariableIds = solver.variableIdsForEntity(record.id);
+      } else {
+        nextEntity = moveGeometryHandle(
+          record,
+          Number(reference.index) || 0,
+          [...world],
+          [...world],
+          startEntity,
+          cloneEntity(startEntity),
+        );
+        const feature = {
+          kind: 'point',
+          recordId: record.id,
+          index: Number(reference.index) || 0,
+          ...(reference.pointRole ? { pointRole: reference.pointRole } : {}),
+        };
+        lockedVariableIds = solver.dragVariableIdsForFeature?.(feature) || solver.variableIdsForFeature(feature);
+      }
+
+      entitiesById.set(record.id, nextEntity);
+      lockedVariableIds.forEach((id) => locks.add(id));
     }
-    const record = records.find((candidate) => candidate.id === reference.recordId && candidate.recordType === 'geometry');
-    if (!record) return { success: false, error: 'The target geometry no longer exists.' };
+    if (!entitiesById.size) return { success: true };
     if (history !== 'none') requestHistoryCheckpoint('set-point-feature-position');
-    const startEntity = cloneEntity(record.entity);
-    let nextEntity;
-    let lockedVariableIds;
-    if (reference.pointRole === 'center' && record.entity.type === 'arc') {
-      const center = record.entity.center || circleFromThreePoints(record.entity.start, record.entity.arcPoint, record.entity.end)?.center;
-      if (!center) return { success: false, error: 'The arc center could not be resolved.' };
-      const delta = [world[0] - center[0], world[1] - center[1]];
-      nextEntity = cloneEntity(record.entity);
-      nextEntity.start = addPoints(nextEntity.start, delta);
-      nextEntity.arcPoint = addPoints(nextEntity.arcPoint, delta);
-      nextEntity.end = addPoints(nextEntity.end, delta);
-      nextEntity.center = [...world];
-      lockedVariableIds = solver.variableIdsForEntity(record.id);
-    } else {
-      nextEntity = moveGeometryHandle(
-        record,
-        Number(reference.index) || 0,
-        [...world],
-        [...world],
-        startEntity,
-        cloneEntity(startEntity),
-      );
-      const feature = {
-        kind: 'point',
-        recordId: record.id,
-        index: Number(reference.index) || 0,
-        ...(reference.pointRole ? { pointRole: reference.pointRole } : {}),
-      };
-      lockedVariableIds = solver.dragVariableIdsForFeature?.(feature) || solver.variableIdsForFeature(feature);
-    }
-    const outcome = solver.updateEntities([nextEntity], { lockedVariableIds });
+    const outcome = solver.updateEntities([...entitiesById.values()], { lockedVariableIds: [...locks] });
     if (outcome?.then) return { success: false, error: 'The point update did not complete synchronously.' };
-    applySolverSnapshot(outcome?.snapshot, { incremental: outcome?.snapshotMode === 'delta' });
-    notifyObjectChange({ history });
+    const changedRecordIds = applySolverSnapshot(outcome?.snapshot, { incremental: outcome?.snapshotMode === 'delta' });
+    if (history !== 'none' || !drawingUpdates.running) notifyObjectChange({ history, changedRecordIds });
     const status = outcome?.result?.status;
     const success = !['invalid', 'conflict', 'failed', 'timeout'].includes(status);
     return { success, error: success ? null : outcome?.result?.message || 'The target point could not be moved.' };
@@ -3250,7 +3300,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     isRecordProcessingEnabled: stackProcessingScope.recordEnabled,
   });
 
-  function applySolverSnapshot(snapshot = null, { incremental = false } = {}) {
+  function applySolverSnapshot(snapshot = null, options = {}) {
+    const previous = drawingReadCache;
+    drawingReadCache = new Map();
+    try { return applySolverSnapshotInScope(snapshot, options); }
+    finally { drawingReadCache = previous; drawingReadCache?.clear(); }
+  }
+
+  function applySolverSnapshotInScope(snapshot = null, { incremental = false } = {}) {
     syncDimensionStackFrames(records, stackSystem.getState(), solver.stackState);
     imageTools.syncStackFrames(records, stackSystem.getState(), solver.stackState);
     stackSystem.syncCoordinateFrames(solver.stackState);
@@ -3260,61 +3317,62 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     );
     const byId = new Map(resolvedSnapshot.map((entity) => [entity.id, entity]));
     const changedIds = new Set();
-    const geometryDragPreview = Boolean(
-      shapeDrag
-      || (handleDrag && handleDrag.record?.recordType === 'geometry'),
-    );
     const snapshotRecords = incremental
       ? resolvedSnapshot.map((entity) => recordById(entity.id)).filter((record) => (
         record && stackProcessingScope.recordEnabled(record)
       ))
       : stackProcessingScope.records(records);
+    // Install the complete solved revision before any rendering or feature read.
+    // In particular, a fillet/Array query must never cache a mixture of old and
+    // new source records while this batch is being applied.
+    const changedRecords = [];
     snapshotRecords.forEach((record) => {
       const next = byId.get(record.id);
-      if (!next) return;
+      if (!next || JSON.stringify(record.entity) === JSON.stringify(next)) return;
+      if (['geometry', 'text'].includes(record.recordType)) record.entity = cloneEntity(next);
+      changedRecords.push({ record, next });
+    });
+    drawingReadCache?.clear();
+    changedRecords.forEach(({ record, next }) => {
       if (record.updateFromConstraint?.(next)) {
         changedIds.add(record.id);
         return;
       }
       if (!['geometry', 'text'].includes(record.recordType)) return;
-      record.entity = cloneEntity(next);
       if (record.recordType === 'text') textTools.updateRecord(record);
       else updateRecordNode(record);
       updateRecordHandles(record);
       changedIds.add(record.id);
     });
-    if (incremental) {
-      filletSystem.syncRadiusDimensions(changedIds);
-      filletSystem.refreshPresentation({ renderRegions: false, changedRecordIds: changedIds })
-        .forEach((recordId) => changedIds.add(recordId));
-      subtractSystem.refreshPresentation({ changedRecordIds: changedIds });
-      updateClosedRegionGeometryInPlace(changedIds);
-      notchSystem.applyDrivingDimensions(changedIds);
-      notchSystem.refresh(changedIds);
-      seamLineSystem.refresh(changedIds);
-      refreshLinkedDimensions(changedIds);
-      snapshotRecords.filter((record) => record.recordType === 'text').forEach(textTools.updateRecord);
-      constraintOverlaySystem?.render?.({ changedRecordIds: changedIds });
-      syncState({ changedRecordIds: changedIds, refreshPresentation: false });
-    } else {
-      filletSystem.syncRadiusDimensions();
-      filletSystem.refreshPresentation({ renderRegions: !geometryDragPreview });
-      subtractSystem.refreshPresentation();
-      if (geometryDragPreview) updateClosedRegionGeometryInPlace();
-      else renderClosedRegions();
-      notchSystem.applyDrivingDimensions();
-      notchSystem.refresh();
-      seamLineSystem.refresh();
-      refreshLinkedDimensions();
-      records.filter((record) => (
-        record.recordType === 'text' && stackProcessingScope.recordEnabled(record)
-      )).forEach(textTools.updateRecord);
-      constraintOverlaySystem?.render?.();
-      syncState();
-    }
-    presentationChangeListeners.forEach((listener) => listener({ changedRecordIds: new Set(changedIds) }));
+    drawingUpdates.invalidate({ changedRecordIds: changedIds });
     return changedIds;
   }
+
+  drawingUpdates.onInvalidate(() => {
+    drawingReadCache?.clear();
+    geometryAppearanceSystem.invalidate();
+  });
+  drawingUpdates.register('source-presentation', ({ changedRecordIds, objectsChanged }) => {
+    if (objectsChanged) refreshStackActivation();
+    filletSystem.syncRadiusDimensions(changedRecordIds);
+    filletSystem.refreshPresentation({ renderRegions: false, changedRecordIds })
+      .forEach((id) => changedRecordIds?.add(id));
+    subtractSystem.refreshPresentation({ changedRecordIds });
+    geometryAppearanceSystem.refreshPresentation().forEach((id) => changedRecordIds?.add(id));
+    if (objectsChanged) stackProcessingScope.records(records)
+      .filter((record) => record.recordType === 'text').forEach(textTools.updateRecord);
+    if (changedRecordIds && !objectsChanged) updateClosedRegionGeometryInPlace(changedRecordIds);
+    else renderClosedRegions();
+  }, 10);
+  drawingUpdates.register('dependent-presentation', ({ changedRecordIds, objectsChanged }) => {
+    notchSystem.applyDrivingDimensions(changedRecordIds);
+    notchSystem.refresh(changedRecordIds);
+    seamLineSystem.refresh(changedRecordIds);
+    refreshLinkedDimensions(changedRecordIds);
+    constraintOverlaySystem?.render?.({ changedRecordIds });
+    syncState({ changedRecordIds, refreshPresentation: objectsChanged });
+    syncGeometryStacking();
+  }, 100);
 
   function updateDimensionParameterName(dimensionId, name) {
     records.forEach((record) => {
@@ -3399,6 +3457,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   function scheduleGeometrySolve(editedEntries) {
+    solver.supersedeInteractivePreview?.();
     editedEntries.forEach((entry) => {
       const record = entry.record || entry;
       pendingSolveRecords.set(record.id, {
@@ -3812,7 +3871,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     constraintOverlaySystem?.render?.();
     syncScreenInvariantSizing();
     positionDimensionEditPanel();
-    if (status) status.textContent = `Zoom ${(camera.scale * 100).toFixed(0)}% - Alt/Middle drag to pan - Wheel to zoom`;
+    if (status) status.textContent = `Zoom ${(camera.scale * 100).toFixed(0)}% - Middle/Right drag to pan - Wheel to zoom - Alt-click to cycle selection`;
   }
 
   function syncScreenInvariantSizing() {
@@ -3974,15 +4033,14 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     const hoverOwnership = canvasHoverOwnership(event);
     hoveredId = hoverOwnership.recordId;
     hoveredOwnerStackId = hoverOwnership.stackId;
+    const handlesEnabled = !canvas.classList.contains('point-handles-disabled');
     records.forEach((record) => {
-      const isVisible = hoveredId === record.id || selectedIds.has(record.id);
+      const canHoverHandles = handlesEnabled && isRecordInteractive(record);
       interactiveHandlesForRecord(record).forEach((handle) => {
         handle.classList.remove('hovered');
-        if (!isVisible) return;
-        const rect = handle.getBoundingClientRect();
-        const dx = event.clientX - (rect.left + rect.width / 2);
-        const dy = event.clientY - (rect.top + rect.height / 2);
-        if (Math.hypot(dx, dy) <= 8) handle.classList.add('hovered');
+        if (canHoverHandles && Number.isFinite(canvasPointHandleHitDistance(handle, event.clientX, event.clientY))) {
+          handle.classList.add('hovered');
+        }
       });
     });
     const hasHoveredHandle = records.some((record) => interactiveHandlesForRecord(record)
@@ -3994,6 +4052,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }
 
   canvas.addEventListener('wheel', (event) => {
+    overlapSelectionCycler?.clear();
     event.preventDefault();
     const rect = canvas.getBoundingClientRect();
     const cursor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -4010,7 +4069,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       event.stopPropagation();
       return;
     }
-    if (event.button === 0 && event.altKey && deleteCurvePointFromEvent(event)) {
+    if (isCurvePointDeleteGesture(event, canvasToolInteractionActive()) && deleteCurvePointFromEvent(event)) {
       event.preventDefault();
       event.stopPropagation();
       suppressRecordClick = true;
@@ -4035,16 +4094,16 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       }
     }
     if (event.button === 0 && event.altKey) {
-      const selected = overlapSelectionCycler.cycle(event);
-      if (selected) {
-        event.paramagicSelectionTarget = selected.node;
-        if (featureCommandDelegate?.pointerDown?.(event)) return;
-        if (smartDimensionDelegate?.pointerDown?.(event)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        suppressRecordClick = true;
-        suppressNextCanvasClick = true;
-      }
+      overlapSelectionCycler.cycle(event);
+      event.preventDefault();
+      event.stopPropagation();
+      suppressRecordClick = true;
+      suppressNextCanvasClick = true;
+      return;
+    }
+    if (overlapSelectionCycler.acceptPointer(event)) {
+      suppressRecordClick = true;
+      suppressNextCanvasClick = true;
       return;
     }
     if (featureCommandDelegate?.pointerDown?.(event)) return;
@@ -4111,14 +4170,16 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       syncState();
       return;
     }
+    // The release event may contain a newer position than the last pointermove.
+    // Capture it before dispatching the final requested geometry and strict solve.
+    if (shapeDrag?.moved) moveShapeDrag(event);
+    else if (handleDrag?.record.recordType === 'geometry') moveHandle(event);
     flushScheduledSolve();
     let geometryDragEnded = false;
-    let notifyAfterGeometryDrag = false;
     if (shapeDrag) {
       const derivedItems = shapeDrag.derivedItems || [];
       suppressRecordClick = shapeDrag.moved;
       if (shapeDrag.moved) suppressNextCanvasClick = true;
-      notifyAfterGeometryDrag = shapeDrag.moved;
       geometryDragEnded = shapeDrag.solverActive;
       if (shapeDrag.moved) derivedItems.forEach((item) => item.end?.());
       shapeDrag = null;
@@ -4149,16 +4210,16 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       const outcome = solver.endDragInteractive ? solver.endDragInteractive() : solver.endDrag();
       if (outcome && typeof outcome.then === 'function') {
         outcome.then((resolved) => {
-          if (resolved?.snapshot) applySolverSnapshot(resolved.snapshot, {
+          const changedRecordIds = resolved?.snapshot ? applySolverSnapshot(resolved.snapshot, {
             incremental: resolved.snapshotMode === 'delta',
-          });
-          if (notifyAfterGeometryDrag) notifyObjectChange();
+          }) : null;
+          notifyObjectChange({ history: 'commit', changedRecordIds });
         });
       } else {
-        applySolverSnapshot(outcome?.snapshot, {
+        const changedRecordIds = applySolverSnapshot(outcome?.snapshot, {
           incremental: outcome?.snapshotMode === 'delta',
         });
-        if (notifyAfterGeometryDrag) notifyObjectChange();
+        notifyObjectChange({ history: 'commit', changedRecordIds });
       }
     }
   });
@@ -4176,6 +4237,11 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
   canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
+  canvas.addEventListener('keydown', (event) => {
+    if (event.target?.closest?.('input, textarea, select, [contenteditable]')) return;
+    overlapSelectionCycler.keyDown(event);
+  }, { capture: true });
+
   document.addEventListener('keydown', (event) => {
     if (event.defaultPrevented) return;
     // Editing a property or text field must never invoke canvas commands.
@@ -4186,10 +4252,6 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     if (smartDimensionDelegate?.keyDown?.(event)) return;
     if (drawingMode) return;
     if (event.key === 'Escape') clearSelection();
-    if (event.key === 'Enter' && overlapSelectionCycler.commit({ additive: event.ctrlKey || event.metaKey })) {
-      event.preventDefault();
-      return;
-    }
     if (event.key === 'Delete' || event.key === 'Backspace') deleteSelection();
   });
 
@@ -4535,6 +4597,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       notifyObjectChange();
       return next;
     },
+    registerDrawingUpdateStage: (name, update, order) => drawingUpdates.register(name, update, order),
+    onDrawingInvalidated: (listener) => drawingUpdates.onInvalidate(listener),
+    requestDrawingUpdate: (change = {}) => drawingUpdates.invalidate(change),
+    flushDrawingUpdate: () => drawingUpdates.flush(),
+    isDrawingUpdatePending: () => drawingUpdates.pending,
+    getDrawingRevision: () => drawingUpdates.revision,
     onObjectsChange(listener) {
       objectChangeListeners.add(listener);
       return () => objectChangeListeners.delete(listener);
@@ -4579,6 +4647,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       return imageStrokeSystem.render(record, appearance, rerender);
     },
     setPointFeaturePosition,
+    setPointFeaturePositions,
     setSelectedSeamLine: seamLineSystem.setSelectedSeamLine,
     setBoundaryPropertyFeatureFromEvent: seamLineSystem.setPropertyFeatureFromEvent,
     getSelectedSubtractParent: subtractSystem.selectedParentOwner,
@@ -4610,6 +4679,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       drawingHint = helper;
     },
     setFeatureCommandDelegate(delegate) {
+      overlapSelectionCycler?.clear();
       featureCommandDelegate = delegate;
       objectLayer.classList.toggle('feature-command-active', Boolean(featureCommandDelegate));
       syncCanvasToolHitTesting();
@@ -4653,6 +4723,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     setPreviewEntities,
     setDimensionPreview,
     setSmartDimensionDelegate(delegate) {
+      overlapSelectionCycler?.clear();
       smartDimensionDelegate = delegate;
       syncCanvasToolHitTesting();
       emitCanvasHover();
@@ -4715,12 +4786,8 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       if (event?.button !== 0) return false;
       return beginRecordsDrag(event);
     },
-    notifyDerivedFeatureChange() {
-      notchSystem.refresh();
-      seamLineSystem.refresh();
-      refreshLinkedDimensions();
-      constraintOverlaySystem?.render?.();
-      syncGeometryStacking();
+    notifyDerivedFeatureChange(changedRecordIds = null) {
+      drawingUpdates.invalidate({ changedRecordIds });
     },
     registerSubtractOperandProvider(provider) {
       if (!provider || typeof provider.owners !== 'function') return () => {};

@@ -262,6 +262,19 @@ function endpointTangentPoint(model, constraint) {
   if (constraint?.type !== 'Tangent' || constraint.tangentPoint) return constraint?.tangentPoint || null;
   const lineRef = constraint.featureRefs?.find((ref) => ref.kind === 'segment');
   const arcRef = constraint.featureRefs?.find((ref) => ref.kind === 'arc');
+  const arcRefs = constraint.featureRefs?.filter((ref) => ref.kind === 'arc') || [];
+  if (!lineRef && arcRefs.length === 2) {
+    const [first, second] = arcRefs.map(ref => model.resolveEntity(ref));
+    if (!first || !second) return null;
+    const tolerance = Math.max(1e-7, Math.min(1e-3, Math.min(first.radius, second.radius) * 1e-6));
+    for (const index of [0, 2]) {
+      const endpoint = index === 0 ? first.start : first.end;
+      if ([second.start, second.end].some(other => distance(endpoint, other) <= tolerance)) {
+        return { kind: 'point', recordId: arcRefs[0].recordId, index };
+      }
+    }
+    return null;
+  }
   if (!lineRef || !arcRef) return null;
   const line = model.resolveSegment(lineRef);
   const arc = model.resolveEntity(arcRef);
@@ -1001,10 +1014,13 @@ export class SolverController {
     ));
     const offender = dimension
       ? this.dimensions.qualifiedName(dimension)
-      : constraint ? `${constraint.type} (${constraint.id})` : 'unknown relationship';
+      : constraint?.type;
+    const detail = offender
+      ? `Largest remaining constraint error: ${offender}.`
+      : 'The solver could not isolate an individual constraint.';
     return {
       ...result,
-      message: `${result?.message || 'Solve failed.'} Stack ${names.map((name) => `"${name}"`).join(', ')}; offender: ${offender}.`,
+      message: `${result?.message || 'Solve failed.'} Stack ${names.map((name) => `"${name}"`).join(', ')}. ${detail}`,
       offender: {
         stackIds: [...stackIds],
         constraintId: constraint?.id || null,
@@ -1410,6 +1426,7 @@ export class SolverController {
       dxfExportUnit: this.dxfExportUnit,
       filletRadius: this.filletRadius,
       entities: this.getGeometrySnapshot(),
+      derivedEntities: [...this.model.derivedEntities.values()].map(clone),
       constraints: this.constraints(),
       parameters,
       dimensions: clone(parameters),
@@ -1663,7 +1680,9 @@ export class SolverController {
   }
 
   applyAuthoritativeEntities(entities = [], workerResult = {}) {
-    if (workerResult.stackState) this.setStackState(workerResult.stackState, { rewriteExpressions: false, emit: false });
+    if (workerResult.stackState && JSON.stringify(workerResult.stackState) !== JSON.stringify(this.stackState)) {
+      this.setStackState(workerResult.stackState, { rewriteExpressions: false, emit: false });
+    }
     const changedEntityIds = [];
     try {
       entities.forEach((entity) => {
@@ -1828,6 +1847,8 @@ export class SolverController {
       this.model.removeConstraint(constraint.id);
       this.invalidateConstraintGraph();
       restoreEntities(this.model, before);
+      result = { ...result, message: `Could not add ${constraint.type}. ${result.message || 'The existing constraints could not be satisfied.'}` };
+      this.lastResult = result;
       this.emit();
       return { constraint: null, result, snapshot: this.getGeometrySnapshot() };
     }
@@ -2760,6 +2781,8 @@ export class SolverController {
   }
 
   setDerivedEntity(entity) {
+    const existing = this.model.derivedEntity(entity?.id);
+    if (existing && JSON.stringify(existing) === JSON.stringify(entity)) return existing;
     const result = this.model.setDerivedEntity(entity);
     if (this.constraintGraph) this.constraintGraph.updateDerivedEntity(result.id);
     return result;

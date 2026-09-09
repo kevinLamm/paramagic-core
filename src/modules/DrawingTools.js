@@ -32,6 +32,10 @@ export function drawingArcFromPoints(start, arcPoint, end) {
 }
 
 // --- Curve Control Points Utilities ---
+export function isCurvePointDeleteGesture(event, toolActive = false) {
+  return !toolActive && event.button === 0 && event.altKey && (event.ctrlKey || event.metaKey) && !event.shiftKey;
+}
+
 const distanceSquared = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2;
 
 function controlPoint(current, previous, next, tension = 0.18) {

@@ -129,6 +129,14 @@ export class SolverWorkerClient {
     return this.request('load-sketch', { snapshot });
   }
 
+  applyGeometry(entities, result) {
+    return this.request('apply-geometry', { entities, result });
+  }
+
+  updateModel(updates) {
+    return this.request('update-model', { updates });
+  }
+
   getSnapshot() {
     return this.request('get-snapshot');
   }
@@ -147,6 +155,11 @@ export class SolverWorkerClient {
 
   updateEntities(entities, options = {}) {
     return this.request('update-entities', { entities, lockedVariableIds: options.lockedVariableIds || [] });
+  }
+
+  supersedeInteractivePreview() {
+    // Pointer input is newer even before the next animation frame dispatches it.
+    this.latestInteractiveGeneration = this.nextGeneration;
   }
 
   dragUpdate(entities, options = {}) {

@@ -2,6 +2,8 @@ export const SOLVER_WORKER_PROTOCOL_VERSION = 1;
 
 export const solverWorkerCommandTypes = new Set([
   'load-sketch',
+  'update-model',
+  'apply-geometry',
   'get-snapshot',
   'solve',
   'add-entity',
@@ -22,7 +24,15 @@ const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Arra
 const isNonNegativeInteger = (value) => Number.isInteger(value) && value >= 0;
 const isId = (value) => typeof value === 'string' && value.length > 0;
 
+export const solverModelUpdateMethods = new Set([
+  'updateDimensionAnnotation', 'setDerivedEntity', 'updateEntity', 'setStackState', 'setExternalStackRelationships',
+]);
+
 function validatePayload(type, payload) {
+  if (type === 'update-model' && (!Array.isArray(payload.updates) || payload.updates.some((update) =>
+    !solverModelUpdateMethods.has(update?.method) || !Array.isArray(update.args)
+  ))) throw new TypeError('update-model requires supported model updates.');
+  if (type === 'apply-geometry' && !Array.isArray(payload.entities)) throw new TypeError('apply-geometry requires entities.');
   if (type === 'load-sketch' && !isRecord(payload.snapshot)) throw new TypeError('load-sketch requires a snapshot object.');
   if (type === 'solve' && payload.options !== undefined && !isRecord(payload.options)) throw new TypeError('solve options must be an object.');
   if (type === 'add-entity' && !isRecord(payload.entity)) throw new TypeError('add-entity requires an entity object.');

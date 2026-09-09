@@ -556,6 +556,23 @@ export const residualImplementations = {
     }
     if (!lineRef && roundRefs.length === 2) {
       const [a, b] = roundRefs.map((ref) => entity(model, ref));
+      if (constraint.tangentPoint && roundRefs.every(ref => ref.kind === 'arc')) {
+        const joint = point(model, constraint.tangentPoint);
+        const radialA = subtract(a.center, joint);
+        const radialB = subtract(b.center, joint);
+        const radialScale = Math.max(1e-12, length(radialA) * length(radialB));
+        const other = constraint.tangentPoint.recordId === roundRefs[0].recordId ? b : a;
+        const otherRadius = length(subtract(other.center, joint));
+        const orientation = constraint.tangentMode === 'internal' ? 1 : -1;
+        // At a joined endpoint, circle-distance error is quadratic in the
+        // tangent angle. Radial alignment retains a first-order angular error.
+        // Point-on-circle preserves contact even if Coincident is later removed.
+        return [
+          cross(radialA, radialB) / radialScale,
+          (otherRadius - other.radius) / safeScale(otherRadius, other.radius),
+          Math.min(0, orientation * dot(radialA, radialB) / radialScale),
+        ];
+      }
       const centerDistanceSquared = pointDistance2(a.center, b.center);
       const targetDistance = constraint.tangentMode === 'internal'
         ? Math.abs(a.radius - b.radius)
@@ -643,12 +660,11 @@ export function evaluateConstraint(model, constraint, dimensions) {
 
 // --- Levenberg-Marquardt Optimizer ---
 function diagnosticConstraints(evaluation) {
-  return evaluation.values
+  return [...new Set(evaluation.values
     .map((value, index) => ({ value: Math.abs(value), constraintId: evaluation.equations[index]?.constraintId }))
+    .filter((item) => item.constraintId && item.value > 0)
     .sort((a, b) => b.value - a.value)
-    .slice(0, 5)
-    .filter((item) => item.value > 1e-6)
-    .map((item) => item.constraintId);
+    .map((item) => item.constraintId))].slice(0, 5);
 }
 
 function pointReferenceKey(model, reference) {
