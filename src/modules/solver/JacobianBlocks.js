@@ -262,6 +262,7 @@ export function createMatrixFreeJacobian(contract, options = {}) {
     columnCount,
     diagonal,
     normalBlocks,
+    blocks: evaluatedBlocks,
     diagnostics,
     applyJacobian,
     applyJacobianTranspose,

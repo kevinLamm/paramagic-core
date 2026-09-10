@@ -33,6 +33,8 @@ function aggregateJacobianStats(results, requestedMode) {
   let derivativeEntries = 0;
   let linearIterations = 0;
   let linearConverged = true;
+  const linearSolvers = new Set();
+  let factorEntries = 0;
   results.forEach((result) => {
     const componentStats = result?.jacobianStats;
     if (!componentStats) return;
@@ -43,6 +45,8 @@ function aggregateJacobianStats(results, requestedMode) {
     stats.fallbackBlocks += Number(componentStats.fallbackBlocks) || 0;
     stats.residualRows += Number(componentStats.residualRows) || 0;
     if (componentStats.mode === 'matrix-free') {
+      if (componentStats.linearSolver) linearSolvers.add(componentStats.linearSolver);
+      factorEntries += Number(componentStats.factorEntries) || 0;
       matrixFreeComponentCount += 1;
       derivativeEntries += Number(componentStats.derivativeEntries) || 0;
       linearIterations += Number(componentStats.linearIterations) || 0;
@@ -54,6 +58,8 @@ function aggregateJacobianStats(results, requestedMode) {
   if (fallbackReasons.size === 1) stats.fallbackReason = [...fallbackReasons][0];
   else if (fallbackReasons.size > 1) stats.fallbackReason = [...fallbackReasons].sort().join(', ');
   if (matrixFreeComponentCount) {
+    if (linearSolvers.size) stats.linearSolver = linearSolvers.size === 1 ? [...linearSolvers][0] : 'mixed';
+    if (factorEntries) stats.factorEntries = factorEntries;
     stats.matrixFreeComponentCount = matrixFreeComponentCount;
     stats.derivativeEntries = derivativeEntries;
     stats.linearIterations = linearIterations;

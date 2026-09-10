@@ -72,6 +72,7 @@ const normalizedDirection = (value) => {
 const drawingUnits = new Set(['in', 'mm', 'cm', 'm', 'ft']);
 const simpleLength = /^([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?)\s*(in|mm|cm|m|ft)?$/i;
 const maximumDimensionContinuationSteps = 64;
+const parameterCorrectorIterations = 200;
 const proactiveDimensionContinuationThreshold = 0.25;
 const dimensionContinuationStepsPerRange = 32;
 const interactivePreviewSquaredErrorLimit = 1e-8;
@@ -2640,14 +2641,21 @@ export class SolverController {
           stepCount,
         );
       } else {
-        result = this.solve({ seedDimensionIds: affectedDimensionIds });
+        const recoveryStepCount = dimensionTargetContinuationStepCount(
+          beforeDimensions,
+          targetDimensions,
+          continuationDimensionIds,
+          { force: true },
+        );
+        // A direct parameter edit is one corrector attempt. When a continuation
+        // route exists, use its correction budget rather than exhausting the
+        // general solver's full budget before changing strategy.
+        result = this.solve({
+          seedDimensionIds: affectedDimensionIds,
+          ...(recoveryStepCount > 1 ? { maxIterations: parameterCorrectorIterations } : {}),
+        });
         if (!isSuccessfulSolve(result) && continuationDimensionIds.length) {
-          stepCount = dimensionTargetContinuationStepCount(
-            beforeDimensions,
-            targetDimensions,
-            continuationDimensionIds,
-            { force: true },
-          );
+          stepCount = recoveryStepCount;
           if (stepCount > 1) {
             this.dimensions.restoreEntries(beforeDimensions, { emit: false });
             result = this.solveParameterContinuation(
@@ -2704,19 +2712,59 @@ export class SolverController {
       return this.solve({ seedDimensionIds: dimensionIds });
     }
     const results = [];
-    for (let step = 1; step <= stepCount; step += 1) {
-      const fraction = step / stepCount;
+    const variableSnapshot = () => new Map(this.model.allVariables().map((variable) => [variable.id, variable.value]));
+    let currentValues = variableSnapshot();
+    let previousValues = null;
+    let previousFraction = 0;
+    let fraction = 0;
+    const maximumStep = 1 / stepCount;
+    let stepSize = maximumStep;
+    // Follow the same solution branch with a secant predictor. Re-solving each
+    // target from stationary geometry lets a large translation bend tangent
+    // profiles instead. Failed correctors reduce the step, never the accuracy.
+    for (let attempt = 0; attempt < maximumDimensionContinuationSteps * 2 && fraction < 1; attempt += 1) {
+      const nextFraction = fraction + stepSize >= 1 - 1e-12 ? 1 : fraction + stepSize;
+      const beforeStep = this.snapshotGeometryForSeeds({ dimensionIds });
       interpolatedDimensions.forEach(({ before, target }) => {
         const intermediateValue = Number(before.value)
-          + (Number(target.value) - Number(before.value)) * fraction;
+          + (Number(target.value) - Number(before.value)) * nextFraction;
         this.dimensions.set({
           ...this.dimensions.get(target.id),
           expression: exactDimensionValueExpression(intermediateValue, target.unit),
         });
       });
-      const result = this.solve({ seedDimensionIds: dimensionIds });
+      const predictedEntityIds = new Set();
+      if (previousValues && fraction > previousFraction) {
+        const ratio = (nextFraction - fraction) / (fraction - previousFraction);
+        for (const variable of this.model.allVariables()) {
+          if (!variable.active || !previousValues.has(variable.id)) continue;
+          const current = currentValues.get(variable.id);
+          const delta = (current - previousValues.get(variable.id)) * ratio;
+          if (!Number.isFinite(delta) || Math.abs(delta) <= 1e-12) continue;
+          variable.value = current + delta;
+          predictedEntityIds.add(variable.ownerId);
+        }
+      }
+      let result = this.solve({ seedDimensionIds: dimensionIds, maxIterations: parameterCorrectorIterations });
+      if (isSuccessfulSolve(result) && predictedEntityIds.size) {
+        result = { ...result, status: 'converged', changedEntityIds: [...new Set([...predictedEntityIds, ...(result.changedEntityIds || [])])] };
+      }
       results.push(result);
-      if (!isSuccessfulSolve(result)) return combineContinuationResults(results);
+      if (!isSuccessfulSolve(result)) {
+        this.restoreGeometryTransaction(beforeStep);
+        stepSize /= 2;
+        if (stepSize < 1e-6 || !['max-iterations', 'failed'].includes(result.status)) return combineContinuationResults(results);
+        continue;
+      }
+      previousValues = currentValues;
+      currentValues = variableSnapshot();
+      previousFraction = fraction;
+      fraction = nextFraction;
+      stepSize = Math.min(maximumStep, 1 - fraction, stepSize * 2);
+    }
+    if (fraction < 1) {
+      results.push({ status: 'max-iterations', changedEntityIds: [], message: 'Parameter continuation did not reach the requested value; geometry was restored.' });
+      return combineContinuationResults(results);
     }
     this.dimensions.restoreEntries(targetEntries, { emit: false });
     this.lastResult = combineContinuationResults(results);

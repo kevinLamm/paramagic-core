@@ -574,7 +574,7 @@ function lineLineDistance({ model, constraint, dimensions, variables }) {
     vectorBetween(reference.start, measuredMidpoint),
     'cross',
   );
-  const signedDistance = quotientScalar(
+  const signedDistance = normalizedByScale(
     signedNumerator,
     referenceLength,
   );

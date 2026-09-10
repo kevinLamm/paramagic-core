@@ -86,6 +86,7 @@ export function sanitizeCanvasPresentationClone(source, {
 } = {}) {
   const valueOnly = dimensionTextMode === 'value';
   const cloneNode = source.cloneNode(true);
+  const referencedIds = svgReferenceIds(source);
   replaceDrawingTextForeignObjects(source, cloneNode);
   replaceTableCellForeignObjects(source, cloneNode);
   if (valueOnly) prepareNotchValueOnlyPresentationClone(cloneNode);
@@ -100,7 +101,9 @@ export function sanitizeCanvasPresentationClone(source, {
   const nodes = [cloneNode, ...(cloneNode.querySelectorAll?.('*') || [])];
   nodes.forEach((node) => {
     TRANSIENT_CLASSES.forEach((name) => node.classList?.remove?.(name));
-    node.removeAttribute?.('id');
+    // Embedded paint servers (notably image-stroke patterns) must keep their
+    // identity until the complete presentation can rebind its references.
+    if (!referencedIds.has(node.getAttribute?.('id'))) node.removeAttribute?.('id');
     node.removeAttribute?.('aria-label');
     node.removeAttribute?.('aria-hidden');
     node.removeAttribute?.('role');
@@ -208,6 +211,40 @@ function svgReferenceIds(root) {
   return ids;
 }
 
+let presentationSequence = 0;
+
+// SVG fragment references resolve across the document, not just the nearest
+// SVG. Every mounted presentation, including a clone of a preview, therefore
+// needs its own definition IDs so hiding the canvas cannot hide its paints.
+export function namespaceCanvasPresentationIds(svg) {
+  const nodes = svgElementTree(svg);
+  const prefix = `canvas-presentation-${++presentationSequence}`;
+  const ids = new Map();
+  nodes.forEach((node) => {
+    const id = node.getAttribute?.('id');
+    if (id && !ids.has(id)) ids.set(id, `${prefix}-${ids.size}`);
+  });
+  nodes.forEach((node) => {
+    const id = node.getAttribute?.('id');
+    if (ids.has(id)) node.setAttribute('id', ids.get(id));
+    [...(node.attributes || [])].forEach((attribute) => {
+      const name = String(attribute.localName || attribute.name || '').toLowerCase();
+      const original = String(attribute.value || '');
+      let value = original.replace(/url\(\s*['"]?#([^\s)'"]+)['"]?\s*\)/gi,
+        (reference, target) => ids.has(target) ? `url(#${ids.get(target)})` : reference);
+      if ((name === 'href' || name.endsWith(':href')) && ids.has(value.trim().slice(1))
+        && value.trim().startsWith('#')) {
+        value = `#${ids.get(value.trim().slice(1))}`;
+      }
+      if (value !== original) {
+        if (attribute.namespaceURI) node.setAttributeNS(attribute.namespaceURI, attribute.name, value);
+        else node.setAttribute(attribute.name, value);
+      }
+    });
+  });
+  return svg;
+}
+
 export function canvasPresentationDefinitionRoots(objectLayer, content) {
   const ownerSvg = objectLayer?.ownerSVGElement;
   const definitions = [...(ownerSvg?.children || [])]
@@ -281,7 +318,7 @@ export function createCanvasPresentationSvg({
     }));
   }
   svg.appendChild(content);
-  return svg;
+  return namespaceCanvasPresentationIds(svg);
 }
 
 export function mountCanvasPresentationSvg(host, options = {}) {

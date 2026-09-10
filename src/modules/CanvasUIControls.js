@@ -1037,7 +1037,7 @@ function controlRuntimeMarkup(item, state) {
         step="${escapeHtml(state.step)}" value="${escapeHtml(state.value)}"
         aria-label="${escapeHtml(item.label || item.parameterName)}" />
       <input class="panel-control-number panel-control-slider-value" data-control-value type="number"
-        min="${escapeHtml(state.minimum)}" max="${escapeHtml(state.maximum)}" step="any"
+        min="${escapeHtml(state.minimum)}" max="${escapeHtml(state.maximum)}" step="${escapeHtml(state.step)}"
         inputmode="decimal" value="${escapeHtml(state.value)}"
         aria-label="${escapeHtml(item.label || item.parameterName)} value" />
     </div>`;
@@ -1372,7 +1372,7 @@ export function createControlTools({
         if (valueInput && document.activeElement !== valueInput) {
           valueInput.min = String(state.minimum);
           valueInput.max = String(state.maximum);
-          valueInput.step = 'any';
+          valueInput.step = String(state.step);
           valueInput.value = String(state.value);
         }
       } else if (item.controlType === 'checkbox') {

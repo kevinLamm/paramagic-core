@@ -5,7 +5,8 @@ import {
   createMatrixFreeJacobian,
   JacobianBlockCancellationError,
 } from './JacobianBlocks.js';
-import { ARC_MIDPOINT_ROLE } from '../ArcGeometry.js';
+import { prepareArcSolveGeometry } from './ArcSolveGeometry.js';
+import { compileConstraintSystem } from './CompiledConstraintSystem.js';
 
 // --- DimensionRepository Compatibility ---
 export class DimensionRepository extends ParameterRepository {}
@@ -667,131 +668,6 @@ function diagnosticConstraints(evaluation) {
     .map((item) => item.constraintId))].slice(0, 5);
 }
 
-function pointReferenceKey(model, reference) {
-  const recordId = reference?.recordId;
-  if (!recordId) return null;
-  const type = reference.kind || reference.type;
-  if (type === 'point') {
-    return reference.pointRole === ARC_MIDPOINT_ROLE
-      ? `${recordId}:${ARC_MIDPOINT_ROLE}`
-      : `${recordId}:${Number(reference.index) || 0}`;
-  }
-  if (type !== 'segment-start' && type !== 'segment-end') return null;
-  const binding = model.binding?.(recordId);
-  if (!binding) return null;
-  const segmentIndex = Number(reference.index) || 0;
-  if (binding.type === 'line' || binding.type === 'arc') {
-    return `${recordId}:${type === 'segment-start' ? 0 : 2}`;
-  }
-  if (binding.type === 'polygon' || binding.type === 'polyline') {
-    const pointCount = binding.metadata?.pointCount || 0;
-    if (!pointCount) return null;
-    const pointIndex = type === 'segment-start'
-      ? segmentIndex
-      : (segmentIndex + 1) % pointCount;
-    return `${recordId}:${pointIndex}`;
-  }
-  return null;
-}
-
-function coincidentPointRootResolver(model, constraints) {
-  const parents = new Map();
-  const find = (key) => {
-    if (!parents.has(key)) parents.set(key, key);
-    const parent = parents.get(key);
-    if (parent === key) return key;
-    const root = find(parent);
-    parents.set(key, root);
-    return root;
-  };
-  const union = (first, second) => {
-    const firstRoot = find(first);
-    const secondRoot = find(second);
-    if (firstRoot !== secondRoot) parents.set(secondRoot, firstRoot);
-  };
-  for (const constraint of constraints) {
-    if (constraint.enabled === false || constraint.type !== 'Coincident') continue;
-    const keys = (constraint.featureRefs || [])
-      .map((reference) => pointReferenceKey(model, reference))
-      .filter(Boolean);
-    if (keys.length >= 2) union(keys[0], keys[1]);
-  }
-  return (reference) => {
-    const key = pointReferenceKey(model, reference);
-    return key ? find(key) : null;
-  };
-}
-
-function hasHalfChordDistanceTarget(constraints, dimensions, binding, targetRadius, rootForReference) {
-  const arcRoots = [
-    rootForReference({ type: 'point', recordId: binding.id, index: 0 }),
-    rootForReference({ type: 'point', recordId: binding.id, index: 2 }),
-  ];
-  if (arcRoots.some((root) => !root)) return false;
-  for (const constraint of constraints) {
-    if (constraint.enabled === false || constraint.type !== 'Distance' || !constraint.dimensionRef) continue;
-    const distanceRoots = [
-      rootForReference(constraint.anchors?.start || constraint.featureRefs?.[0]),
-      rootForReference(constraint.anchors?.end || constraint.featureRefs?.[1]),
-    ];
-    const sameEndpoints = (
-      distanceRoots[0] === arcRoots[0] && distanceRoots[1] === arcRoots[1]
-    ) || (
-      distanceRoots[0] === arcRoots[1] && distanceRoots[1] === arcRoots[0]
-    );
-    if (!sameEndpoints) continue;
-    const targetChord = Number(dimensions.value(constraint.dimensionRef));
-    const expectedChord = targetRadius * 2;
-    const matchTolerance = Math.max(1e-7, Math.max(Math.abs(targetChord), Math.abs(expectedChord)) * 1e-8);
-    if (Number.isFinite(targetChord) && Math.abs(targetChord - expectedChord) <= matchTolerance) return true;
-  }
-  return false;
-}
-
-// At the semicircle limit, radius - target is quadratic in the arc center's
-// distance from the chord and its first derivative vanishes at the solution.
-// Keep the implied center-at-midpoint relationship active throughout every
-// Jacobian evaluation so later constraints can move the semicircle as a unit.
-function createHalfChordArcProjection(model, dimensions) {
-  const constraints = model.constraints?.values ? [...model.constraints.values()] : [];
-  if (!constraints.length) return null;
-  const rootForReference = coincidentPointRootResolver(model, constraints);
-  const projectedBindings = [];
-  for (const constraint of constraints) {
-    if (constraint.enabled === false || constraint.type !== 'Radius' || !constraint.dimensionRef) continue;
-    const ref = constraint.featureRefs?.[0];
-    const binding = ref?.recordId ? model.binding(ref.recordId) : null;
-    if (binding?.type !== 'arc') continue;
-    const centerX = binding.variables.get('center.x');
-    const centerY = binding.variables.get('center.y');
-    if (!centerX?.active || !centerY?.active) continue;
-    const targetRadius = Number(dimensions.value(constraint.dimensionRef));
-    if (!Number.isFinite(targetRadius) || targetRadius <= 0) continue;
-    const start = binding.point('start');
-    const end = binding.point('end');
-    const halfChord = Math.hypot(end[0] - start[0], end[1] - start[1]) / 2;
-    const matchTolerance = Math.max(1e-7, Math.max(Math.abs(targetRadius), halfChord) * 1e-8);
-    const matchesCurrentChord = Math.abs(targetRadius - halfChord) <= matchTolerance;
-    const matchesDrivingChord = hasHalfChordDistanceTarget(
-      constraints,
-      dimensions,
-      binding,
-      targetRadius,
-      rootForReference,
-    );
-    if (matchesCurrentChord || matchesDrivingChord) projectedBindings.push(binding);
-  }
-  if (!projectedBindings.length) return null;
-  return () => {
-    for (const binding of projectedBindings) {
-      const start = binding.point('start');
-      const end = binding.point('end');
-      binding.variables.get('center.x').value = (start[0] + end[0]) / 2;
-      binding.variables.get('center.y').value = (start[1] + end[1]) / 2;
-    }
-  };
-}
-
 export const DEFAULT_MAX_ITERATIONS = 2000;
 export const DEFAULT_SOLVE_TOLERANCE = 1e-3;
 export const DEFAULT_MATRIX_FREE_VARIABLE_THRESHOLD = 192;
@@ -855,13 +731,14 @@ export function solveLevenbergMarquardt({
     });
   }
   const allVariables = model.allVariables();
-  const activeVariables = model.activeVariables();
+  const originalActiveVariables = model.activeVariables();
+  let activeVariables = originalActiveVariables;
   const initialValues = allVariables.map((variable) => variable.value);
-  let projectHalfChordArcs = null;
+  let arcGeometry = null;
   const evaluate = () => {
     const started = now();
     try {
-      projectHalfChordArcs?.();
+      arcGeometry?.project();
       return registry.evaluate(model, dimensions);
     } finally {
       timings.residualMs += now() - started;
@@ -875,20 +752,23 @@ export function solveLevenbergMarquardt({
   }
   const initialError = squaredNorm(evaluation.values);
   if (initialError < convergenceThreshold) return finish({ status: 'unchanged', iterations: 0, initialError, finalError: initialError, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: [], problematicConstraintIds: [], message: 'Constraints already satisfied.' });
-  projectHalfChordArcs = createHalfChordArcProjection(model, dimensions);
-  if (projectHalfChordArcs) {
-    try {
+  try {
+    arcGeometry = prepareArcSolveGeometry(model, dimensions, originalActiveVariables);
+    activeVariables = arcGeometry.variables;
+    if (arcGeometry.changed) {
       evaluation = evaluate();
-    } catch (error) {
-      allVariables.forEach((variable, index) => { variable.value = initialValues[index]; });
-      return finish({ status: 'invalid', iterations: 0, initialError, finalError: initialError, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: [], problematicConstraintIds: diagnosticConstraints(evaluation), message: error.message });
     }
+  } catch (error) {
+    allVariables.forEach((variable, index) => { variable.value = initialValues[index]; });
+    return finish({ status: 'invalid', iterations: 0, initialError, finalError: initialError, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: [], problematicConstraintIds: diagnosticConstraints(evaluation), message: error.message });
   }
   let jacobianContract = null;
   let useMatrixFreeJacobian = false;
-  if (requestedJacobianMode === 'blocks' && !projectHalfChordArcs) {
+  let compiledSystem;
+  const hasArcs = originalActiveVariables.some(variable => model.binding?.(variable.ownerId)?.type === 'arc');
+  if (requestedJacobianMode === 'blocks') {
     try {
-      jacobianContract = registry.blocks(model, dimensions, { variables: activeVariables });
+      jacobianContract = arcGeometry.reduceBlocks(registry.blocks(model, dimensions, { variables: originalActiveVariables }));
       useMatrixFreeJacobian = activeVariables.length >= resolvedMatrixFreeThreshold;
       jacobianStats.mode = useMatrixFreeJacobian ? 'matrix-free' : 'blocks';
       if (useMatrixFreeJacobian) {
@@ -902,9 +782,9 @@ export function solveLevenbergMarquardt({
       return finish({ status: 'invalid', iterations: 0, initialError, finalError: initialError, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: [], problematicConstraintIds: diagnosticConstraints(evaluation), message: error.message });
     }
   } else {
-    jacobianStats.mode = requestedJacobianMode === 'blocks' ? 'dense-reference' : 'dense';
-    if (projectHalfChordArcs) jacobianStats.fallbackReason = 'half-chord-arc-projection';
+    jacobianStats.mode = 'dense';
   }
+  if (arcGeometry.reducedArcCenters) jacobianStats.reducedArcCenters = arcGeometry.reducedArcCenters;
   let error = squaredNorm(evaluation.values);
   const changedEntityIds = () => [...new Set(allVariables
     .filter((variable, index) => Math.abs(variable.value - initialValues[index]) > 1e-10)
@@ -948,7 +828,10 @@ export function solveLevenbergMarquardt({
   if (error < convergenceThreshold) {
     return finish({ status: 'converged', iterations: 0, initialError, finalError: error, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: changedEntityIds(), problematicConstraintIds: [], message: 'Constraints converged.' });
   }
-  if (!activeVariables.length) return finish({ status: 'failed', iterations: 0, initialError, finalError: initialError, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: [], problematicConstraintIds: diagnosticConstraints(evaluation), message: 'No free variables are available to satisfy the constraints.' });
+  if (!activeVariables.length) {
+    allVariables.forEach((variable, index) => { variable.value = initialValues[index]; });
+    return finish({ status: 'failed', iterations: 0, initialError, finalError: initialError, acceptedSteps: 0, rejectedSteps: 0, changedEntityIds: [], problematicConstraintIds: diagnosticConstraints(evaluation), message: 'No free variables are available to satisfy the constraints.' });
+  }
 
   let lambda = 0.01;
   let acceptedSteps = 0;
@@ -965,6 +848,14 @@ export function solveLevenbergMarquardt({
     const jacobianStarted = now();
     try {
       if (useMatrixFreeJacobian) {
+        if (compiledSystem === undefined) {
+          compiledSystem = hasArcs ? compileConstraintSystem(jacobianContract, { shouldCancel: cancellationCheck }) : null;
+          jacobianStats.linearSolver = compiledSystem ? 'compiled-elimination' : 'iterative-pcg';
+          if (compiledSystem) {
+            jacobianStats.factorEntries = compiledSystem.fillEntries;
+            jacobianStats.symbolicCacheHit = compiledSystem.cacheHit;
+          }
+        }
         jacobianOperator = createMatrixFreeJacobian(jacobianContract, { shouldCancel: cancellationCheck });
         if (jacobianOperator.rowCount !== errors.length) {
           throw new Error('Matrix-free Jacobian row count does not match the current residual vector.');
@@ -987,14 +878,15 @@ export function solveLevenbergMarquardt({
     } finally {
       timings.jacobianMs += now() - jacobianStarted;
     }
-    projectHalfChordArcs?.();
+    arcGeometry?.project();
     let step;
     const linearStarted = now();
     try {
       if (jacobianOperator) {
-        const linearResult = solveMatrixFreeDampedLeastSquares(jacobianOperator, errors, lambda, {
-          shouldCancel: cancellationCheck,
-        });
+        const linearOptions = { shouldCancel: cancellationCheck };
+        const linearResult = compiledSystem
+          ? compiledSystem.solve(jacobianOperator, errors, lambda, linearOptions)
+          : solveMatrixFreeDampedLeastSquares(jacobianOperator, errors, lambda, linearOptions);
         step = linearResult.step;
         jacobianStats.linearIterations = linearResult.iterations;
         jacobianStats.linearConverged = linearResult.converged;
@@ -1047,6 +939,7 @@ export function solveLevenbergMarquardt({
       }
     } else {
       activeVariables.forEach((variable, index) => { variable.value = previous[index]; });
+      arcGeometry.project();
       rejectedSteps += 1;
       lambda *= 10;
       if (!Number.isFinite(lambda) || lambda > MAX_LEVENBERG_MARQUARDT_DAMPING) {

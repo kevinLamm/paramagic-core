@@ -319,6 +319,7 @@ async function svgMarkupImage(markup, {
 }
 
 export async function rasterizePresentationSvg(svg, width, height, {
+  background = '#ffffff',
   createCanvas = () => globalThis.document?.createElement('canvas'),
   embedImageAssets = embedSvgImageAssets,
   inlinePresentationStyles = inlinePngPresentationStyles,
@@ -344,8 +345,10 @@ export async function rasterizePresentationSvg(svg, width, height, {
     if (!context) {
       throw new Error('This browser cannot rasterize PNG exports.');
     }
-    context.fillStyle = '#ffffff';
-    context.fillRect(0, 0, width, height);
+    if (background !== null) {
+      context.fillStyle = background;
+      context.fillRect(0, 0, width, height);
+    }
     context.drawImage(loaded.image, 0, 0, width, height);
     return canvasPngBlob(canvas);
   } finally {
