@@ -721,6 +721,7 @@ function sanitizeClone(node) {
   ].forEach((attribute) => node.removeAttribute(attribute));
   node.removeAttribute('aria-label');
   node.removeAttribute('role');
+  node.removeAttribute('tabindex');
   node.classList.remove(
     'canvas-record',
     'selected',
@@ -750,7 +751,10 @@ function sanitizeClone(node) {
     child.removeAttribute('contenteditable');
     child.classList.remove('selected', 'hovered', 'smart-selected', 'overlap-cycle-selected', 'array-source-selected', 'stack-hidden', 'stack-inactive');
     child.style.pointerEvents = 'none';
-    if ('tabIndex' in child) child.tabIndex = -1;
+    // tabindex=-1 still allows mouse focus on SVG, including through <use>.
+    // Derivative graphics leave keyboard focus on the canvas.
+    if (child.namespaceURI === SVG_NS) child.removeAttribute('tabindex');
+    else if ('tabIndex' in child) child.tabIndex = -1;
   });
   node.querySelectorAll([
     '.handle-group',

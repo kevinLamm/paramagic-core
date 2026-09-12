@@ -482,7 +482,10 @@ function sanitizeClone(node, type) {
     child.classList.remove('canvas-record', 'selected', 'hovered', 'smart-selected', 'overlap-cycle-selected', 'linked-copy-source-selected', 'symmetric-source-selected', 'stack-hidden', 'stack-inactive', 'object-visibility-hidden');
     ['id', 'data-record-id', 'data-object-visible', 'aria-label', 'role', 'contenteditable'].forEach((name) => child.removeAttribute(name));
     child.style.pointerEvents = 'none';
-    if ('tabIndex' in child) child.tabIndex = -1;
+    // SVG clones are graphics, not focus targets. Keep embedded HTML editors
+    // out of the tab order without making every SVG child mouse-focusable.
+    if (child.namespaceURI === SVG_NS) child.removeAttribute('tabindex');
+    else if ('tabIndex' in child) child.tabIndex = -1;
   });
   node.querySelectorAll('.handle-group,.segment-selection-layer,.hit-target,.image-context-toolbar,.text-selection-frame,.text-resize-handle,.text-rotation-handle,.text-rotation-stem,.notch-hit').forEach((child) => child.remove());
   node.classList.add('linked-copy-content', `${type}-copy-content`);

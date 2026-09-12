@@ -1,4 +1,5 @@
 import { createUuid } from '../IdentitySystem.js';
+import { stackNameVariable, stackExpressionRenames } from '../StackVariables.js';
 import { formatUnitValue, unitFactors } from './Units.js';
 import {
   defaultStackId as resolveDefaultStackId,
@@ -270,6 +271,25 @@ export class ParameterRepository {
   rebuildStackIndexes() {
     this.stackNamesById = new Map(this.stackState.stacks.map((stack) => [stack.id, stack.name]));
     this.stackIdsByName = new Map(this.stackState.stacks.map((stack) => [stack.name.toLocaleLowerCase(), stack.id]));
+    this.stackVariables = new Map(this.stackState.stacks.map(stack => {
+      const entry = stackNameVariable(stack);
+      return [entry.name.toLocaleLowerCase(), entry];
+    }));
+  }
+
+  externalVariable(name, stackId = null) {
+    if (this.externalVariables.has(name)) return this.externalVariables.get(name);
+    if (name.toLocaleLowerCase() === 'stackname' && stackId) {
+      return stackNameVariable(this.stackState.stacks.find(stack => stack.id === stackId), { local: true });
+    }
+    return this.stackVariables.get(name.toLocaleLowerCase());
+  }
+
+  stackVariableEntries(stackId = null) {
+    const entries = [...this.stackVariables.values()];
+    const local = stackId ? this.externalVariable('StackName', stackId) : null;
+    if (local) entries.push(local);
+    return entries;
   }
 
   defaultStackId() {
@@ -389,6 +409,7 @@ export class ParameterRepository {
       }
     });
     this.externalVariables.forEach((entry) => symbols.push({ name: entry.name, symbolKey: entry.symbolKey, caseInsensitive: false }));
+    this.stackVariableEntries(stackId).forEach(entry => symbols.push({ name: entry.name, symbolKey: entry.symbolKey, caseInsensitive: true }));
     return normalizedSymbols(symbols);
   }
 
@@ -422,12 +443,13 @@ export class ParameterRepository {
       symbolKey: entry.symbolKey,
       kind: 'external',
     }));
+    this.stackVariableEntries(stackId).forEach(entry => symbols.push({ name: entry.name, symbolKey: entry.symbolKey, kind: 'stack', stackId: entry.stackId }));
     return symbols.sort((first, second) => first.name.localeCompare(second.name, undefined, { numeric: true }));
   }
 
   expressionEntries(options = {}) {
     return this.expressionSymbols(options).map((symbol) => {
-      const entry = this.entries.get(symbol.parameterId) || this.externalVariables.get(symbol.name);
+      const entry = this.entries.get(symbol.parameterId) || this.externalVariable(symbol.name, options.stackId);
       return entry ? { ...entry, name: symbol.name, alias: Boolean(symbol.alias) } : null;
     }).filter(Boolean);
   }
@@ -460,15 +482,9 @@ export class ParameterRepository {
     this.rebuildStackIndexes();
     if (rewriteExpressions) {
       const renames = [];
-      this.entries.forEach((entry) => {
-        if (entry.kind !== 'dimension') return;
-        const beforeStackName = previousNames.get(entry.stackId);
-        const afterStackName = this.stackNamesById.get(entry.stackId);
-        if (!beforeStackName || !afterStackName || beforeStackName === afterStackName) return;
-        renames.push({
-          before: qualifiedDimensionName(entry.name, beforeStackName),
-          after: qualifiedDimensionName(entry.name, afterStackName),
-        });
+      this.stackState.stacks.forEach(stack => {
+        const previousName = previousNames.get(stack.id);
+        if (previousName) renames.push(...stackExpressionRenames([...this.entries.values()], { ...stack, name: previousName }, stack));
       });
       if (renames.length) {
         this.entries.forEach((entry) => {
@@ -936,7 +952,7 @@ export class ParameterRepository {
               allowUniqueDimension: false,
             });
             if (!dependencyId) {
-              const external = this.externalVariables.get(name);
+              const external = this.externalVariable(name, contextStackId);
               if (!external) throw new Error(`Unknown parameter: ${name}`);
               nextDependencies.add(external.symbolKey);
               const externalIsLength = typeof external.value === 'number'
@@ -1066,7 +1082,7 @@ export class ParameterRepository {
     return parseExpression(expression, (name) => {
       const id = this.idForName(name, { stackId, allowUniqueDimension: false });
       const entry = id ? this.entries.get(id) : null;
-      const external = this.externalVariables.get(name);
+      const external = this.externalVariable(name, stackId);
       if (!entry && !external) throw new Error(`Unknown parameter: ${name}`);
       if (!entry) {
         const externalIsLength = typeof external.value === 'number' && external.unit && external.unit !== 'deg';
@@ -1087,7 +1103,7 @@ export class ParameterRepository {
     return parseExpression(expression, (name) => {
       const id = this.idForName(name, { stackId, allowUniqueDimension: false });
       const entry = id ? this.entries.get(id) : null;
-      const external = this.externalVariables.get(name);
+      const external = this.externalVariable(name, stackId);
       if (!entry && !external) throw new Error(`Unknown parameter: ${name}`);
       if (!entry) {
         const externalIsLength = typeof external.value === 'number' && external.unit && external.unit !== 'deg';
@@ -1114,7 +1130,7 @@ export class ParameterRepository {
     const value = parseExpression(expression, (name) => {
       const id = this.idForName(name, { stackId, allowUniqueDimension: false });
       const entry = id ? this.entries.get(id) : null;
-      const external = this.externalVariables.get(name);
+      const external = this.externalVariable(name, stackId);
       if (!entry && !external) throw new Error(`Unknown parameter: ${name}`);
       if (!entry) return external.value;
       this.assertEntryAvailable(entry, name);

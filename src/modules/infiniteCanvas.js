@@ -66,6 +66,7 @@ import {
   createStackActivationSystem,
 } from './StackActivationSystem.js';
 import { qualifiedDimensionName, rewriteQualifiedDimensionReferences } from './NamingSystem.js';
+import { stackExpressionRenames } from './StackVariables.js';
 import { pruneDormantStackRelationships } from './StackRelationshipSystem.js';
 import { createObjectVisibilitySystem } from './ObjectVisibility.js';
 import { createClassSystem, isClassGeometryEntity } from './ClassSystem.js';
@@ -4476,12 +4477,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       if (!stackSystem.renameStack(stackId, name, { notify: false })) return false;
       const afterStack = stackSystem.stack(stackId);
       if (!afterStack || beforeStack.name === afterStack.name) return true;
-      const renames = (beforeDrawing.parameters || [])
-        .filter((parameter) => parameter.kind === 'dimension' && parameter.stackId === stackId)
-        .map((parameter) => ({
-          before: qualifiedDimensionName(parameter.name, beforeStack.name),
-          after: qualifiedDimensionName(parameter.name, afterStack.name),
-        }));
+      const renames = stackExpressionRenames(beforeDrawing.parameters, beforeStack, afterStack);
       const rewritten = rewriteQualifiedDimensionReferences(beforeDrawing, renames);
       rewritten.extensions = {
         ...(rewritten.extensions || {}),
