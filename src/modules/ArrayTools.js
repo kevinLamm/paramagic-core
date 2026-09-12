@@ -2077,7 +2077,9 @@ export function createArrayTools({ toolbar, canvas, derivativeSourceProviders = 
   }
 
   function removeOrphanedDefinitions() {
-    const entities = entityMap();
+    // A source in a disabled Stack still exists. Never prune persistent Array
+    // definitions against the filtered geometry used for rendering/solving.
+    const entities = new Map((canvas.getDrawingData().entities || []).map((entity) => [entity.id, entity]));
     const missingRecordIds = uniqueIds(arrays.flatMap((definition) => [
       ...definition.sourceIds,
       ...(definition.centerRef?.recordId ? [definition.centerRef.recordId] : []),

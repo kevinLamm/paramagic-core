@@ -1331,7 +1331,9 @@ export function createLinkedCopyTools({ toolbar, canvas }) {
     syncSourceHighlights();
   });
   function updateLinkedSources() {
-    const entities = entityMap();
+    // Source lifetime belongs to the full drawing. The processing snapshot
+    // excludes disabled Stacks and must only govern evaluation/presentation.
+    const entities = new Map((canvas.getDrawingData().entities || []).map((entity) => [entity.id, entity]));
     for (let index = definitions.length - 1; index >= 0; index -= 1) {
       definitions[index].sourceIds = definitions[index].sourceIds.filter((id) => accepts(entities.get(id), definitions[index].type));
       if (definitions[index].sourceIds.length) continue;

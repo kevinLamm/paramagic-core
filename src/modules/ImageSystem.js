@@ -2919,19 +2919,25 @@ export async function embedSvgImageAssets(svgInput, {
 
 export async function embedPortableImageAssets(documentInput, {
   fetchAsset = defaultFetchAsset,
+  onAssetError,
 } = {}) {
   const document = cloneWarp(documentInput);
   const images = [];
   for (const reference of collectDrawingImageReferences(document)) {
-    const asset = await fetchAsset(reference);
-    const bytes = asset.bytes instanceof Uint8Array ? asset.bytes : new Uint8Array(asset.bytes);
-    images.push({
-      reference,
-      fileName: asset.fileName || reference.split('/').at(-1) || 'image',
-      mimeType: asset.mimeType,
-      sha256: asset.sha256 || await sha256(bytes),
-      dataBase64: bytesToBase64(bytes),
-    });
+    try {
+      const asset = await fetchAsset(reference);
+      const bytes = asset.bytes instanceof Uint8Array ? asset.bytes : new Uint8Array(asset.bytes);
+      images.push({
+        reference,
+        fileName: asset.fileName || reference.split('/').at(-1) || 'image',
+        mimeType: asset.mimeType,
+        sha256: asset.sha256 || await sha256(bytes),
+        dataBase64: bytesToBase64(bytes),
+      });
+    } catch (error) {
+      if (!onAssetError) throw error;
+      onAssetError({ code: 'image-asset-unavailable', reference, message: String(error?.message || error) });
+    }
   }
   if (images.length) document.embeddedAssets = { images };
   else delete document.embeddedAssets;
@@ -2939,9 +2945,17 @@ export async function embedPortableImageAssets(documentInput, {
 }
 
 export async function serializePortableDrawingJson(snapshot, name = 'Untitled Drawing', options = {}) {
-  return JSON.stringify(await embedPortableImageAssets(
-    JSON.parse(serializeDrawingJson(snapshot, name)), options,
-  ), null, 2);
+  const assetErrors = [];
+  const drawing = await embedPortableImageAssets(
+    JSON.parse(serializeDrawingJson(snapshot, name)),
+    { ...options, onAssetError: issue => assetErrors.push(issue) },
+  );
+  if (assetErrors.length) drawing.saveDiagnostics = {
+    ...drawing.saveDiagnostics,
+    version: 1,
+    errors: [...(drawing.saveDiagnostics?.errors || []), ...assetErrors],
+  };
+  return JSON.stringify(drawing, null, 2);
 }
 
 export async function serializePortablePackageJson(packageValue, options = {}) {
@@ -2997,7 +3011,7 @@ export async function hydratePortableImageAssets(documentInput, { importAsset } 
 export async function parsePortableDrawingText(fileName, text, { importAsset } = {}) {
   if (/\.dxf$/i.test(fileName)) return parseDrawingText(fileName, text);
   const hydrated = await hydratePortableImageAssets(JSON.parse(text), { importAsset });
-  return normalizeDrawingData(hydrated?.format === 'ParaMagic Clipboard' && hydrated.drawing
+  return parseDrawingText(fileName, JSON.stringify(hydrated?.format === 'ParaMagic Clipboard' && hydrated.drawing
     ? hydrated.drawing
-    : hydrated);
+    : hydrated));
 }

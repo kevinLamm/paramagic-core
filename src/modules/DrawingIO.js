@@ -1,8 +1,10 @@
 import { GLOBAL_LAYER_ID, stackFrameFor, stackFrameMatrix, transformStackEntity, transformStackPoint } from './StackCoordinates.js';
+import { serializePreservedDrawing } from './DrawingPersistence.js';
 import { evaluateFilletedGeometry } from './FilletSystem.js';
 import { createUuid, deriveUuidForKey } from './IdentitySystem.js';
 import {
   cloneDrawingIdentityGraph,
+  identityAudit,
   migrateDrawingIdentities,
   remapDrawingIdentityGraph,
   validateDrawingIdentityGraph,
@@ -105,7 +107,7 @@ const dxfUnits = {
   cm: { code: 5, factor: 10 },
   m: { code: 6, factor: 1000 },
 };
-export function normalizeDrawingDataWithIdentityMap(input = {}) {
+export function normalizeDrawingDataWithIdentityMap(input = {}, { allowIdentityErrors = false } = {}) {
   const source = migrateSubtractReferences(migrateCanvasOriginReferences(input.drawing || input));
   const parameters = source.parameters || source.dimensions || [];
   const classState = normalizeClassState(source);
@@ -152,32 +154,44 @@ export function normalizeDrawingDataWithIdentityMap(input = {}) {
     ...(extensions && Object.keys(extensions).length ? { extensions } : {}),
   });
   const migrated = migrateDrawingIdentities(structured);
-  if (migrated.errors.length) throw new Error(migrated.errors[0].message);
+  if (migrated.errors.length && !allowIdentityErrors) throw new Error(migrated.errors[0].message);
   return migrated;
 }
 
-export function normalizeDrawingData(input = {}) {
-  return normalizeDrawingDataWithIdentityMap(input).drawing;
+export function normalizeDrawingData(input = {}, options = {}) {
+  return normalizeDrawingDataWithIdentityMap(input, options).drawing;
 }
 
 export function serializeDrawingJson(snapshot, name = 'Untitled Drawing') {
-  if (Number(snapshot?.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(snapshot);
-  const drawing = normalizeDrawingData(snapshot);
-  validateDrawingIdentityGraph(drawing);
-  delete drawing.dimensions;
-  return JSON.stringify({
-    format: 'ParaMagic Drawing',
-    version: 4,
-    name,
-    ...drawing,
-  }, null, 2);
+  try {
+    if (Number(snapshot?.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(snapshot);
+    const drawing = normalizeDrawingData(snapshot);
+    validateDrawingIdentityGraph(drawing);
+    delete drawing.dimensions;
+    return JSON.stringify({
+      format: 'ParaMagic Drawing',
+      version: 4,
+      name,
+      ...drawing,
+    }, null, 2);
+  } catch (error) {
+    return serializePreservedDrawing(snapshot, name, error);
+  }
 }
 
 export function createIndependentDrawingSave(snapshot, name = 'Untitled Drawing') {
-  const { drawing: remappedDrawing, idMap } = cloneDrawingIdentityGraph(snapshot);
-  const content = serializeDrawingJson(remappedDrawing, name);
-  const drawing = parseDrawingText(`${name}.paramagic`, content);
-  return { content, drawing, idMap };
+  try {
+    if (Number(snapshot?.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(snapshot);
+    validateDrawingIdentityGraph(normalizeDrawingData(snapshot));
+    const { drawing: remappedDrawing, idMap } = cloneDrawingIdentityGraph(snapshot);
+    const content = serializeDrawingJson(remappedDrawing, name);
+    const drawing = parseDrawingText(`${name}.paramagic`, content);
+    return { content, drawing, idMap, requiresReload: true };
+  } catch (error) {
+    // A failed clone must save the original graph, never a partly remapped one.
+    const content = serializePreservedDrawing(snapshot, name, error, 'save-as');
+    return { content, drawing: JSON.parse(content), idMap: new Map(), requiresReload: false };
+  }
 }
 
 function replaceExpressionNames(expression, nameMap, { caseInsensitive = false } = {}) {
@@ -1234,9 +1248,14 @@ export function serializeDxf(snapshot) {
 export function parseDrawingText(fileName, text) {
   if (/\.dxf$/i.test(fileName)) return parseDxf(text);
   const parsed = JSON.parse(text);
-  if (Number(parsed.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(parsed);
-  const drawing = normalizeDrawingData(parsed);
-  if (Number(parsed.identityArchitectureVersion) >= 1) validateDrawingIdentityGraph(drawing);
+  if (Number(parsed?.identityArchitectureVersion) >= 1) {
+    const warnings = identityAudit(parsed).errors;
+    if (warnings.length) return { ...parsed, identityWarnings: warnings };
+  }
+  const drawing = normalizeDrawingData(parsed, { allowIdentityErrors: true });
+  // File loading reports identity problems without discarding their references.
+  const warnings = identityAudit(drawing).errors;
+  if (warnings.length) drawing.identityWarnings = warnings;
   return drawing;
 }
 
