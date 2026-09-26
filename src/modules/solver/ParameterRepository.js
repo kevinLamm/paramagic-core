@@ -1118,7 +1118,7 @@ export class ParameterRepository {
     }, { symbols });
   }
 
-  evaluateLengthExpression(expression, { stackId = null } = {}) {
+  evaluateLengthExpression(expression, { stackId = null, dependencies = null } = {}) {
     const finiteLength = (value) => {
       const numeric = Number(value);
       if (!Number.isFinite(numeric)) throw new Error('Length expression must evaluate to a finite number.');
@@ -1129,6 +1129,7 @@ export class ParameterRepository {
     const symbols = this.symbolDefinitions(stackId);
     const value = parseExpression(expression, (name) => {
       const id = this.idForName(name, { stackId, allowUniqueDimension: false });
+      if (id) dependencies?.add(id);
       const entry = id ? this.entries.get(id) : null;
       const external = this.externalVariable(name, stackId);
       if (!entry && !external) throw new Error(`Unknown parameter: ${name}`);

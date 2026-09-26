@@ -384,6 +384,7 @@ export async function createCanvasPresentationPng(objectLayer, options = {}, {
       const svg = createPresentationSvg({
         objectLayer,
         stackId: options.stackId || null,
+        stackIds: options.stackIds ?? null,
         width: 1024,
         height: 1024,
         background: '#ffffff',

@@ -1,5 +1,5 @@
 import { evaluateConstraint, featureLength, residualImplementations } from './NumericSolverCore.js';
-import { constraintVariableIds } from './ConstraintGraph.js';
+import { constraintVariableIds, constraintHasDerivedFeatures } from './ConstraintGraph.js';
 import { createVariableColumnMap } from './JacobianBlocks.js';
 import { analyticalJacobianImplementations, intrinsicArcJacobian } from './AnalyticalJacobians.js';
 import { isSelfCoincidentConstraint, selfCoincidentConstraintMessage } from './ConstraintValidation.js';
@@ -72,7 +72,7 @@ export class ConstraintRegistry {
       const evaluateResiduals = () => evaluateConstraint(model.constraintModel?.(constraint) || model, constraint, dimensions);
       const residualCount = evaluateResiduals().length;
       if (residualCount === 0) continue;
-      const analyticalJacobian = constraint.coordinateSpace === 'global'
+      const analyticalJacobian = constraint.coordinateSpace === 'global' || constraintHasDerivedFeatures(constraint)
         ? null
         : analyticalJacobianImplementations[constraint.type];
       blocks.push({

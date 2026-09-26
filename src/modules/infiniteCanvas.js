@@ -3415,7 +3415,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     });
     notchSystem.setValueOnly(mode === 'value');
     syncScreenInvariantSizing();
-    if (changed) presentationChangeListeners.forEach((listener) => listener({ dimensionTextMode: mode }));
+    if (changed) drawingUpdates.invalidate();
   }
 
   function solveEditedRecords(editedEntries, lockedVariableIds = []) {

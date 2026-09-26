@@ -32,6 +32,7 @@ export function closedGeometryTopologyEntities(entities = []) {
 }
 
 export function findClosedGeometryCycles(entities = [], constraints = []) {
+  const byId = new Map(entities.map((entity) => [entity.id, entity]));
   const edges = [];
   const endpointKeys = new Set();
   const endpointPoints = new Map();
@@ -93,27 +94,6 @@ export function findClosedGeometryCycles(entities = [], constraints = []) {
     endpointBuckets.get(bucket).push(key);
   });
 
-  const compositeGroups = new Map();
-  entities.forEach((entity) => {
-    if (entity.construction || !entity.composite?.closed || !entity.composite.id) return;
-    if (!compositeGroups.has(entity.composite.id)) compositeGroups.set(entity.composite.id, []);
-    compositeGroups.get(entity.composite.id).push(entity);
-  });
-  compositeGroups.forEach((group) => {
-    group.sort((a, b) => a.composite.index - b.composite.index);
-    const expectedCount = group[0]?.composite.count;
-    if (!expectedCount || group.length !== expectedCount) return;
-    group.forEach((entity, index) => {
-      const next = group[(index + 1) % group.length];
-      const entityIndices = endpointIndices(entity);
-      const nextIndices = endpointIndices(next);
-      if (!entityIndices || !nextIndices) return;
-      const endKey = endpointKey(entity.id, entityIndices[1]);
-      const nextStartKey = endpointKey(next.id, nextIndices[0]);
-      if (samePoint(endpointPoints.get(endKey), endpointPoints.get(nextStartKey))) union(endKey, nextStartKey);
-    });
-  });
-
   constraints.forEach((constraint) => {
     if (constraint.enabled === false || constraint.type !== 'Coincident') return;
     const keys = (constraint.featureRefs || [])
@@ -123,70 +103,152 @@ export function findClosedGeometryCycles(entities = [], constraints = []) {
     keys.slice(1).forEach((key) => union(keys[0], key));
   });
 
-  const graphEdges = edges.map((edge, index) => ({
+  const graphEdges = edges.map((edge) => ({
     ...edge,
-    index,
     start: find(edge.startKey),
     end: find(edge.endKey),
   }));
-  const incident = new Map();
-  const addIncident = (node, edgeIndex) => {
-    if (!incident.has(node)) incident.set(node, []);
-    incident.get(node).push(edgeIndex);
-  };
+  // A declared closed object owns its boundary even when another object
+  // touches it or has an overlapping edge. Coordinate joins do not transfer
+  // that ownership. Incomplete objects still participate in inferred faces.
+  const compositeGroups = new Map();
   graphEdges.forEach((edge) => {
-    addIncident(edge.start, edge.index);
-    addIncident(edge.end, edge.index);
+    const composite = byId.get(edge.entityId)?.composite;
+    if (!composite?.closed || !composite.id) return;
+    if (!compositeGroups.has(composite.id)) compositeGroups.set(composite.id, []);
+    compositeGroups.get(composite.id).push(edge);
   });
-
   const cycles = [];
-  const visitedNodes = new Set();
-  const handledSelfLoops = new Set();
-  const parentNode = new Map();
-  const parentEdge = new Map();
-  const depth = new Map();
-  const oriented = (edge, from) => ({ entityId: edge.entityId, reversed: edge.start !== from });
-
-  const visit = (node) => {
-    visitedNodes.add(node);
-    (incident.get(node) || []).forEach((edgeIndex) => {
-      const edge = graphEdges[edgeIndex];
-      const other = edge.start === node ? edge.end : edge.start;
-      if (edge.start === edge.end) {
-        if (!handledSelfLoops.has(edgeIndex)) {
-          handledSelfLoops.add(edgeIndex);
-          cycles.push([{ entityId: edge.entityId, reversed: false }]);
-        }
-        return;
-      }
-      if (!visitedNodes.has(other)) {
-        parentNode.set(other, node);
-        parentEdge.set(other, edgeIndex);
-        depth.set(other, (depth.get(node) || 0) + 1);
-        visit(other);
-        return;
-      }
-      if (parentEdge.get(node) === edgeIndex || (depth.get(other) || 0) >= (depth.get(node) || 0)) return;
-      const treePath = [];
-      let cursor = node;
-      while (cursor !== other) {
-        const treeEdgeIndex = parentEdge.get(cursor);
-        if (treeEdgeIndex === undefined) return;
-        const parent = parentNode.get(cursor);
-        treePath.unshift(oriented(graphEdges[treeEdgeIndex], parent));
-        cursor = parent;
-      }
-      treePath.push(oriented(edge, node));
-      cycles.push(treePath);
-    });
-  };
-
-  incident.forEach((_edgesAtNode, node) => {
-    if (visitedNodes.has(node)) return;
-    depth.set(node, 0);
-    visit(node);
+  const owned = new Set();
+  const filletEdges = graphEdges.filter((edge) => byId.get(edge.entityId)?.derivedFromFillet);
+  compositeGroups.forEach((group) => {
+    const count = byId.get(group[0].entityId).composite.count;
+    if (!count || group.length !== count) return;
+    const nodes = new Set(group.flatMap((edge) => [edge.start, edge.end]));
+    const members = [...group, ...filletEdges.filter((edge) => nodes.has(edge.start) && nodes.has(edge.end))];
+    const faces = boundedGeometryFaces(members, byId);
+    if (faces.length !== 1 || faces[0].length !== members.length) return;
+    cycles.push(faces[0]);
+    members.forEach((edge) => owned.add(edge.entityId));
   });
-  return cycles;
+  return [...cycles, ...boundedGeometryFaces(graphEdges.filter((edge) => !owned.has(edge.entityId)), byId)];
+}
+
+// Order outgoing half-edges by the actual geometry at the junction. The
+// endpoint chord alone cannot distinguish arcs or curves with common ends.
+function boundaryDeparture(feature, sampled) {
+  const start = sampled[0];
+  const next = sampled.slice(1).find((point) => !closeEnough(start, point));
+  if (!next) return { angle: 0, curvature: 0 };
+  let tangent = [next[0] - start[0], next[1] - start[1]];
+  let curvature = 0;
+  if (feature.kind === 'arc') {
+    const a = Math.atan2(feature.start[1] - feature.center[1], feature.start[0] - feature.center[0]);
+    const b = Math.atan2(feature.end[1] - feature.center[1], feature.end[0] - feature.center[0]);
+    const m = Math.atan2(feature.arcPoint[1] - feature.center[1], feature.arcPoint[0] - feature.center[0]);
+    const direction = arcSweepFromAngles(a, b, m).ccw ? 1 : -1;
+    tangent = [-Math.sin(a) * direction, Math.cos(a) * direction];
+    curvature = direction / feature.radius;
+  } else if (feature.kind === 'curve' && feature.points.length > 2) {
+    const [p, q, r] = feature.points;
+    const first = [(q[0] - p[0]) * 0.54, (q[1] - p[1]) * 0.54];
+    const second = [0, 1].map((i) => 6 * (0.64 * (q[i] - p[i]) - 0.18 * (r[i] - p[i])));
+    const length = Math.hypot(...first);
+    if (length > EPSILON) {
+      tangent = first;
+      curvature = (first[0] * second[1] - first[1] * second[0]) / length ** 3;
+    }
+  }
+  const tau = Math.PI * 2;
+  let angle = (Math.atan2(tangent[1], tangent[0]) + tau) % tau;
+  if (angle < 1e-10 || tau - angle < 1e-10) angle = 0;
+  return { angle, curvature };
+}
+
+function signedBoundaryArea(points) {
+  if (!points.length) return 0;
+  // Translate before summing to retain precision far from the origin.
+  const [x, y] = points[0];
+  return points.reduce((sum, point, index) => {
+    const next = points[(index + 1) % points.length];
+    return sum + (point[0] - x) * (next[1] - y) - (next[0] - x) * (point[1] - y);
+  }, 0) / 2;
+}
+
+function boundedGeometryFaces(edges, byId) {
+  const outgoing = new Map();
+  const halfEdges = [];
+  edges.forEach((edge) => {
+    const feature = resolvedBoundaryFeaturesForEntity(byId.get(edge.entityId))[0];
+    if (!feature) return;
+    const points = sampleNotchFeature(feature);
+    if (points.length < 2) return;
+    const pair = [false, true].map((reversed) => {
+      const samples = reversed ? [...points].reverse() : points;
+      return {
+        entityId: edge.entityId, reversed,
+        from: reversed ? edge.end : edge.start,
+        to: reversed ? edge.start : edge.end,
+        points: samples,
+        ...boundaryDeparture(reversed ? reverseResolvedBoundaryFeature(feature) : feature, samples),
+      };
+    });
+    pair.forEach((halfEdge, index) => {
+      halfEdge.twin = pair[1 - index];
+      if (!outgoing.has(halfEdge.from)) outgoing.set(halfEdge.from, []);
+      outgoing.get(halfEdge.from).push(halfEdge);
+      halfEdges.push(halfEdge);
+    });
+  });
+  outgoing.forEach((incident) => {
+    incident.sort((a, b) => (Math.abs(a.angle - b.angle) > 1e-10 ? a.angle - b.angle
+      : a.curvature - b.curvature || a.entityId.localeCompare(b.entityId) || Number(a.reversed) - Number(b.reversed)));
+    incident.forEach((edge, index) => { edge.position = index; });
+  });
+  halfEdges.forEach((edge) => {
+    const incident = outgoing.get(edge.to);
+    edge.next = incident[(edge.twin.position + incident.length - 1) % incident.length];
+  });
+  const visited = new Set();
+  const faces = [];
+  const addFace = (boundary) => {
+    if (!boundary.length || signedBoundaryArea(boundary.flatMap((edge) => edge.points)) <= EPSILON ** 2) return;
+    const memberIndex = (edge) => {
+      const composite = byId.get(edge.entityId)?.composite;
+      return composite?.closed ? Number(composite.index) || 0 : Infinity;
+    };
+    const first = boundary.reduce((best, edge, index) => (
+      (memberIndex(edge) - memberIndex(boundary[best]) || edge.entityId.localeCompare(boundary[best].entityId)) < 0 ? index : best
+    ), 0);
+    faces.push([...boundary.slice(first), ...boundary.slice(0, first)]
+      .map(({ entityId, reversed }) => ({ entityId, reversed })));
+  };
+  halfEdges.forEach((start) => {
+    if (visited.has(start)) return;
+    const walk = [];
+    let cursor = start;
+    while (!visited.has(cursor)) {
+      visited.add(cursor);
+      walk.push(cursor);
+      cursor = cursor.next;
+    }
+    if (cursor !== start) return;
+    // Split repeated junctions into continuous contours. This discards
+    // zero-area out-and-back bridges without concatenating separate loops
+    // (for example an inner outline connected to an outer one by a branch).
+    const path = [];
+    const positions = new Map([[start.from, 0]]);
+    walk.forEach((edge) => {
+      path.push(edge);
+      if (positions.has(edge.to)) {
+        const contour = path.splice(positions.get(edge.to));
+        contour.forEach((member) => positions.delete(member.from));
+        addFace(contour);
+      }
+      positions.set(edge.to, path.length);
+    });
+  });
+  return faces;
 }
 
 // --- Resolved Boundary System ---
@@ -390,17 +452,29 @@ function boundaryPolygon(features) {
 }
 
 function boundaryIdForCycle(cycle, byId) {
-  const compositeIds = new Set(cycle
-    .map(({ entityId }) => byId.get(entityId)?.composite?.id)
-    .filter(Boolean));
-  if (compositeIds.size === 1) return [...compositeIds][0];
+  const entities = cycle.map(({ entityId }) => byId.get(entityId));
+  const composite = entities.find((entity) => entity?.composite?.closed)?.composite;
+  if (composite?.id && entities.every((entity) => (
+    entity?.composite?.id === composite.id || entity?.derivedFromFillet
+  )) && entities.filter((entity) => entity?.composite?.id === composite.id).length === composite.count) {
+    return composite.id;
+  }
   const memberIds = cycle.map(({ entityId }) => entityId).sort();
   return deriveUuidForKey('boundary-cycle', ...memberIds);
 }
 
-function boundaryFromFeatures(id, features, recordIds, byId, kind) {
+function boundaryFromFeatures(id, features, recordIds, byId, kind, membership = new Map()) {
   const polygon = boundaryPolygon(features);
-  const appearanceSourceId = recordIds.find((recordId) => byId.has(recordId)) || features[0]?.recordId;
+  // Prefer the object's first declared member, then an edge belonging only
+  // to this face. Keep the choice stable when drawing/z order changes.
+  const appearanceSourceId = [...recordIds].filter((recordId) => byId.has(recordId)).sort((a, b) => {
+    const first = byId.get(a).composite;
+    const second = byId.get(b).composite;
+    const rank = (composite) => composite?.id === id ? Number(composite.index) || 0 : Infinity;
+    return rank(first) - rank(second)
+      || (membership.get(a) || 1) - (membership.get(b) || 1)
+      || a.localeCompare(b);
+  })[0] || features[0]?.recordId;
   const sourceEntity = byId.get(appearanceSourceId) || byId.get(features[0]?.recordId);
   return {
     id,
@@ -423,10 +497,15 @@ export function resolveClosedBoundaries(entities = [], constraints = []) {
   const byId = new Map(evaluated.filter(({ id }) => id).map((entity) => [entity.id, entity]));
   const boundaries = [];
 
-  findClosedGeometryCycles(
+  const cycles = findClosedGeometryCycles(
     evaluated,
     filletTopologyConstraints(constraints, fillets),
-  ).forEach((cycle) => {
+  );
+  const membership = new Map();
+  cycles.forEach((cycle) => cycle.forEach(({ entityId }) => {
+    membership.set(entityId, (membership.get(entityId) || 0) + 1);
+  }));
+  cycles.forEach((cycle) => {
     const id = boundaryIdForCycle(cycle, byId);
     const features = cycle.flatMap(({ entityId, reversed }) => {
       const source = resolvedBoundaryFeaturesForEntity(byId.get(entityId), id);
@@ -436,7 +515,7 @@ export function resolveClosedBoundaries(entities = [], constraints = []) {
       return oriented;
     });
     if (!features.length) return;
-    boundaries.push(boundaryFromFeatures(id, features, cycle.map(({ entityId }) => entityId), byId, 'cycle'));
+    boundaries.push(boundaryFromFeatures(id, features, cycle.map(({ entityId }) => entityId), byId, 'cycle', membership));
   });
 
   evaluated

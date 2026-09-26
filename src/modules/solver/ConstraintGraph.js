@@ -32,6 +32,12 @@ function referencedRecordIds(value) {
     .filter(Boolean));
 }
 
+export function constraintHasDerivedFeatures(constraint) {
+  const references = [];
+  collectReferences(constraint, references);
+  return references.some((reference) => reference.derivedFeature);
+}
+
 export function constraintVariableIds(model, constraint) {
   const ids = new Set();
   const references = [];

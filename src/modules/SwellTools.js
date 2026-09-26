@@ -387,21 +387,6 @@ export function isSwellPropertiesPanelSuppressed(root = globalThis.document) {
   ));
 }
 
-function projectToSegment(point, start, end) {
-  const delta = [end[0] - start[0], end[1] - start[1]];
-  const lengthSquared = delta[0] ** 2 + delta[1] ** 2;
-  if (lengthSquared <= 1e-12) return [...start];
-  const t = Math.max(0, Math.min(1, ((point[0] - start[0]) * delta[0] + (point[1] - start[1]) * delta[1]) / lengthSquared));
-  return [start[0] + delta[0] * t, start[1] + delta[1] * t];
-}
-
-function projectToRound(point, feature) {
-  const delta = [point[0] - feature.center[0], point[1] - feature.center[1]];
-  const magnitude = Math.hypot(...delta);
-  if (magnitude <= 1e-12) return [feature.center[0] + feature.radius, feature.center[1]];
-  return [feature.center[0] + delta[0] * feature.radius / magnitude, feature.center[1] + delta[1] * feature.radius / magnitude];
-}
-
 function mixedValue(values, fallback = null) {
   if (!values.length) return fallback;
   return new Set(values.map((value) => JSON.stringify(value))).size === 1 ? values[0] : fallback;
@@ -603,14 +588,12 @@ export function createSwellTools({
   const propertiesPanel = document.createElement('section');
   let active = false;
   let renderFrame = null;
-  let applyingExternalConstraints = false;
   let derivedByPieceId = new Map();
   let derivedByOwnerId = new Map();
   const evaluateGeometry = createSwellGeometryEvaluator();
   const ownerPresentationKeys = new Map();
   let boundaryPresentationKey = null;
   let derivedBoundaries = [];
-  let externalConstraints = [];
   let creationExpressions = rememberSwellCreationExpressions();
 
   propertiesPanel.className = 'floating-panel swell-panel';
@@ -877,48 +860,6 @@ export function createSwellTools({
     });
   }
 
-  function applyExternalConstraint(constraint, { history = 'none', updates = null } = {}) {
-    const derived = derivedDimensionProvider.resolveFeature(constraint.externalTarget?.derivedRef);
-    const movable = constraint.externalTarget?.movableRef;
-    if (!derived || !movable) return false;
-    const current = constraint.type === 'Concentric'
-      ? canvas.getEntityFeature?.(movable.recordId, { rendered: true })
-      : canvas.getPointFeature?.(movable.recordId, movable.index, { pointRole: movable.pointRole, rendered: true });
-    let target = null;
-    if (constraint.type === 'Coincident' && derived.kind === 'point') target = derived.point;
-    if (constraint.type === 'Point-on Line' && derived.kind === 'segment' && current?.point) {
-      target = projectToSegment(current.point, derived.start, derived.end);
-    }
-    if (['Point-on Circle', 'Point-on Arc'].includes(constraint.type) && ['circle', 'arc'].includes(derived.kind) && current?.point) {
-      target = projectToRound(current.point, derived);
-    }
-    if (constraint.type === 'Concentric' && ['circle', 'arc'].includes(derived.kind)) target = derived.center;
-    if (!finitePoint(target)) return false;
-    const currentPoint = constraint.type === 'Concentric' ? current?.center : current?.point;
-    if (finitePoint(currentPoint) && pointDistance(currentPoint, target) <= 1e-7) return true;
-    if (updates) { updates.push({ reference: movable, world: target }); return true; }
-    return canvas.setPointFeaturePosition?.(movable, target, { history })?.success === true;
-  }
-
-  function applyExternalConstraints() {
-    if (applyingExternalConstraints || !externalConstraints.length) return false;
-    applyingExternalConstraints = true;
-    let changed = false;
-    const updates = [];
-    try {
-      externalConstraints = externalConstraints.filter((constraint) => {
-        if (canvas.isStackRelationshipAvailable?.(constraint) === false) return true;
-        const valid = Boolean(derivedDimensionProvider.resolveFeature(constraint.externalTarget?.derivedRef));
-        if (valid) changed = applyExternalConstraint(constraint, { updates: canvas.setPointFeaturePositions ? updates : null }) || changed;
-        return valid;
-      });
-      if (updates.length) changed = canvas.setPointFeaturePositions(updates, { history: 'none' })?.success === true;
-    } finally {
-      applyingExternalConstraints = false;
-    }
-    return changed;
-  }
-
   function renderNow() {
     renderFrame = null;
     if (!objectLayer) return;
@@ -926,7 +867,7 @@ export function createSwellTools({
     const next = evaluateGeometry({
       entities: drawing.entities || [],
       constraints: drawing.constraints || [],
-      evaluateLength: (expression) => canvas.evaluateLengthExpression?.(expression) ?? Number(expression),
+      evaluateLength: (expression, entity) => canvas.evaluateLengthExpression?.(expression, entity) ?? Number(expression),
     });
     const changedOwners = new Set();
     const removeOwner = (ownerId) => {
@@ -966,11 +907,7 @@ export function createSwellTools({
       renderClosedBoundaryFills(derivedBoundaries);
       boundaryPresentationKey = boundaryKey;
     }
-    externalConstraints = externalConstraints.map((constraint) => normalizeSwellExternalConstraint(
-      constraint, (request) => derivedDimensionProvider.resolveFeature(request),
-    ));
     syncDerivedSelection();
-    applyExternalConstraints();
     if (!canvas.registerDrawingUpdateStage) canvas.notifyDerivedFeatureChange?.(changedOwners);
     return changedOwners;
   }
@@ -1088,67 +1025,8 @@ export function createSwellTools({
   };
 
   const constraintOperation = {
-    applyConstraint({ type, features, request }) {
-      if (!features.some((feature) => feature?.swellDerived)) return undefined;
-      const stackId = request.stackId || canvas.getActiveStackId?.() || null;
-      const participantStackIds = [...new Set([
-        ...(request.participantStackIds || []),
-        ...features.map((feature) => canvas.getRecordStackId?.(
-          feature?.swellDerived ? feature.swellSourceId : feature?.recordId,
-        )),
-      ].filter(Boolean))].filter((id) => id !== stackId);
-      const constraint = swellExternalConstraintRequest(type, features, {
-        ...request,
-        stackId,
-        participantStackIds,
-      });
-      if (!constraint) return { constraint: null };
-      canvas.requestHistoryCheckpoint?.('add-swell-constraint');
-      externalConstraints.push(constraint);
-      if (!applyExternalConstraint(constraint)) {
-        externalConstraints.pop();
-        return { constraint: null };
-      }
-      return { constraint: clone(constraint) };
-    },
-    constraints: () => externalConstraints
-      .filter((constraint) => canvas.isStackRelationshipAvailable?.(constraint) !== false)
-      .map(clone),
+    // Swell references use the standard constraint transaction and history.
     resolveFeature: (request) => derivedDimensionProvider.resolveFeature(request),
-    dependsOn(constraint, changedRecordIds) {
-      return Boolean(changedRecordIds?.has(constraint.externalTarget?.sourceId)
-        || changedRecordIds?.has(constraint.externalTarget?.movableRef?.recordId));
-    },
-    isConstraintVisible(constraint) {
-      if (canvas.isStackRelationshipAvailable?.(constraint) === false) return false;
-      const sourceId = constraint.externalTarget?.sourceId;
-      return canvas.isRecordVisible?.(sourceId) !== false
-        && canvas.isRecordInActiveStack?.(sourceId) !== false
-        && canvas.isObjectVisible?.(sourceId) !== false;
-    },
-    removeConstraint(id) {
-      const index = externalConstraints.findIndex((constraint) => constraint.id === id);
-      if (index < 0) return false;
-      canvas.requestHistoryCheckpoint?.('delete-swell-constraint');
-      externalConstraints.splice(index, 1);
-      return true;
-    },
-    removeStackReferences(stackId, recordIds = []) {
-      const removedRecordIds = new Set(recordIds.map(String));
-      const referencesRemovedRecord = (value, visited = new Set()) => {
-        if (typeof value === 'string') return removedRecordIds.has(value);
-        if (!value || typeof value !== 'object' || visited.has(value)) return false;
-        visited.add(value);
-        return Object.values(value).some((item) => referencesRemovedRecord(item, visited));
-      };
-      const before = externalConstraints.length;
-      externalConstraints = externalConstraints.filter((constraint) => (
-        constraint.stackId !== stackId
-        && !constraint.participantStackIds?.includes(stackId)
-        && !referencesRemovedRecord(constraint)
-      ));
-      return externalConstraints.length !== before;
-    },
   };
 
   function selectionTargets() {
@@ -1211,20 +1089,9 @@ export function createSwellTools({
   };
 
   const extensionProvider = {
-    serialize() {
-      externalConstraints = externalConstraints.map((constraint) => normalizeSwellExternalConstraint(
-        constraint,
-        (request) => derivedDimensionProvider.resolveFeature(request),
-      ));
-      return externalConstraints.length ? { version: 2, constraints: externalConstraints.map(clone) } : null;
-    },
-    restore(value) {
-      externalConstraints = Array.isArray(value?.constraints) ? value.constraints.map(clone) : [];
-      render();
-    },
-    removeStackReferences: constraintOperation.removeStackReferences,
+    serialize: () => null,
+    restore: () => render(),
     clear() {
-      externalConstraints = [];
       removeRenderedGroups();
       derivedByPieceId.clear();
       derivedByOwnerId.clear();
@@ -1360,6 +1227,5 @@ export function createSwellTools({
     selectionPropertyProvider,
     derivativeSourceProvider,
     updateSelectedDefinitions,
-    removeStackReferences: constraintOperation.removeStackReferences,
   };
 }

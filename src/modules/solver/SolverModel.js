@@ -551,6 +551,7 @@ export class SketchModel {
     this.derivedEntities = new Map();
     this.constraints = new Map();
     this.variablesById = new Map();
+    this.derivedFeatureProviders = new Map();
   }
 
   indexBinding(binding, previousVariableIds = []) {
@@ -657,6 +658,9 @@ export class SketchModel {
       if (constraint.enabled === false || constraint.type !== 'Fixed') continue;
       for (const feature of constraint.featureRefs || []) {
         const binding = this.binding(feature?.entityId || feature?.recordId);
+        // A fixed derived point is an equation on its sources, not a lock on
+        // every variable used to construct it.
+        if (feature.derivedFeature) continue;
         const variableIds = binding && (feature.kind === 'point' || feature.type === 'point')
           ? binding.fixedVariableIdsForPoint(feature.index || 0, feature.pointRole)
           : this.variableIdsForFeature(feature);
@@ -693,10 +697,17 @@ export class SketchModel {
     return this.variablesById.get(id) || null;
   }
 
+  featureBinding(ref) {
+    if (ref?.derivedFeature) {
+      return this.derivedFeatureProviders.get(ref.derivedFeature.provider)?.binding(ref) || null;
+    }
+    return this.binding(ref?.entityId || ref?.recordId);
+  }
+
   localPoint(ref) {
     if (!ref) return null;
     if (isCanvasOriginReference(ref)) return [0, 0];
-    const binding = this.binding(ref.entityId || ref.recordId);
+    const binding = this.featureBinding(ref);
     if (!binding) return null;
     if (ref.type === 'segment-start' || ref.type === 'segment-end') {
       const segment = binding.segmentFeature(ref.index || 0);
@@ -717,12 +728,12 @@ export class SketchModel {
 
   localSegment(ref) {
     if (!ref) return null;
-    return this.binding(ref.entityId || ref.recordId)?.segmentFeature(ref.index || 0) || null;
+    return this.featureBinding(ref)?.segmentFeature(ref.index || 0) || null;
   }
 
   localEntityFeature(ref) {
     if (!ref) return null;
-    return this.binding(ref.entityId || ref.recordId)?.entityFeature() || null;
+    return this.featureBinding(ref)?.entityFeature() || null;
   }
 
   frameForReference(ref) {
@@ -761,6 +772,9 @@ export class SketchModel {
 
   variableIdsForFeature(ref) {
     if (isCanvasOriginReference(ref)) return [];
+    if (ref?.derivedFeature) {
+      return this.derivedFeatureProviders.get(ref.derivedFeature.provider)?.variableIds(ref) || [];
+    }
     const binding = this.binding(ref?.entityId || ref?.recordId);
     if (!binding) return [];
     if (ref.kind === 'point' || ref.type === 'point') return binding.variableIdsForPoint(ref.index || 0, ref.pointRole);

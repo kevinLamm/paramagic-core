@@ -319,7 +319,7 @@ function sourceTopology(entities = [], constraints = []) {
   constraints.forEach((constraint) => {
     if (constraint?.type !== 'Coincident' || constraint.enabled === false) return;
     const keys = (constraint.featureRefs || []).flatMap((reference) => {
-      if (reference?.kind !== 'point') return [];
+      if (reference?.kind !== 'point' || reference.derivedFeature) return [];
       const entity = byId.get(reference.recordId);
       const role = sourceEndpointRole(entity, reference.index);
       return role ? [endpointKey(reference.recordId, role)] : [];
@@ -450,7 +450,7 @@ function endpointKey(recordId, index) {
 function coincidentEndpointPairs(constraints = []) {
   return constraints.flatMap((constraint) => {
     if (constraint?.type !== 'Coincident' || constraint.enabled === false) return [];
-    const refs = (constraint.featureRefs || []).filter((ref) => ref.kind === 'point' && [0, 2].includes(Number(ref.index)));
+    const refs = (constraint.featureRefs || []).filter((ref) => !ref.derivedFeature && ref.kind === 'point' && [0, 2].includes(Number(ref.index)));
     if (refs.length !== 2) return [];
     return [[endpointKey(refs[0].recordId, refs[0].index), endpointKey(refs[1].recordId, refs[1].index)]];
   });
@@ -837,30 +837,35 @@ function orientedResultPieces(result) {
 // Cache complete connected source components. Endpoint joins, composite normals,
 // and fillet transitions can affect neighbours, so an individual line is not a
 // sufficient cache boundary.
+export function swellSourceComponents(entities = [], constraints = []) {
+  const sources = entities.filter(isSwellEntity);
+  const parents = new Map(sources.map(({ id }) => [id, id]));
+  const find = (id) => {
+    if (!parents.has(id)) return null;
+    let root = id;
+    while (parents.get(root) !== root) root = parents.get(root);
+    return root;
+  };
+  const join = (ids) => {
+    const roots = ids.map(find).filter(Boolean);
+    roots.slice(1).forEach((root) => parents.set(root, roots[0]));
+  };
+  sourceTopology(sources, constraints).groups.forEach((group) => join(group.map(({ recordId }) => recordId)));
+  compositeGroups(sources).forEach((group) => join(group.map(({ id }) => id)));
+  constraints.forEach((constraint) => join((constraint.featureRefs || []).map(({ recordId }) => recordId)));
+  const groups = new Map();
+  sources.forEach((entity) => {
+    const id = find(entity.id);
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(entity);
+  });
+  return groups;
+}
+
 export function createSwellGeometryEvaluator() {
   let cache = new Map();
   return ({ entities = [], constraints = [], evaluateLength = Number } = {}) => {
-    const sources = entities.filter(isSwellEntity);
-    const parents = new Map(sources.map(({ id }) => [id, id]));
-    const find = (id) => {
-      if (!parents.has(id)) return null;
-      let root = id;
-      while (parents.get(root) !== root) root = parents.get(root);
-      return root;
-    };
-    const join = (ids) => {
-      const roots = ids.map(find).filter(Boolean);
-      roots.slice(1).forEach((root) => parents.set(root, roots[0]));
-    };
-    sourceTopology(sources, constraints).groups.forEach((group) => join(group.map(({ recordId }) => recordId)));
-    compositeGroups(sources).forEach((group) => join(group.map(({ id }) => id)));
-    constraints.forEach((constraint) => join((constraint.featureRefs || []).map(({ recordId }) => recordId)));
-    const groups = new Map();
-    sources.forEach((entity) => {
-      const id = find(entity.id);
-      if (!groups.has(id)) groups.set(id, []);
-      groups.get(id).push(entity);
-    });
+    const groups = swellSourceComponents(entities, constraints);
     const nextCache = new Map();
     const result = new Map();
     groups.forEach((group, id) => {

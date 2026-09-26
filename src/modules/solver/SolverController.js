@@ -10,6 +10,7 @@ import {
   isSuccessfulSolve,
 } from './NumericSolverCore.js';
 import { SketchModel } from './SolverModel.js';
+import { createSwellSolverProvider } from '../SwellSolver.js';
 import { createUuid } from '../IdentitySystem.js';
 import { findDrivingDimensionLoop, formatDrivingDimensionLoopMessage } from './DimensionConflictDiagnostics.js';
 import { formatUnitlessValue, formatValueOnlyDimensionValue, unitFactors } from './Units.js';
@@ -586,6 +587,7 @@ export class SolverController {
     this.model = new SketchModel();
     this.model.stackFrame = (id) => stackFrameFor(this.stackState, id || this.defaultStackId());
     this.dimensions = new DimensionRepository();
+    this.model.derivedFeatureProviders.set('swell', createSwellSolverProvider(this.model, this.dimensions));
     this.registry = new ConstraintRegistry();
     this.constraintGraph = null;
     this.listeners = new Set();
@@ -1377,7 +1379,7 @@ export class SolverController {
     this.dimensions.evaluateDirty({ strict: false });
     const loadWarnings = [];
     const restoredConstraints = [];
-    (snapshot?.constraints || []).forEach((inputConstraint) => {
+    this.model.derivedFeatureProviders.get('swell').restoreConstraints(snapshot).forEach((inputConstraint) => {
       const constraint = this.withStackParticipation(completeTangentConstraint(this.model, clone(inputConstraint)));
       const constraintModel = this.model.constraintModel(constraint);
       const annotation = this.dimensionAnnotations.get(constraint.dimensionRef);
@@ -2604,10 +2606,12 @@ export class SolverController {
 
   updateParameter(id, patch) {
     const affectedBefore = this.dimensions.affectedIds(id);
+    const derivedEntityIds = [...this.model.derivedFeatureProviders.values()]
+      .flatMap((provider) => provider.parameterEntityIds?.(affectedBefore) || []);
     const beforeDimensions = this.dimensions.snapshotEntries(affectedBefore);
     const affectedDimensionsBefore = [...affectedBefore]
       .filter((affectedId) => this.dimensions.get(affectedId)?.kind === 'dimension');
-    const beforeGeometry = this.snapshotGeometryForSeeds({ dimensionIds: affectedDimensionsBefore });
+    const beforeGeometry = this.snapshotGeometryForSeeds({ dimensionIds: affectedDimensionsBefore, entityIds: derivedEntityIds });
     let entry;
     try {
       entry = this.dimensions.update(id, patch, { strict: false });
@@ -2626,7 +2630,7 @@ export class SolverController {
     const continuationDimensionIds = affectedDimensionIds
       .filter((dimensionId) => this.dimensionConstraints.has(dimensionId));
     let result;
-    if (affectedDimensionIds.length) {
+    if (affectedDimensionIds.length || derivedEntityIds.length) {
       let stepCount = dimensionTargetContinuationStepCount(
         beforeDimensions,
         targetDimensions,
@@ -2639,6 +2643,7 @@ export class SolverController {
           targetDimensions,
           continuationDimensionIds,
           stepCount,
+          derivedEntityIds,
         );
       } else {
         const recoveryStepCount = dimensionTargetContinuationStepCount(
@@ -2652,6 +2657,7 @@ export class SolverController {
         // general solver's full budget before changing strategy.
         result = this.solve({
           seedDimensionIds: affectedDimensionIds,
+          seedEntityIds: derivedEntityIds,
           ...(recoveryStepCount > 1 ? { maxIterations: parameterCorrectorIterations } : {}),
         });
         if (!isSuccessfulSolve(result) && continuationDimensionIds.length) {
@@ -2663,6 +2669,7 @@ export class SolverController {
               targetDimensions,
               continuationDimensionIds,
               stepCount,
+              derivedEntityIds,
             );
           }
         }
@@ -2693,7 +2700,7 @@ export class SolverController {
     return { entry: this.dimensions.get(id), result };
   }
 
-  solveParameterContinuation(beforeEntries, targetEntries, dimensionIds, stepCount) {
+  solveParameterContinuation(beforeEntries, targetEntries, dimensionIds, stepCount, seedEntityIds = []) {
     const beforeById = new Map(beforeEntries.map((entry) => [entry.id, entry]));
     const targetById = new Map(targetEntries.map((entry) => [entry.id, entry]));
     const interpolatedDimensions = dimensionIds
@@ -2709,7 +2716,7 @@ export class SolverController {
       ));
     if (!interpolatedDimensions.length) {
       this.dimensions.restoreEntries(targetEntries, { emit: false });
-      return this.solve({ seedDimensionIds: dimensionIds });
+      return this.solve({ seedDimensionIds: dimensionIds, seedEntityIds });
     }
     const results = [];
     const variableSnapshot = () => new Map(this.model.allVariables().map((variable) => [variable.id, variable.value]));
@@ -2745,7 +2752,7 @@ export class SolverController {
           predictedEntityIds.add(variable.ownerId);
         }
       }
-      let result = this.solve({ seedDimensionIds: dimensionIds, maxIterations: parameterCorrectorIterations });
+      let result = this.solve({ seedDimensionIds: dimensionIds, seedEntityIds, maxIterations: parameterCorrectorIterations });
       if (isSuccessfulSolve(result) && predictedEntityIds.size) {
         result = { ...result, status: 'converged', changedEntityIds: [...new Set([...predictedEntityIds, ...(result.changedEntityIds || [])])] };
       }
