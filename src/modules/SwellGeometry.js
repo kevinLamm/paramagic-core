@@ -862,9 +862,55 @@ export function swellSourceComponents(entities = [], constraints = []) {
   return groups;
 }
 
+// Compare numeric source state before reusing a Worker result. Local edits,
+// Undo/Redo, parameter changes, and stale revisions cannot reuse old geometry.
+export function swellDisplayKey({ entities = [], constraints = [], evaluateLength = Number } = {}) {
+  const sources = entities.filter(isSwellEntity), ids = new Set(sources.map(e => e.id));
+  return JSON.stringify([sources.map(entity => {
+    const points = entity.type === 'rect' ? [[entity.x, entity.y], [entity.x + entity.width, entity.y],
+      [entity.x + entity.width, entity.y + entity.height], [entity.x, entity.y + entity.height]] : entity.points;
+    const segments = lineSegmentsForEntity(entity);
+    const evaluated = (segments.length ? segments.map(s => s.segmentIndex) : [null])
+      .map(index => evaluatedDefinition(swellDefinitionForEntity(entity, index), evaluateLength, entity));
+    return [entity.id, entity.type === 'rect' ? 'polygon' : entity.type, entity.start, entity.end, entity.arcPoint,
+      entity.center, entity.radius, points, Boolean(entity.closed), entity.composite, evaluated];
+  }), constraints.filter(c => c.type === 'Coincident' && c.enabled !== false && c.featureRefs?.some(r => ids.has(r.recordId)))
+    .map(c => c.featureRefs)]);
+}
+
+export function swellGeometryFromPacked(packet, entities, constraints) {
+  const byId = new Map(entities.map(e => [e.id, e])), results = new Map();
+  for (const id of packet.sourceIds) {
+    const entity = byId.get(id); if (!entity) return null;
+    results.set(id, { ownerId: id, sourceEntity: entity, closed: ['rect', 'polygon', 'circle'].includes(entity.type) || entity.composite?.closed === true, pieces: [], segmentResults: new Map() });
+  }
+  const data = packet.pieces, points = packet.points, roles = ['offset', 'start-transition', 'swell', 'end-transition'];
+  for (let i = 0; i < data.length; i += 18) {
+    const ownerId = packet.sourceIds[data[i]], kind = data[i + 4], point = offset => [data[i + offset], data[i + offset + 1]];
+    let entity;
+    if (kind === 1) entity = { type: 'line', start: point(5), end: point(7) };
+    else if (kind === 2) entity = { type: 'arc', start: point(5), end: point(7), arcPoint: point(9), center: point(11), radius: data[i + 13], ccw: Boolean(data[i + 14]), major: Boolean(data[i + 17]) };
+    else if (kind === 3) entity = { type: 'circle', center: point(11), radius: data[i + 13] };
+    else if (kind === 4) entity = { type: 'polyline', points: Array.from({ length: data[i + 16] }, (_, k) => [points[(data[i + 15] + k) * 2], points[(data[i + 15] + k) * 2 + 1]]) };
+    else return null;
+    const piece = featurePiece(ownerId, data[i + 1] < 0 ? null : data[i + 1], roles[data[i + 2]], entity, data[i + 3]);
+    results.get(ownerId).pieces.push(piece);
+  }
+  const sources = [...results.values()].map(r => r.sourceEntity);
+  applyBoundaryMetadata(results, sources, sourceTopology(sources, constraints).cycles);
+  return results;
+}
+
 export function createSwellGeometryEvaluator() {
   let cache = new Map();
-  return ({ entities = [], constraints = [], evaluateLength = Number } = {}) => {
+  const stats = { nativeHits: 0, referenceEvaluations: 0 };
+  const evaluate = ({ entities = [], constraints = [], evaluateLength = Number, nativeGeometry = null } = {}) => {
+    if (nativeGeometry && nativeGeometry.key === swellDisplayKey({ entities, constraints, evaluateLength })) {
+      const result = swellGeometryFromPacked(nativeGeometry, entities, constraints);
+      if (result) { stats.nativeHits++; stats.lastBackend = 'wasm'; return result; }
+    }
+    stats.referenceEvaluations++;
+    stats.lastBackend = 'javascript';
     const groups = swellSourceComponents(entities, constraints);
     const nextCache = new Map();
     const result = new Map();
@@ -886,6 +932,8 @@ export function createSwellGeometryEvaluator() {
     cache = nextCache;
     return result;
   };
+  evaluate.stats = stats;
+  return evaluate;
 }
 
 export function deriveSwellGeometry({ entities = [], constraints = [], evaluateLength = Number } = {}) {

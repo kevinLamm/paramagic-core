@@ -10,6 +10,8 @@ function sameLength(first, second) {
 }
 
 function pointReferenceKey(model, reference) {
+  // A derived point is not the source endpoint with the same index.
+  if (reference?.derivedFeature) return null;
   const recordId = reference?.recordId;
   if (!recordId) return null;
   const type = reference.kind || reference.type;
@@ -108,7 +110,8 @@ export function prepareArcSolveGeometry(model, dimensions, originalVariables) {
   const visited = new Set();
   let seeded = false;
   for (const constraint of constraints) {
-    if (constraint.type !== 'Radius' || constraint.coordinateSpace === 'global') continue;
+    if (constraint.type !== 'Radius' || constraint.coordinateSpace === 'global'
+      || constraint.featureRefs?.[0]?.derivedFeature) continue;
     const binding = model.binding(constraint.featureRefs?.[0]?.recordId);
     if (binding?.type !== 'arc' || visited.has(binding.id)) continue;
     visited.add(binding.id);
@@ -185,5 +188,5 @@ export function prepareArcSolveGeometry(model, dimensions, originalVariables) {
     });
     return { ...contract, variables, columnByVariableId, blocks };
   };
-  return { variables, project, reduceBlocks, changed: seeded || projected.length > 0, reducedArcCenters: projected.length };
+  return { variables, dependencies, project, reduceBlocks, changed: seeded || projected.length > 0, reducedArcCenters: projected.length };
 }

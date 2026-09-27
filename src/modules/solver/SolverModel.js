@@ -2,6 +2,7 @@ import { transformStackEntity, transformStackPoint, IDENTITY_FRAME } from '../St
 import { isCanvasOriginReference } from '../CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from '../ArcGeometry.js';
 import { createUuid } from '../IdentitySystem.js';
+import { isStackFrameRelationship } from '../StackRelationshipSystem.js';
 
 export class Variable {
   constructor({ id = createUuid(), value = 0, fixed = false, ownerId = null, parameterKey = null } = {}) {
@@ -655,7 +656,7 @@ export class SketchModel {
   refreshFixedVariables() {
     this.allVariables().forEach((variable) => { variable.fixed = false; });
     for (const constraint of this.constraints.values()) {
-      if (constraint.enabled === false || constraint.type !== 'Fixed') continue;
+      if (constraint.enabled === false || constraint.type !== 'Fixed' || isStackFrameRelationship(constraint)) continue;
       for (const feature of constraint.featureRefs || []) {
         const binding = this.binding(feature?.entityId || feature?.recordId);
         // A fixed derived point is an equation on its sources, not a lock on

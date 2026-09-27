@@ -1,6 +1,7 @@
 import { canvasFeatureFromEvent } from './CanvasSelection.js';
 import { GLOBAL_LAYER_ID, stackFrameFor } from './StackCoordinates.js';
 import { stackRelationshipSolveDomain } from './StackRelationshipSystem.js';
+import { constraintAvailableInStackContext } from './StackTransformPolicy.js';
 import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE } from './ArcGeometry.js';
 import { isSelfCoincidentConstraint } from './solver/ConstraintValidation.js';
@@ -659,7 +660,7 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
   }
 
   function setActiveConstraint(constraint) {
-    if (!supportedConstraints.includes(constraint)) {
+    if (!supportedConstraints.includes(constraint) || !constraintAvailableInStackContext(constraint, canvas.getActiveStackId?.())) {
       deactivate();
       return false;
     }
@@ -673,6 +674,8 @@ export function createConstraintHandlers({ canvas, solver, onApplied = null }) {
 
   function addSelection(rawFeature) {
     if (mutationPending) return false;
+    if (!constraintAvailableInStackContext(activeConstraint, canvas.getActiveStackId?.())) return false;
+    if (!canvas.getActiveStackId?.() && rawFeature?.linkedCopyId) return false;
     if (rawFeature?.kind === 'point' && !featureAllowed(activeConstraint, rawFeature)) return false;
     const feature = normalizeFeature(activeConstraint, rawFeature);
     if (!featureAllowed(activeConstraint, feature)) return false;

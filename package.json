@@ -6,6 +6,7 @@
   "sideEffects": false,
   "files": [
     "src",
+    "native",
     "vendor/xlsx-0.20.3.tgz",
     "README.md"
   ],

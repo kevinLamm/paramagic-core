@@ -18,7 +18,7 @@ function checkCancellation(shouldCancel) {
  * constraint is removed. The program depends only on the block topology, so it
  * is reused for every Newton correction and damping retry in this solve.
  */
-function compileTopology(contract, shouldCancel) {
+export function compileConstraintTopology(contract, shouldCancel) {
   const size = contract.variables.length;
   if (size > MAX_VARIABLES) return null;
   const graph = Array.from({ length: size }, () => new Set());
@@ -79,7 +79,7 @@ export function compileConstraintSystem(contract, { shouldCancel = null } = {}) 
   if (size > MAX_VARIABLES) return null;
   const key = `${size};${contract.blocks.length};${contract.blocks.map(block => block.columnIndexes.join(',')).join(';')}`;
   const cacheHit = topologyCache.has(key);
-  const topology = cacheHit ? topologyCache.get(key) : compileTopology(contract, shouldCancel);
+  const topology = cacheHit ? topologyCache.get(key) : compileConstraintTopology(contract, shouldCancel);
   if (!topology) return null;
   topologyCache.delete(key);
   topologyCache.set(key, topology);

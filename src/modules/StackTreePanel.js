@@ -1,4 +1,5 @@
 import { GLOBAL_LAYER_ID } from './StackCoordinates.js';
+import { requestStackDeletion } from './StackDeleteDialog.js';
 import {
   DRAWING_NODE_KIND,
   createStackTreeIndex,
@@ -87,7 +88,7 @@ export function createStackTreePanel({
   canvas,
   onSaveAs = () => {},
   onImport = () => {},
-  onRemove = (stackId) => canvas.removeStack(stackId),
+  onRemove = (stackId, options) => canvas.removeStack(stackId, options),
   getDrawingName = () => 'Untitled Drawing',
   minimumWidth = 190,
   maximumWidth = 520,
@@ -109,6 +110,7 @@ export function createStackTreePanel({
   let drawingRootExpanded = true;
   let geometryHoveredStackId = null;
   let resize = null;
+  let deletionRequest = null;
 
   host.classList.add('stack-tree-sidebar');
   host.setAttribute('aria-label', 'Stacks');
@@ -406,10 +408,13 @@ export function createStackTreePanel({
     return outcome;
   }
 
-  function removeStackImmediately(stackId) {
-    const stack = runtimeState.stacks.find(({ id }) => id === stackId);
-    if (!stack?.removable) return;
-    onRemove(stackId);
+  async function confirmStackRemoval(stackId) {
+    if (deletionRequest) return;
+    deletionRequest = new AbortController();
+    try {
+      await requestStackDeletion({ stackId, getStackState: canvas.getStackState,
+        removeStack: onRemove, signal: deletionRequest.signal });
+    } finally { deletionRequest = null; }
   }
 
   drawingRootRow.querySelector('[data-drawing-root-add]').addEventListener('click', () => canvas.addStack({ name: '', parentStackId: null }));
@@ -457,7 +462,7 @@ export function createStackTreePanel({
       } else if (event.target.closest('[data-stack-save-as]')) {
         onSaveAs(stackId);
       } else if (event.target.closest('[data-stack-delete]')) {
-        removeStackImmediately(stackId);
+        void confirmStackRemoval(stackId);
       }
       return;
     }
@@ -529,7 +534,7 @@ export function createStackTreePanel({
       const stack = index.byId.get(stackId);
       setManualEnabled(stackId, stack.enabled === false);
     } else if (event.key === 'F2') focusNameInput(stackId);
-    else if ((event.key === 'Delete' || event.key === 'Backspace') && !event.target.closest('input')) removeStackImmediately(stackId);
+    else if ((event.key === 'Delete' || event.key === 'Backspace') && !event.target.closest('input')) void confirmStackRemoval(stackId);
     else if (event.key === 'Home' && visibleIds[0]) select(visibleIds[0], { focus: true });
     else if (event.key === 'End' && visibleIds.at(-1)) select(visibleIds.at(-1), { focus: true });
     else return;
@@ -698,6 +703,7 @@ export function createStackTreePanel({
       updateDrawingRoot();
     },
     destroy() {
+      deletionRequest?.abort();
       clearTimeout(autoExpandTimer);
       canvas.setHoveredStackId?.(null);
       stopStackSubscription?.();

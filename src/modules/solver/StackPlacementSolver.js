@@ -1,8 +1,9 @@
 import { Variable } from './SolverModel.js';
-import { solveLevenbergMarquardt, isSuccessfulSolve } from './NumericSolverCore.js';
+import { isSuccessfulSolve } from './NumericSolverCore.js';
 import { GLOBAL_LAYER_ID, stackFrameFor } from '../StackCoordinates.js';
 import { isStackFrameRelationship } from '../StackRelationshipSystem.js';
-import { transitiveParticipantStackIds } from './StackSolveSystem.js';
+import { runSolverWork } from './SolverWork.js';
+import { isSwellEntity } from '../SwellGeometry.js';
 
 function relationshipStackIds(constraint) {
   return [...new Set([
@@ -83,10 +84,26 @@ function lockedStackIdsForComponent(component, options) {
 
 function stackVariables(stackId, frame) {
   return ['x', 'y', 'rotation'].map((key) => new Variable({
+    id: `stack-frame:${stackId}:${key}`,
     value: frame[key],
     ownerId: stackId,
     parameterKey: key,
   }));
+}
+
+function placementGeometry(controller, constraints) {
+  const selected = new Set(), visited = new Set(); let swell = false;
+  const visit = value => {
+    if (!value || typeof value !== 'object' || visited.has(value)) return;
+    visited.add(value);
+    const id = value.recordId || value.entityId;
+    if (id && !selected.has(id)) { selected.add(id); visit(controller.model.derivedEntity(id)); }
+    if (value.derivedFeature) swell = true;
+    Object.values(value).forEach(visit);
+  };
+  constraints.forEach(visit);
+  if (swell) for (const b of controller.model.entities.values()) if (isSwellEntity(b)) selected.add(b.id);
+  return new Map([...selected].map(id => [id, controller.model.binding(id)]).filter(([, b]) => b));
 }
 
 function activePlacementConstraints(controller) {
@@ -98,24 +115,12 @@ function activePlacementConstraints(controller) {
   ));
 }
 
-export function translateStackPlacementComponent(controller, stackId, dx, dy) {
-  const stackIds = [...transitiveParticipantStackIds(
-    controller.stackParticipationGraph(),
-    [String(stackId)],
-  )];
-  for (const relatedStackId of stackIds) {
-    const stack = controller.stackState.stacks.find(({ id }) => id === relatedStackId);
-    if (!stack?.frame) continue;
-    const frame = stackFrameFor(controller.stackState, relatedStackId);
-    stack.frame = { ...frame, x: frame.x + dx, y: frame.y + dy };
-  }
-  return stackIds;
-}
-
 // Every cross-Stack relationship component is one global placement system.
 // A temporary frame gauge keeps one requested/reference Stack still while all
 // other frames in the component remain available to satisfy its relationships.
-export function solveStackPlacements(controller, options = {}) {
+export function solveStackPlacements(controller, options = {}) { return runSolverWork(solveStackPlacementsWork(controller, options)); }
+
+export function* solveStackPlacementsWork(controller, options = {}) {
   const constraints = activePlacementConstraints(controller);
   for (const constraint of constraints) {
     if (isStackFrameRelationship(constraint) && (!constraint.movingStackId || !constraint.referenceStackId)) {
@@ -125,7 +130,8 @@ export function solveStackPlacements(controller, options = {}) {
 
   const explicitLocks = new Set((options.lockedStackIds || []).map(String));
   const components = placementComponents(constraints).filter((component) => (
-    !explicitLocks.size || component.stackIds.some((id) => explicitLocks.has(id))
+    options.projectStackId ? component.stackIds.includes(options.projectStackId)
+      : !explicitLocks.size || component.stackIds.some((id) => explicitLocks.has(id))
   ));
   if (!components.length) {
     return { status: 'unchanged', changedStackIds: [], changedEntityIds: [], finalError: 0, iterations: 0 };
@@ -137,11 +143,47 @@ export function solveStackPlacements(controller, options = {}) {
 
   for (const component of components) {
     const lockedStackIds = lockedStackIdsForComponent(component, options);
-    const variablesByStack = new Map(component.stackIds
-      .filter((stackId) => stackId !== GLOBAL_LAYER_ID && !lockedStackIds.has(stackId))
-      .map((stackId) => [stackId, stackVariables(stackId, stackFrameFor(controller.stackState, stackId))]));
-    const variables = [...variablesByStack.values()].flat();
-    const model = Object.create(controller.model);
+    controller.placementWorlds ||= new Map();
+    const key = component.stackIds.join('|');
+    let resident = controller.placementWorlds.get(key);
+    if (!resident) {
+      resident = { frames: new Map(component.stackIds.map(id => [id, stackVariables(id, stackFrameFor(controller.stackState, id))])), geometry: new Map(), model: Object.create(controller.model) };
+      controller.placementWorlds.set(key, resident);
+      if (controller.placementWorlds.size > 8) controller.placementWorlds.delete(controller.placementWorlds.keys().next().value);
+    }
+    const variablesByStack = resident.frames;
+    for (const [id, variables] of variablesByStack) {
+      const frame = stackFrameFor(controller.stackState, id);
+      variables.forEach(v => { v.value = frame[v.parameterKey]; });
+    }
+    for (const [id, variables] of variablesByStack) variables.forEach(v => { v.locked = id === GLOBAL_LAYER_ID || lockedStackIds.has(id); });
+    const frameVariables = [...variablesByStack.values()].flat();
+    // Geometry is constant in the frame solve. These read-only variable views
+    // retain its packed coordinates without changing document fixed/lock flags.
+    const bindings = controller.numericBackend ? placementGeometry(controller, component.constraints) : controller.model.entities;
+    const geometry = controller.numericBackend ? [...bindings.values()].flatMap(b => b.allVariables()).map(v => {
+      let constant = resident.geometry.get(v.id);
+      if (!constant) { constant = { id: v.id, ownerId: v.ownerId, parameterKey: v.parameterKey, active: false }; resident.geometry.set(v.id, constant); }
+      constant.value = v.value; return constant;
+    }) : [];
+    if (resident.geometry.size !== geometry.length) resident.geometry = new Map(geometry.map(v => [v.id, v]));
+    const variables = [...frameVariables, ...geometry];
+    const model = resident.model;
+    model.entities = bindings;
+    model.source = controller.model;
+    model.nativeSessionKey = `placement:${component.stackIds.join('|')}`;
+    model.placementVariables = variablesByStack;
+    model.placementVariableIds = constraint => {
+      const stacks = new Set(relationshipStackIds(constraint));
+      const visit = value => {
+        if (!value || typeof value !== 'object') return;
+        if (value.recordId || value.entityId) stacks.add(value.stackId || model.binding(value.recordId || value.entityId)?.stackId);
+        if (value.derivedFeature) for (const b of model.entities.values()) if (isSwellEntity(b)) stacks.add(b.stackId);
+        Object.values(value).forEach(visit);
+      };
+      visit(constraint);
+      return [...stacks].flatMap(id => (variablesByStack.get(id) || []).map(v => v.id));
+    };
     model.constraints = new Map(component.constraints.map((constraint) => [constraint.id, constraint]));
     model.stackFrame = (id) => {
       const stackVariablesForId = variablesByStack.get(id);
@@ -150,16 +192,40 @@ export function solveStackPlacements(controller, options = {}) {
         : stackFrameFor(controller.stackState, id);
     };
     model.allVariables = () => variables;
-    model.activeVariables = () => variables;
+    model.activeVariables = () => frameVariables.filter(v => v.active);
     model.intrinsicResiduals = () => [];
-    result = solveLevenbergMarquardt({
-      ...options,
-      tolerance: options.tolerance ?? 1e-8,
-      model,
-      registry: controller.registry,
-      dimensions: controller.dimensions,
-      jacobianMode: 'dense',
-    });
+    try {
+      const solveOptions = {
+        ...options,
+        numericBackend: controller.numericBackend,
+        tolerance: options.tolerance ?? 1e-8,
+        model,
+        registry: controller.registry,
+        dimensions: controller.dimensions,
+        jacobianMode: 'dense',
+      };
+      // Distance edits should preserve the accepted frame directions when
+      // translation can satisfy the equations. These are temporary solve
+      // locks, never drawing constraints; release them when rotation is needed.
+      const distanceEdit = seededPlacementConstraints(component, options).some(constraint => (
+        constraint.source === 'dimension'
+        && ['Distance', 'Horizontal Distance', 'Vertical Distance', 'Point Line Distance', 'Line Line Distance'].includes(constraint.type)
+      ));
+      const rotations = distanceEdit || options.projectStackId
+        ? frameVariables.filter(v => v.parameterKey === 'rotation' && !v.locked) : [];
+      if (rotations.length) {
+        const values = frameVariables.map(v => v.value);
+        rotations.forEach(v => { v.locked = true; });
+        result = yield solveOptions;
+        rotations.forEach(v => { v.locked = false; });
+        if (!isSuccessfulSolve(result) && result.status !== 'cancelled') {
+          const translationResult = result;
+          frameVariables.forEach((v, i) => { v.value = values[i]; });
+          result = yield solveOptions;
+          result = { ...result, translationIterations: translationResult.iterations || 0 };
+        }
+      } else result = yield solveOptions;
+    } finally { frameVariables.forEach(v => { v.locked = false; }); }
     if (!isSuccessfulSolve(result)) {
       before.forEach(([stack, original]) => { if (original) stack.frame = original; });
       return {
@@ -171,6 +237,7 @@ export function solveStackPlacements(controller, options = {}) {
     }
 
     for (const [stackId, stackVariablesForId] of variablesByStack) {
+      if (lockedStackIds.has(stackId) || stackId === GLOBAL_LAYER_ID) continue;
       const frame = stackFrameFor(controller.stackState, stackId);
       if (!stackVariablesForId.some((variable) => Math.abs(variable.value - frame[variable.parameterKey]) > 1e-10)) continue;
       const stack = controller.stackState.stacks.find(({ id }) => id === stackId);

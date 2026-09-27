@@ -21,9 +21,10 @@ export class SolverWorkerRuntime {
     controller = null,
     interactiveSolveOptions = {},
     jacobianMode = 'dense',
+    numericBackend = null,
   } = {}) {
     this.jacobianMode = jacobianMode === 'blocks' ? 'blocks' : 'dense';
-    this.controller = controller || createSolverController({ jacobianMode: this.jacobianMode });
+    this.controller = controller || createSolverController({ jacobianMode: this.jacobianMode, numericBackend });
     this.latestInteractiveGeneration = -1;
     this.interactiveBaseline = null;
     this.interactiveRequest = null;
@@ -136,7 +137,48 @@ export class SolverWorkerRuntime {
     }
   }
 
+  supersede(requestToken) {
+    if (this.activeRequest?.requestToken === requestToken) this.activeRequest.superseded = true;
+  }
+
+  async dispatchAsync(type, payload, shouldCancel) {
+    if (type === 'set-dimension') return this.controller.setDimensionAsync(payload.dimensionId, payload.expression, shouldCancel);
+    if (type === 'update-parameter') return this.controller.updateParameterAsync(payload.parameterId, payload.patch || {}, shouldCancel);
+    if (type === 'solve' && !this.interactiveRequest) return this.controller.solveAsync({ ...payload.options, solveMode: 'final' }, shouldCancel);
+    return this.dispatch(type, payload);
+  }
+
   handleRequest(message) {
+    const work = this.requestWork(message);
+    try {
+      const next = work.next();
+      if (next.done) return next.value;
+      return work.next(this.dispatch(next.value.type, next.value.payload)).value;
+    } catch (error) { return work.throw(error).value; }
+    finally { work.return(); }
+  }
+
+  async handleRequestAsync(message) {
+    if (this.activeRequest) throw new Error('Worker commands must be serialized.');
+    const work = this.requestWork(message);
+    this.activeRequest = { requestToken: message?.requestToken, superseded: false };
+    try {
+      const next = work.next();
+      if (next.done) return next.value;
+      const outcome = await this.dispatchAsync(next.value.type, next.value.payload,
+        () => this.activeRequest.superseded ? 'superseded' : false);
+      const response = work.next(outcome).value;
+      // The controller has restored the cancelled transaction before returning.
+      if (response.diagnostics.cancellationReason === 'superseded') {
+        response.status = 'superseded';
+        response.changedEntities = []; response.changedParameters = []; response.changedConstraints = [];
+      }
+      return response;
+    } catch (error) { return work.throw(error).value; }
+    finally { this.activeRequest = null; work.return(); }
+  }
+
+  *requestWork(message) {
     let request;
     try {
       request = validateSolverWorkerRequest(message);
@@ -165,7 +207,7 @@ export class SolverWorkerRuntime {
       const changedParameterIds = parameterMutationId
         ? this.controller.dimensions.affectedIds(parameterMutationId)
         : new Set();
-      const outcome = this.dispatch(request.type, request.payload);
+      const outcome = yield request;
       const result = solveResult(outcome, this.controller);
       if (parameterMutationId) {
         this.controller.dimensions.affectedIds(parameterMutationId).forEach((id) => changedParameterIds.add(id));
@@ -190,6 +232,8 @@ export class SolverWorkerRuntime {
         : [];
       return createSolverWorkerResult(request, {
         status: result.status || 'completed',
+        derivedGeometry: this.controller.numericBackend && isSuccessfulSolve(result)
+          ? this.controller.numericBackend.derivedGeometry?.(this.controller.model, this.controller.dimensions) : undefined,
         stackState: structuredClone(this.controller.stackState),
         message: result.message,
         changedEntities,
@@ -200,8 +244,16 @@ export class SolverWorkerRuntime {
         snapshot: request.type === 'get-snapshot' ? outcome?.snapshot : undefined,
         diagnostics: {
           durationMs: now() - startedAt,
+          backend: result.backend || 'javascript',
+          placementBackend: result.placementBackend || null,
+          placementIterations: result.placementIterations || 0,
+          placementMs: result.placementTimings?.totalMs || 0,
+          initialError: result.initialError ?? null,
+          finalError: result.finalError ?? null,
           solveScope: result.solveScope || null,
           iterations: Number(result.iterations) || 0,
+          continuationSteps: Number(result.continuationSteps) || 0,
+          continuationIterations: Number(result.continuationIterations) || 0,
           solveMode: result.solveMode || null,
           cancellationReason: result.cancellationReason || null,
           acceptedSteps: Number(result.acceptedSteps) || 0,

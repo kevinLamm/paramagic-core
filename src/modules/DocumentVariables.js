@@ -12,6 +12,8 @@ const dateValue = (value, fallback = new Date()) => {
 
 const editableFields = [
   ['documentTitle', 'Document Title'],
+  ['drawingDescription', 'Drawing Description'],
+  ['developers', 'Developer(s)'],
   ['drawingNumber', 'Drawing Number'],
   ['revision', 'Revision'],
   ['revisionDescription', 'Revision Description'],
@@ -39,6 +41,8 @@ export const DOCUMENT_VARIABLE_SPECS = Object.freeze([
   { name: 'FileName', label: 'File Name', key: 'fileName', readOnly: true },
   { name: 'FilePath', label: 'File Path', key: 'filePath', readOnly: true },
   { name: 'DocumentTitle', label: 'Document Title', key: 'documentTitle' },
+  { name: 'DrawingDescription', label: 'Drawing Description', key: 'drawingDescription', multiline: true },
+  { name: 'Developers', label: 'Developer(s)', key: 'developers' },
   { name: 'DrawingNumber', label: 'Drawing Number', key: 'drawingNumber' },
   { name: 'Revision', label: 'Revision', key: 'revision' },
   { name: 'RevisionDescription', label: 'Revision Description', key: 'revisionDescription' },

@@ -1,4 +1,5 @@
-import { GLOBAL_LAYER_ID } from './StackCoordinates.js';
+import { GLOBAL_LAYER_ID, normalizeStackFrame } from './StackCoordinates.js';
+import { planStackDeletion } from './StackDeletion.js';
 import {
   isCanvasPresentationSourceNode,
   mountCanvasPresentationSvg,
@@ -531,7 +532,7 @@ export function createStackSystem({
     renderStackHoverOverlay(hoverOverlayLayer, hoverSources);
   }
 
-  function addStack(options = '') {
+  function addStack(options = '', { history = 'commit', select = true } = {}) {
     const request = typeof options === 'string' ? { name: options } : (options || {});
     const parentStackId = request.parentStackId || null;
     if (parentStackId && (!stack(parentStackId) || parentStackId === GLOBAL_LAYER_ID)) return null;
@@ -544,6 +545,7 @@ export function createStackSystem({
       kind: STACK_NODE_KIND,
       sourceStackId: null,
       parentStackId,
+      frame: normalizeStackFrame(request.frame),
       order: siblingCount,
       name: uniqueStackName(requestedName, state.stacks, { fallback: automaticName }),
       visible: true,
@@ -555,8 +557,8 @@ export function createStackSystem({
     if (Number.isFinite(Number(request.siblingIndex))) {
       replaceState(reparentStackState(state, id, parentStackId, request.siblingIndex));
     }
-    selectedStackId = id;
-    emit('add', { history: 'commit', affectedStackIds: [id] });
+    if (select) selectedStackId = id;
+    emit('add', { history, affectedStackIds: [id] });
     return clone(stack(id));
   }
 
@@ -685,13 +687,12 @@ export function createStackSystem({
     return true;
   }
 
-  function removeStackSubtree(stackId) {
-    const target = stack(stackId);
-    if (!target?.removable) return false;
-    const removedStackIds = subtreeStackIds(state, stackId);
-    const recordIds = recordIdsForSubtree(stackId);
+  function removeStackSubtree(stackId, options = {}) {
+    const plan = planStackDeletion(state, stackId, options);
+    if (!plan) return false;
+    const { removedStackIds, promotedStackIds, remainingStacks } = plan;
+    const recordIds = removedStackIds.flatMap(recordIdsForStack);
     const unavailable = new Set(removedStackIds);
-    const remainingStacks = state.stacks.filter(({ id }) => !unavailable.has(id));
     const replacementStack = userStacks({ stacks: remainingStacks }).length
       ? null
       : newUserStackRecord({ stacks: remainingStacks });
@@ -705,13 +706,13 @@ export function createStackSystem({
     if (replacementStack || unavailable.has(selectedStackId)) selectedStackId = state.activeStackId;
     emit('remove-subtree', {
       history: 'commit',
-      affectedStackIds: [...removedStackIds, replacementStack?.id].filter(Boolean),
+      affectedStackIds: [...removedStackIds, ...promotedStackIds, replacementStack?.id].filter(Boolean),
     });
     return { removedStackIds, recordIds, createdStackId: replacementStack?.id || null };
   }
 
-  function removeStack(stackId) {
-    return Boolean(removeStackSubtree(stackId));
+  function removeStack(stackId, options) {
+    return Boolean(removeStackSubtree(stackId, options));
   }
 
   function recordIdsForStack(stackId) {

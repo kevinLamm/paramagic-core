@@ -4,6 +4,7 @@ import { rememberRepeatableTool } from './CanvasUIControls.js';
 import { isCanvasOriginReference } from './CanvasOrigin.js';
 import { ARC_MIDPOINT_ROLE, arcSweepFromAngles } from './ArcGeometry.js';
 import { stackRelationshipSolveDomain } from './StackRelationshipSystem.js';
+import { stackTransformDimensionAllowed } from './StackTransformPolicy.js';
 import { createExpressionBoxLookup, expressionBoxLookupMarkup } from './ExpressionBox.js';
 import { canvasPointerDragReady } from './CanvasPointerDrag.js';
 import { canvasFeatureFromEvent } from './CanvasSelection.js';
@@ -2522,7 +2523,40 @@ function mclDimension(features, pointer, drawingUnit) {
   };
 }
 
-export function candidateFromSelections(selections, pointer, mode, ctrlMcl = false, drawingUnit = 'in') {
+function pointEdgeDimension(pointFeature, edge, pointer, mode, drawingUnit, solveDomain) {
+  const placement = solveDomain === 'stack-frame';
+  const projectionMode = placement ? 'line' : 'segment';
+  const projected = projectionOnSegmentSmart(pointFeature.point, edge, projectionMode);
+  const dimension = distanceDimensionSmart(projected, pointFeature.point, pointer, mode, projected, pointFeature.point, {
+    pointToSegment: {
+      point: pointAnchor(pointFeature), segment: segmentAnchor(edge),
+      ...(placement ? { projectionMode } : {}),
+    },
+  }, drawingUnit);
+  dimension.firstSegment = dimensionExtensionSegment(edge);
+  if (placement) {
+    // A Stack's distance to an edge measures its supporting line, including
+    // beyond the endpoints. Label placement must not change that relationship
+    // into an axis component of a distance to a corner.
+    dimension.measurementKind = 'point-edge-distance';
+    dimension.subtype = 'aligned';
+    dimension.direction = unitSmart(subtractSmart(pointFeature.point, projected));
+    dimension.measuredValue = pointDistanceSmart(projected, pointFeature.point);
+    dimension.text = formatDrawingLengthSmart(dimension.measuredValue, drawingUnit);
+    delete dimension.orientation;
+    delete dimension.offsetDirection;
+    delete dimension.offsetDistance;
+    recordDistanceDimensionPlacement(dimension);
+  }
+  if (mode === 'driving' && pointFeature.entityType === 'notch') {
+    dimension.externalDrivingTarget = {
+      type: 'notch-distance', recordId: pointFeature.recordId, otherSegment: segmentAnchor(edge),
+    };
+  }
+  return dimension;
+}
+
+export function candidateFromSelections(selections, pointer, mode, ctrlMcl = false, drawingUnit = 'in', { solveDomain } = {}) {
   if (ctrlMcl && mode === 'driven' && selections.length) return mclDimension(selections, pointer, drawingUnit);
   if (mode === 'driving') {
     const linkedPosition = linkedPositionDimension(selections, pointer, drawingUnit);
@@ -2565,34 +2599,10 @@ export function candidateFromSelections(selections, pointer, mode, ctrlMcl = fal
       return dimension;
     }
     if (first.kind === 'point' && second.kind === 'segment') {
-      const projected = projectionOnSegmentSmart(first.point, second);
-      const dimension = distanceDimensionSmart(projected, first.point, pointer, mode, projected, first.point, {
-        pointToSegment: { point: pointAnchor(first), segment: segmentAnchor(second) },
-      }, drawingUnit);
-      dimension.firstSegment = dimensionExtensionSegment(second);
-      if (mode === 'driving' && first.entityType === 'notch') {
-        dimension.externalDrivingTarget = {
-          type: 'notch-distance',
-          recordId: first.recordId,
-          otherSegment: segmentAnchor(second),
-        };
-      }
-      return dimension;
+      return pointEdgeDimension(first, second, pointer, mode, drawingUnit, solveDomain);
     }
     if (first.kind === 'segment' && second.kind === 'point') {
-      const projected = projectionOnSegmentSmart(second.point, first);
-      const dimension = distanceDimensionSmart(projected, second.point, pointer, mode, projected, second.point, {
-        pointToSegment: { point: pointAnchor(second), segment: segmentAnchor(first) },
-      }, drawingUnit);
-      dimension.firstSegment = dimensionExtensionSegment(first);
-      if (mode === 'driving' && second.entityType === 'notch') {
-        dimension.externalDrivingTarget = {
-          type: 'notch-distance',
-          recordId: second.recordId,
-          otherSegment: segmentAnchor(first),
-        };
-      }
-      return dimension;
+      return pointEdgeDimension(second, first, pointer, mode, drawingUnit, solveDomain);
     }
     if (first.kind === 'segment' && second.kind === 'segment') {
       if (areParallel(first, second)) {
@@ -2611,6 +2621,7 @@ export function radialCandidateUsesPlacementClick(candidate, mode, event = {}) {
 
 export function commitSmartDimensionCandidate(canvas, candidate, { preserveSelectionThroughClick = false } = {}) {
   if (!candidate) return false;
+  if (!canvas.getActiveStackId?.() && !stackTransformDimensionAllowed(candidate, canvas.getRecordStackId)) return false;
   canvas.addDimension({
     ...candidate,
     solveDomain: stackRelationshipSolveDomain(canvas.getActiveStackId?.()),
@@ -2673,7 +2684,10 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
   }
 
   function updateCandidate(pointer) {
-    candidate = candidateFromSelections(selections, pointer, activeMode, ctrlMcl, canvas.getDrawingUnit?.() || 'in');
+    candidate = candidateFromSelections(selections, pointer, activeMode, ctrlMcl, canvas.getDrawingUnit?.() || 'in', {
+      solveDomain: stackRelationshipSolveDomain(canvas.getActiveStackId?.()),
+    });
+    if (!canvas.getActiveStackId?.() && !stackTransformDimensionAllowed(candidate, canvas.getRecordStackId)) candidate = null;
     if (candidate) canvas.setDimensionPreview(candidate);
     else canvas.clearPreview();
   }
@@ -2700,7 +2714,7 @@ export function createSmartDimensionTools({ toolbar, canvas }) {
   function placeCandidate({ preserveSelectionThroughClick = false } = {}) {
     if (!candidate) return false;
     const completedMode = activeMode;
-    commitSmartDimensionCandidate(canvas, candidate, { preserveSelectionThroughClick });
+    if (!commitSmartDimensionCandidate(canvas, candidate, { preserveSelectionThroughClick })) return false;
     deactivate();
     rememberRepeatableTool(() => {
       if (activeMode) return false;

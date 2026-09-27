@@ -1,8 +1,9 @@
+import { runSolverWork, runSolverWorkAsync } from './SolverWork.js';
 import { GLOBAL_LAYER_ID, normalizeStackFrame, stackFrameFor, transformStackEntity } from '../StackCoordinates.js';
-import { solveStackPlacements, translateStackPlacementComponent } from './StackPlacementSolver.js';
+import { solveStackPlacements, solveStackPlacementsWork } from './StackPlacementSolver.js';
 import { ConstraintRegistry } from './ConstraintRegistry.js';
 import { ConstraintGraph } from './ConstraintGraph.js';
-import { solveConstraintComponents, solveConstraintScope } from './ComponentSolver.js';
+import { solveConstraintComponentsWork, solveConstraintScope } from './ComponentSolver.js';
 import {
   DEFAULT_SOLVE_TOLERANCE,
   DimensionRepository,
@@ -12,6 +13,7 @@ import {
 import { SketchModel } from './SolverModel.js';
 import { createSwellSolverProvider } from '../SwellSolver.js';
 import { createUuid } from '../IdentitySystem.js';
+import { stackTransformDimensionAllowed, stackTransformConstraintError } from '../StackTransformPolicy.js';
 import { findDrivingDimensionLoop, formatDrivingDimensionLoopMessage } from './DimensionConflictDiagnostics.js';
 import { formatUnitlessValue, formatValueOnlyDimensionValue, unitFactors } from './Units.js';
 import { remapCurvePointIndex } from '../DrawingTools.js';
@@ -216,6 +218,8 @@ function combineContinuationResults(results) {
       : [],
     timings,
     continuationSteps: results.length,
+    placementTimings: { totalMs: results.reduce((sum, r) => sum + (r.placementTimings?.totalMs || 0), 0) },
+    placementIterations: results.reduce((sum, r) => sum + (r.placementIterations || 0), 0),
     continuationIterations: results.reduce((sum, result) => sum + (Number(result.iterations) || 0), 0),
     continuationAcceptedSteps: results.reduce((sum, result) => sum + (Number(result.acceptedSteps) || 0), 0),
     continuationRejectedSteps: results.reduce((sum, result) => sum + (Number(result.rejectedSteps) || 0), 0),
@@ -581,12 +585,15 @@ function segmentRefFromAnchors(anchors) {
 export class SolverController {
   constructor({
     jacobianMode = 'dense',
+    numericBackend = null,
     matrixFreeVariableThreshold,
     rigidFirstConstraintSolve = rigidFirstConstraintSolveDefault,
   } = {}) {
+    this.numericBackend = numericBackend;
     this.model = new SketchModel();
     this.model.stackFrame = (id) => stackFrameFor(this.stackState, id || this.defaultStackId());
     this.dimensions = new DimensionRepository();
+    this.dimensions.numericEvaluator = numericBackend?.createParameters?.() || null;
     this.model.derivedFeatureProviders.set('swell', createSwellSolverProvider(this.model, this.dimensions));
     this.registry = new ConstraintRegistry();
     this.constraintGraph = null;
@@ -649,16 +656,18 @@ export class SolverController {
     }
     const beforeFrames = new Map(this.stackState.stacks.map(({ id, frame }) => [id, clone(frame || {})]));
     const beforeAnnotations = new Map([...this.dimensionAnnotations].map(([id, annotation]) => [id, clone(annotation)]));
-    const previousTargetFrame = normalizeStackFrame(target.frame);
     const nextTargetFrame = normalizeStackFrame({ ...target.frame, ...requestedFrame });
-    translateStackPlacementComponent(
-      this,
-      stackId,
-      nextTargetFrame.x - previousTargetFrame.x,
-      nextTargetFrame.y - previousTargetFrame.y,
-    );
+    // Only the dragged frame receives the pointer's translation. Related
+    // Stacks start from their current placements; the equations determine
+    // which of their remaining degrees of freedom need to move.
     target.frame = nextTargetFrame;
-    const placement = solveStackPlacements(this, { ...options, lockedStackIds: [stackId] });
+    let placement = solveStackPlacements(this, { ...options, lockedStackIds: [stackId] });
+    if (!isSuccessfulSolve(placement) && placement.status !== 'cancelled') {
+      // A world relationship may prohibit one component of pointer motion.
+      // Project the requested placement onto the allowed translations so the
+      // remaining sliding freedom is still usable with a diagonal drag.
+      placement = solveStackPlacements(this, { ...options, lockedStackIds: [], projectStackId: stackId });
+    }
     if (!isSuccessfulSolve(placement)) {
       this.stackState.stacks.forEach((stack) => {
         if (beforeFrames.has(stack.id)) stack.frame = clone(beforeFrames.get(stack.id));
@@ -671,6 +680,14 @@ export class SolverController {
         snapshot: this.getGeometrySnapshot(),
         snapshotMode: 'full',
       };
+    }
+    // A projected drag may return to its accepted frame within numerical
+    // precision. Keep that exact frame so a blocked move creates no history.
+    for (const stack of this.stackState.stacks) {
+      const previous = beforeFrames.get(stack.id);
+      if (stack.frame && previous && ['x', 'y', 'rotation'].every(key => Math.abs(stack.frame[key] - previous[key]) <= 1e-10)) {
+        stack.frame = clone(previous);
+      }
     }
     const changedStackIds = this.stackState.stacks
       .filter((stack) => JSON.stringify(stack.frame || {}) !== JSON.stringify(beforeFrames.get(stack.id) || {}))
@@ -713,7 +730,7 @@ export class SolverController {
   restoreStackPlacementState(snapshot = {}) {
     const frames = new Map(snapshot.frames || []);
     this.stackState.stacks.forEach((stack) => {
-      if (frames.has(stack.id)) stack.frame = normalizeStackFrame(frames.get(stack.id));
+      if (stack.id !== GLOBAL_LAYER_ID && frames.has(stack.id)) stack.frame = normalizeStackFrame(frames.get(stack.id));
     });
     this.dimensionAnnotations = new Map((snapshot.annotations || []).map(([id, annotation]) => [id, clone(annotation)]));
     this.refreshComputedDimensionsForStackIds(this.stackState.stacks.map(({ id }) => id));
@@ -746,7 +763,9 @@ export class SolverController {
       ? referencedStackIds
       : (value?.participantStackIds || []);
     const participants = [...new Set(participantIds.map(String))];
-    if (participants.length > 1) stackId = GLOBAL_LAYER_ID;
+    const inherited = value?.dimensionRef ? this.dimensionAnnotations.get(value.dimensionRef) : null;
+    const frameRelationship = (value?.solveDomain || inherited?.solveDomain) === STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN;
+    if (participants.length > 1 || (frameRelationship && participants.length)) stackId = GLOBAL_LAYER_ID;
     else if (participants.length === 1) stackId = participants[0];
     return {
       stackId,
@@ -815,12 +834,22 @@ export class SolverController {
       );
       Object.assign(result, { coordinateSpace: 'global', solveDomain });
       if (solveDomain === STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN) {
-        const referenceStackId = hasGlobalOrigin ? GLOBAL_LAYER_ID : value.referenceStackId || inherited?.referenceStackId
+        const referenceStackId = hasGlobalOrigin || participants.length === 1 ? GLOBAL_LAYER_ID : value.referenceStackId || inherited?.referenceStackId
           || (participants.includes(this.stackState.activeStackId) ? this.stackState.activeStackId : participants[0]);
         Object.assign(result, {
           referenceStackId,
           movingStackId: value.movingStackId || inherited?.movingStackId || participants.find((id) => id !== referenceStackId),
         });
+        if (['Horizontal', 'Vertical'].includes(value.type) && !result.axisDirection) {
+          const segment = this.model.resolveSegment(value.featureRefs?.[0]);
+          if (segment) {
+            const axis = value.type === 'Horizontal' ? 0 : 1;
+            result.axisDirection = segment.end[axis] - segment.start[axis] < -1e-10 ? -1 : 1;
+          }
+        }
+        if (value.type === 'Fixed' && !value.featureRefs?.some(ref => ref.kind === 'point' || ref.type === 'point')) {
+          result.fixedFrame = value.fixedFrame || { ...this.model.stackFrame(result.movingStackId) };
+        }
       } else {
         delete result.referenceStackId;
         delete result.movingStackId;
@@ -948,7 +977,9 @@ export class SolverController {
     return new Set([...ids].filter((stackId) => stackId !== GLOBAL_LAYER_ID && this.isStackEnabled(stackId)));
   }
 
-  solveStackSet(stackIds, solveOptions, graph = this.getConstraintGraph()) {
+  solveStackSet(...args) { return runSolverWork(this.solveStackSetWork(...args)); }
+
+  *solveStackSetWork(stackIds, solveOptions, graph = this.getConstraintGraph()) {
     const requested = new Set([...stackIds].filter((stackId) => this.isStackEnabled(stackId)));
     const entityIds = [...requested].flatMap((stackId) => [...(this.entityIdsByStack.get(stackId) || [])]);
     const scope = graph.scopeForSeeds({ entityIds });
@@ -969,9 +1000,9 @@ export class SolverController {
       };
     }
     const scopedModel = graph.scopedModel(scope);
-    const scopedGraph = new ConstraintGraph(scopedModel);
+    const scopedGraph = new ConstraintGraph(scopedModel, { nativeGraph: this.numericBackend?.createGraph?.() });
     const computedDependencyIds = this.dimensions.computedDependencyIds(scope.dimensionIds);
-    const result = solveConstraintComponents({
+    const result = yield* solveConstraintComponentsWork({
       ...solveOptions,
       model: scopedModel,
       graph: scopedGraph,
@@ -1082,6 +1113,7 @@ export class SolverController {
 
   getConstraintGraph() {
     if (!this.constraintGraph) this.constraintGraph = new ConstraintGraph(this.model, {
+      nativeGraph: this.numericBackend?.createGraph?.(),
       includeEntity: (entityId) => this.isStackEnabled(
         this.entityStackIds.get(entityId)
         || this.model.entity(entityId)?.stackId
@@ -1439,7 +1471,9 @@ export class SolverController {
     };
   }
 
-  solve(options = {}) {
+  solve(...args) { return runSolverWork(this.solveWork(...args)); }
+
+  *solveWork(options = {}) {
     const enabledRelationships = [...this.model.constraints.values()].filter((constraint) => (
       constraint.enabled !== false && this.relationshipIsEnabled(constraint)
     ));
@@ -1454,7 +1488,7 @@ export class SolverController {
         tolerance: Math.min(Number.isFinite(requestedTolerance) ? requestedTolerance : Infinity, 1e-8),
       }
       : options;
-    if (!hasStackFrameRelationships) return this.solveLocal(solveOptions);
+    if (!hasStackFrameRelationships) return yield* this.solveLocalWork(solveOptions);
     const localSolveOptions = {
       ...solveOptions,
       seedConstraintIds: (solveOptions.seedConstraintIds || []).filter((constraintId) => (
@@ -1467,9 +1501,9 @@ export class SolverController {
     };
     const before = this.model.snapshot();
     const frames = this.stackState.stacks.map((stack) => [stack, clone(stack.frame || {})]);
-    const local = this.solveLocal(localSolveOptions);
+    const local = yield* this.solveLocalWork(localSolveOptions);
     if (!isSuccessfulSolve(local)) return local;
-    const placement = solveStackPlacements(this, solveOptions);
+    const placement = yield* solveStackPlacementsWork(this, solveOptions);
     if (!isSuccessfulSolve(placement)) {
       frames.forEach(([stack, frame]) => { if (stack.frame) stack.frame = frame; });
       restoreEntities(this.model, before);
@@ -1485,6 +1519,9 @@ export class SolverController {
       }
       this.lastResult = {
         ...local,
+        placementBackend: placement.backend,
+        placementIterations: placement.iterations,
+        placementTimings: placement.timings,
         status: placement.changedStackIds?.length ? 'converged' : local.status,
         changedStackIds: placement.changedStackIds || [],
         changedEntityIds: [...new Set([...(local.changedEntityIds || []), ...(placement.changedEntityIds || [])])],
@@ -1495,7 +1532,10 @@ export class SolverController {
     return this.lastResult;
   }
 
-  solveLocal({
+  solveLocal(...args) { return runSolverWork(this.solveLocalWork(...args)); }
+
+  *solveLocalWork({
+    topologyToken = null,
     seedVariableIds = [],
     seedEntityIds = [],
     seedConstraintIds = [],
@@ -1533,6 +1573,8 @@ export class SolverController {
       })
       : seedScope;
     const solveOptions = {
+      numericBackend: this.numericBackend,
+      topologyToken,
       registry: this.registry,
       dimensions: this.dimensions,
       solveMode,
@@ -1545,10 +1587,10 @@ export class SolverController {
     };
     if (scope) {
       const scopedModel = graph.scopedModel(scope);
-      this.lastResult = solveConstraintComponents({
+      this.lastResult = yield* solveConstraintComponentsWork({
         ...solveOptions,
         model: scopedModel,
-        graph: new ConstraintGraph(scopedModel),
+        graph: new ConstraintGraph(scopedModel, { nativeGraph: this.numericBackend?.createGraph?.() }),
         computedDimensionIds: this.dimensions.computedDependencyIds(scope.dimensionIds),
       });
       this.lastResult.solveScope = affectedStackIds?.size ? {
@@ -1568,10 +1610,10 @@ export class SolverController {
       this.lastResult = this.decorateStackFailure(this.lastResult, affectedStackIds || seededStackIds);
       this.refreshComputedDimensionsForStackIds(affectedStackIds || seededStackIds);
     } else if (fullSolve || !hasSeeds) {
-      const results = stackParticipationGroups(participantGraph).map((stackIds) => ({
-        stackIds,
-        result: this.decorateStackFailure(this.solveStackSet(stackIds, solveOptions, graph), stackIds),
-      }));
+      const results = [];
+      for (const stackIds of stackParticipationGroups(participantGraph)) {
+        results.push({ stackIds, result: this.decorateStackFailure(yield* this.solveStackSetWork(stackIds, solveOptions, graph), stackIds) });
+      }
       this.lastResult = aggregateStackSolveResults(results);
       this.lastResult.solveScope = {
         mode: 'stack-partitions',
@@ -1683,6 +1725,7 @@ export class SolverController {
   }
 
   applyAuthoritativeEntities(entities = [], workerResult = {}) {
+    this.derivedGeometry = workerResult.derivedGeometry || null;
     if (workerResult.stackState && JSON.stringify(workerResult.stackState) !== JSON.stringify(this.stackState)) {
       this.setStackState(workerResult.stackState, { rewriteExpressions: false, emit: false });
     }
@@ -1808,10 +1851,17 @@ export class SolverController {
     return { attempted: true, accepted: false, result: lastResult };
   }
 
+  validateNewStackTransformConstraint(constraint) {
+    if (!isStackFrameRelationship(constraint)) return;
+    const error = stackTransformConstraintError(constraint, id => this.entityStackIds.get(id) || this.model.derivedEntity(id)?.stackId);
+    if (error) throw new Error(error);
+  }
+
   addConstraint(input, { dimensionSolve = false } = {}) {
     const before = this.model.snapshot();
     const constraint = this.withStackParticipation(completeTangentConstraint(this.model, { ...clone(input), id: input.id || createUuid() }));
     try {
+      this.validateNewStackTransformConstraint(constraint);
       if (constraint.type === 'Length' && !Number.isFinite(Number(constraint.value))) {
         constraint.value = featureLength(this.model, constraint.featureRefs?.[0]);
       }
@@ -1877,6 +1927,7 @@ export class SolverController {
       });
       const stagedConstraints = constraints.map((input) => {
         const constraint = this.withStackParticipation(completeTangentConstraint(this.model, { ...clone(input), id: input.id || createUuid() }));
+        this.validateNewStackTransformConstraint(constraint);
         if (constraint.type === 'Length' && !Number.isFinite(Number(constraint.value))) {
           constraint.value = featureLength(this.model, constraint.featureRefs?.[0]);
         }
@@ -2051,6 +2102,10 @@ export class SolverController {
   }
 
   addDimension(entity) {
+    if (entity.solveDomain === STACK_FRAME_RELATIONSHIP_SOLVE_DOMAIN
+      && !stackTransformDimensionAllowed(entity, id => this.entityStackIds.get(id))) {
+      return { entity: null, result: { status: 'invalid', message: 'Activate a Stack to dimension its internal geometry.', changedEntityIds: [] } };
+    }
     const owned = this.withStackParticipation(clone({ id: entity.id || createUuid(), ...entity }), entity.stackId || this.defaultStackId());
     const frame = this.model.stackFrame(owned.stackId);
     const local = normalizeDimensionDirection(normalizeDimensionOrientation(transformStackEntity(owned, frame, true)), this.model.constraintModel(owned));
@@ -2168,7 +2223,15 @@ export class SolverController {
     return { entity: dimension, result: added.result };
   }
 
-  setDimension(idOrName, expression) {
+  setDimensionAsync(id, expression, shouldCancel) { return runSolverWorkAsync(this.setDimensionWork(id, expression), shouldCancel); }
+
+  updateParameterAsync(id, patch, shouldCancel) { return runSolverWorkAsync(this.updateParameterWork(id, patch), shouldCancel); }
+
+  solveAsync(options, shouldCancel) { return runSolverWorkAsync(this.solveWork(options), shouldCancel); }
+
+  setDimension(...args) { return runSolverWork(this.setDimensionWork(...args)); }
+
+  *setDimensionWork(idOrName, expression) {
     const existing = this.dimensions.get(idOrName);
     if (!existing) return { status: 'invalid', message: `Unknown dimension: ${idOrName}` };
     const affectedParameterIds = this.dimensions.affectedIds(existing.id);
@@ -2207,14 +2270,14 @@ export class SolverController {
     let result;
     if (stepCount > 1) {
       this.dimensions.restoreEntries(beforeDimensions, { emit: false });
-      result = this.solveDimensionContinuation(existing, expression, targetValue, stepCount, affectedDimensionIds);
+      result = yield* this.solveDimensionContinuationWork(existing, expression, targetValue, stepCount, affectedDimensionIds);
     } else {
-      result = this.solveDimensionStep({ seedDimensionIds: affectedDimensionIds });
-      if (!isSuccessfulSolve(result)) {
+      result = yield* this.solveDimensionStepWork({ seedDimensionIds: affectedDimensionIds });
+      if (!isSuccessfulSolve(result) && result.status !== 'cancelled') {
         stepCount = dimensionContinuationStepCount(startValue, targetValue, { force: true });
         if (stepCount > 1) {
           this.dimensions.restoreEntries(beforeDimensions, { emit: false });
-          result = this.solveDimensionContinuation(existing, expression, targetValue, stepCount, affectedDimensionIds);
+          result = yield* this.solveDimensionContinuationWork(existing, expression, targetValue, stepCount, affectedDimensionIds);
         }
       }
     }
@@ -2235,8 +2298,11 @@ export class SolverController {
     return result;
   }
 
-  solveDimensionContinuation(existing, expression, targetValue, stepCount, affectedDimensionIds = [existing.id]) {
+  solveDimensionContinuation(...args) { return runSolverWork(this.solveDimensionContinuationWork(...args)); }
+
+  *solveDimensionContinuationWork(existing, expression, targetValue, stepCount, affectedDimensionIds = [existing.id]) {
     const startValue = Number(existing.value);
+    const topologyToken = {};
     const results = [];
     for (let step = 1; step <= stepCount; step += 1) {
       const fraction = step / stepCount;
@@ -2254,7 +2320,7 @@ export class SolverController {
           continuationSteps: step,
         };
       }
-      const result = this.solveDimensionStep({ seedDimensionIds: affectedDimensionIds });
+      const result = yield* this.solveDimensionStepWork({ seedDimensionIds: affectedDimensionIds, topologyToken });
       results.push(result);
       if (!isSuccessfulSolve(result)) return combineContinuationResults(results);
     }
@@ -2491,10 +2557,12 @@ export class SolverController {
     }
   }
 
-  solveDimensionStep(options = {}) {
-    let result = this.solve({ ...options, tolerance: options.tolerance ?? DEFAULT_SOLVE_TOLERANCE });
+  solveDimensionStep(...args) { return runSolverWork(this.solveDimensionStepWork(...args)); }
+
+  *solveDimensionStepWork(options = {}) {
+    let result = yield* this.solveWork({ ...options, tolerance: options.tolerance ?? DEFAULT_SOLVE_TOLERANCE });
     if (result?.status === 'max-iterations') {
-      result = this.solve({
+      result = yield* this.solveWork({
         ...options,
         tolerance: options.tolerance ?? DEFAULT_SOLVE_TOLERANCE,
         jacobianMode: 'blocks',
@@ -2604,7 +2672,9 @@ export class SolverController {
     return this.dimensions.createControl(input);
   }
 
-  updateParameter(id, patch) {
+  updateParameter(...args) { return runSolverWork(this.updateParameterWork(...args)); }
+
+  *updateParameterWork(id, patch) {
     const affectedBefore = this.dimensions.affectedIds(id);
     const derivedEntityIds = [...this.model.derivedFeatureProviders.values()]
       .flatMap((provider) => provider.parameterEntityIds?.(affectedBefore) || []);
@@ -2638,7 +2708,7 @@ export class SolverController {
       );
       if (stepCount > 1) {
         this.dimensions.restoreEntries(beforeDimensions, { emit: false });
-        result = this.solveParameterContinuation(
+        result = yield* this.solveParameterContinuationWork(
           beforeDimensions,
           targetDimensions,
           continuationDimensionIds,
@@ -2655,16 +2725,16 @@ export class SolverController {
         // A direct parameter edit is one corrector attempt. When a continuation
         // route exists, use its correction budget rather than exhausting the
         // general solver's full budget before changing strategy.
-        result = this.solve({
+        result = yield* this.solveWork({
           seedDimensionIds: affectedDimensionIds,
           seedEntityIds: derivedEntityIds,
           ...(recoveryStepCount > 1 ? { maxIterations: parameterCorrectorIterations } : {}),
         });
-        if (!isSuccessfulSolve(result) && continuationDimensionIds.length) {
+        if (!isSuccessfulSolve(result) && result.status !== 'cancelled' && continuationDimensionIds.length) {
           stepCount = recoveryStepCount;
           if (stepCount > 1) {
             this.dimensions.restoreEntries(beforeDimensions, { emit: false });
-            result = this.solveParameterContinuation(
+            result = yield* this.solveParameterContinuationWork(
               beforeDimensions,
               targetDimensions,
               continuationDimensionIds,
@@ -2700,7 +2770,9 @@ export class SolverController {
     return { entry: this.dimensions.get(id), result };
   }
 
-  solveParameterContinuation(beforeEntries, targetEntries, dimensionIds, stepCount, seedEntityIds = []) {
+  solveParameterContinuation(...args) { return runSolverWork(this.solveParameterContinuationWork(...args)); }
+
+  *solveParameterContinuationWork(beforeEntries, targetEntries, dimensionIds, stepCount, seedEntityIds = []) {
     const beforeById = new Map(beforeEntries.map((entry) => [entry.id, entry]));
     const targetById = new Map(targetEntries.map((entry) => [entry.id, entry]));
     const interpolatedDimensions = dimensionIds
@@ -2716,11 +2788,13 @@ export class SolverController {
       ));
     if (!interpolatedDimensions.length) {
       this.dimensions.restoreEntries(targetEntries, { emit: false });
-      return this.solve({ seedDimensionIds: dimensionIds, seedEntityIds });
+      return yield* this.solveWork({ seedDimensionIds: dimensionIds, seedEntityIds });
     }
     const results = [];
     const variableSnapshot = () => new Map(this.model.allVariables().map((variable) => [variable.id, variable.value]));
-    let currentValues = variableSnapshot();
+    const nativeContinuation = this.numericBackend?.beginContinuation?.(this);
+    const topologyToken = {};
+    let currentValues = nativeContinuation ? null : variableSnapshot();
     let previousValues = null;
     let previousFraction = 0;
     let fraction = 0;
@@ -2731,7 +2805,7 @@ export class SolverController {
     // profiles instead. Failed correctors reduce the step, never the accuracy.
     for (let attempt = 0; attempt < maximumDimensionContinuationSteps * 2 && fraction < 1; attempt += 1) {
       const nextFraction = fraction + stepSize >= 1 - 1e-12 ? 1 : fraction + stepSize;
-      const beforeStep = this.snapshotGeometryForSeeds({ dimensionIds });
+      const beforeStep = nativeContinuation ? (nativeContinuation.checkpoint(), null) : this.snapshotGeometryForSeeds({ dimensionIds });
       interpolatedDimensions.forEach(({ before, target }) => {
         const intermediateValue = Number(before.value)
           + (Number(target.value) - Number(before.value)) * nextFraction;
@@ -2740,8 +2814,9 @@ export class SolverController {
           expression: exactDimensionValueExpression(intermediateValue, target.unit),
         });
       });
-      const predictedEntityIds = new Set();
-      if (previousValues && fraction > previousFraction) {
+      const predictedEntityIds = nativeContinuation && fraction > previousFraction
+        ? nativeContinuation.predict((nextFraction - fraction) / (fraction - previousFraction)) : new Set();
+      if (!nativeContinuation && previousValues && fraction > previousFraction) {
         const ratio = (nextFraction - fraction) / (fraction - previousFraction);
         for (const variable of this.model.allVariables()) {
           if (!variable.active || !previousValues.has(variable.id)) continue;
@@ -2752,19 +2827,21 @@ export class SolverController {
           predictedEntityIds.add(variable.ownerId);
         }
       }
-      let result = this.solve({ seedDimensionIds: dimensionIds, seedEntityIds, maxIterations: parameterCorrectorIterations });
+      let result = yield* this.solveWork({ seedDimensionIds: dimensionIds, seedEntityIds, maxIterations: parameterCorrectorIterations, topologyToken });
       if (isSuccessfulSolve(result) && predictedEntityIds.size) {
         result = { ...result, status: 'converged', changedEntityIds: [...new Set([...predictedEntityIds, ...(result.changedEntityIds || [])])] };
       }
       results.push(result);
       if (!isSuccessfulSolve(result)) {
-        this.restoreGeometryTransaction(beforeStep);
+        if (nativeContinuation) nativeContinuation.restore();
+        else this.restoreGeometryTransaction(beforeStep);
         stepSize /= 2;
         if (stepSize < 1e-6 || !['max-iterations', 'failed'].includes(result.status)) return combineContinuationResults(results);
         continue;
       }
       previousValues = currentValues;
-      currentValues = variableSnapshot();
+      if (nativeContinuation) nativeContinuation.accept();
+      else currentValues = variableSnapshot();
       previousFraction = fraction;
       fraction = nextFraction;
       stepSize = Math.min(maximumStep, 1 - fraction, stepSize * 2);

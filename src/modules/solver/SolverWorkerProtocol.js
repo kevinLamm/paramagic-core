@@ -26,6 +26,7 @@ const isId = (value) => typeof value === 'string' && value.length > 0;
 
 export const solverModelUpdateMethods = new Set([
   'updateDimensionAnnotation', 'setDerivedEntity', 'updateEntity', 'setStackState', 'setExternalStackRelationships',
+  'restoreStackPlacementState',
 ]);
 
 function validatePayload(type, payload) {
@@ -90,11 +91,13 @@ export function createSolverWorkerResult(request, result = {}) {
   return {
     version: SOLVER_WORKER_PROTOCOL_VERSION,
     requestToken: request.requestToken,
+    revision: request.requestToken,
     generation: request.generation,
     type: 'result',
     commandType: request.type,
     status: String(result.status || 'completed'),
     ...(result.stackState ? { stackState: result.stackState } : {}),
+    ...(result.derivedGeometry ? { derivedGeometry: result.derivedGeometry } : {}),
     changedEntities: Array.isArray(result.changedEntities) ? result.changedEntities : [],
     changedDimensions: Array.isArray(result.changedDimensions) ? result.changedDimensions : [],
     changedParameters: Array.isArray(result.changedParameters) ? result.changedParameters : [],

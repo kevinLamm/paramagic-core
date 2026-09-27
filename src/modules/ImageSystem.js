@@ -3,9 +3,11 @@ import { resolveColorExpression, resolveOpacityExpression } from './AppearanceEx
 import { clampTranslatedPanelOffset } from './CanvasUIControls.js';
 import { normalizeDrawingData, parseDrawingText, serializeDrawingJson } from './DrawingIO.js';
 import { unitFactors, valueInUnit } from './solver/Units.js';
-import { createImageTraceSettingsMemory, loadOpenCv, imageWorldToLocalPoint, prepareImageTrace, tracePreparedImageRegion } from './ImageTrace.js';
+import { createImageTraceSettingsMemory, loadOpenCv, imageWorldToLocalPoint } from './ImageTrace.js';
+import { ImageTraceClient } from './ImageTraceClient.js';
 import { ARUCO_WARP_REQUIRED_IDS, detectImageWarpMarkers } from './ImageWarpAruco.js';
 import { createUuid } from './IdentitySystem.js';
+import { addEditableLineChain } from './DrawingTools.js';
 
 // --- Image Fill System & References ---
 const IMAGE_REFERENCE = /^(?:basic|user|imported)\/[A-Za-z0-9%._~!$&'()+,;=:@/-]+$/;
@@ -2148,17 +2150,49 @@ function finishRecordChange(record) {
   record.finishChange(record);
 }
 
-export function createImageManipulation({ addSvg, parent, screenToWorld, getScale, getDrawingUnit = () => '', evaluateNumeric, onSelect, onMoveStart, onChange, onDelete, onCreateClosedLineChain, canStartDrag = () => true }) {
+export function applyImageTraceRegion({ image, worldPoints }, {
+  getStackState, restoreStackState, addStack, addObject, addObjects, checkpoint, commit,
+}) {
+  if (!Array.isArray(worldPoints) || worldPoints.length < 3) return [];
+  const before = getStackState();
+  const sourceStack = before.stacks.find(({ id }) => id === image?.stackId);
+  if (!sourceStack) return [];
+  checkpoint('image-trace-apply');
+  // Retain the image Stack's axes for the outline's automatic constraints.
+  const child = addStack({ parentStackId: image.stackId, frame: sourceStack.frame }, { history: 'none', select: false });
+  if (!child) return [];
+  let created = [];
+  try {
+    created = addEditableLineChain({
+      chainPoints: worldPoints,
+      closed: true,
+      kind: 'polyline',
+      decorateEntity: (entity) => ({ ...entity, stackId: child.id }),
+      addObject,
+      addObjects: (entries) => addObjects(entries, { select: false, notify: false }),
+    });
+  } finally {
+    // Stack and outline are one history action; failed geometry leaves no empty Stack.
+    if (!created.length) restoreStackState(before, { notify: true, preserveSelection: true });
+  }
+  if (created.length) commit({ history: 'commit' });
+  return created;
+}
+
+export function createImageManipulation({ addSvg, parent, screenToWorld, getScale, getDrawingUnit = () => '', evaluateNumeric, onSelect, onMoveStart, onChange, onDelete, traceDrawing, setInactiveStackHitTestingBlocked = () => {}, canStartDrag = () => true }) {
   let drag = null;
   let rememberedWarpDimensions = null;
   const traceSettingsMemory = createImageTraceSettingsMemory();
+  const traceSession = new ImageTraceClient();
   const toolbarVisualWidth = 194;
   const toolbarObjectWidth = 300;
 
   function closeTrace(record) {
     record.traceRequest += 1;
     record.traceActive = false;
-    record.tracePrepared = null;
+    setInactiveStackHitTestingBlocked(`image-trace:${record.id}`, false);
+    record.traceSession?.release();
+    record.traceSession = null;
     record.traceWorldPoint = null;
     record.traceResult = null;
     record.traceError = '';
@@ -2232,23 +2266,17 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
   async function runTrace(record) {
     if (!record.traceActive || !record.traceWorldPoint) return;
     const request = ++record.traceRequest;
+    const source = record.entity.source;
     record.traceResult = null;
     record.traceError = '';
     updateRecord(record);
     try {
-      if (!record.tracePrepared || record.tracePrepared.source !== record.entity.source) {
-        record.tracePrepared = await prepareImageTrace(record.entity);
-      }
-      const result = await tracePreparedImageRegion(
-        record.tracePrepared,
-        record.entity,
-        record.traceWorldPoint,
-        record.traceSettings,
-      );
-      if (!record.traceActive || request !== record.traceRequest) return;
+      record.traceSession ||= traceSession;
+      const result = await record.traceSession.trace(record.entity, record.traceWorldPoint, record.traceSettings);
+      if (!result || !record.traceActive || request !== record.traceRequest || source !== record.entity.source) return;
       record.traceResult = result;
     } catch (error) {
-      if (!record.traceActive || request !== record.traceRequest) return;
+      if (!record.traceActive || request !== record.traceRequest || source !== record.entity.source) return;
       record.traceError = error.message || 'The selected region could not be traced.';
     }
     updateRecord(record);
@@ -2262,8 +2290,19 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       record.traceDetailInput.value = record.traceSettings.detail;
       record.traceSmoothingInput.value = record.traceSettings.smoothing;
       record.traceActive = true;
+      setInactiveStackHitTestingBlocked(`image-trace:${record.id}`, true);
       record.tracePanel.hidden = false;
       window.dispatchEvent(new CustomEvent('paramagic:tool-activated', { detail: { source: 'image-trace' } }));
+      // Prepare once while the user chooses a seed. Clicking the image shares
+      // this promise; it cannot trigger another decode or WASM upload.
+      record.traceSession = traceSession;
+      const source = record.entity.source;
+      const request = record.traceRequest;
+      void traceSession.open(record.entity).catch(error => {
+        if (!record.traceActive || request !== record.traceRequest || record.traceSession !== traceSession || source !== record.entity.source) return;
+        record.traceError = error.message || 'The image could not be prepared for tracing.';
+        updateRecord(record);
+      });
     }
     updateRecord(record);
     if (record.traceActive) {
@@ -2501,7 +2540,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       tracePreview,
       traceSeed,
       traceActive: false,
-      tracePrepared: null,
+      traceSession: null,
       traceWorldPoint: null,
       traceResult: null,
       traceError: '',
@@ -2616,10 +2655,21 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
     traceCreateButton.addEventListener('click', (event) => {
       event.stopPropagation();
       if (!record.traceResult?.worldPoints?.length) return;
-      const points = record.traceResult.worldPoints.map((point) => [...point]);
+      let created;
+      try {
+        created = applyImageTraceRegion({ image: record.entity, worldPoints: record.traceResult.worldPoints }, traceDrawing);
+      } catch (error) {
+        record.traceError = error.message || 'The traced outline could not be added.';
+        updateRecord(record);
+        return;
+      }
+      if (!created?.length) {
+        record.traceError = 'The traced outline could not be added with the current constraints.';
+        updateRecord(record);
+        return;
+      }
       closeTrace(record);
       updateRecord(record);
-      onCreateClosedLineChain?.(points);
     });
     record.warpTexts.forEach((text, index) => {
       text.addEventListener('dblclick', (event) => {
@@ -2677,6 +2727,7 @@ export function createImageManipulation({ addSvg, parent, screenToWorld, getScal
       }
     });
     updateRecord(record);
+    record.dispose = () => closeTrace(record);
     return record;
   }
 

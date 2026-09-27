@@ -2,8 +2,8 @@ import {
   DEFAULT_MATRIX_FREE_VARIABLE_THRESHOLD,
   INTERACTIVE_MATRIX_FREE_VARIABLE_THRESHOLD,
   isSuccessfulSolve,
-  solveLevenbergMarquardt,
 } from './NumericSolverCore.js';
+import { runSolverWork } from './SolverWork.js';
 import { isCanvasOriginReference } from '../CanvasOrigin.js';
 
 const now = () => globalThis.performance?.now?.() ?? Date.now();
@@ -37,6 +37,9 @@ function aggregateJacobianStats(results, requestedMode) {
   let factorEntries = 0;
   results.forEach((result) => {
     const componentStats = result?.jacobianStats;
+    for (const key of ['arenaBytes', 'memoryGrowths', 'topologyBuilds', 'lastSyncBytes', 'totalLinearIterations']) {
+      if (componentStats?.[key] !== undefined) stats[key] = (stats[key] || 0) + componentStats[key];
+    }
     if (!componentStats) return;
     if (componentStats.mode && componentStats.mode !== 'not-required') modes.add(componentStats.mode);
     if (componentStats.fallbackReason) fallbackReasons.add(componentStats.fallbackReason);
@@ -139,7 +142,9 @@ function usesMatrixFreeSolver(model, {
   return model.activeVariables().length - temporarilyLockedVariableCount >= threshold;
 }
 
-export function solveConstraintScope({ model, ...options } = {}) {
+export function solveConstraintScope(options) { return runSolverWork(solveConstraintScopeWork(options)); }
+
+export function* solveConstraintScopeWork({ model, ...options } = {}) {
   const gaugeCandidate = translationGaugeVariables(model);
   const gaugeVariables = usesMatrixFreeSolver(model, options, gaugeCandidate.length)
     ? gaugeCandidate
@@ -147,7 +152,7 @@ export function solveConstraintScope({ model, ...options } = {}) {
   const previousLocks = gaugeVariables.map((variable) => [variable, variable.locked]);
   gaugeVariables.forEach((variable) => { variable.locked = true; });
   try {
-    const result = solveLevenbergMarquardt({ ...options, model });
+    const result = yield { ...options, model };
     return gaugeVariables.length
       ? { ...result, translationGaugeVariableIds: gaugeVariables.map((variable) => variable.id) }
       : result;
@@ -156,7 +161,10 @@ export function solveConstraintScope({ model, ...options } = {}) {
   }
 }
 
-export function solveConstraintComponents({
+export function solveConstraintComponents(options) { return runSolverWork(solveConstraintComponentsWork(options)); }
+
+export function* solveConstraintComponentsWork({
+  topologyToken = null,
   model,
   graph,
   registry,
@@ -169,6 +177,7 @@ export function solveConstraintComponents({
   shouldCancel,
   jacobianMode = 'dense',
   matrixFreeVariableThreshold,
+  numericBackend,
 } = {}) {
   if (!model || !graph || !registry) throw new TypeError('Component solving requires a model, graph, and registry.');
   const startedAt = now();
@@ -199,10 +208,12 @@ export function solveConstraintComponents({
     const remainingTimeBudget = Number.isFinite(Number(timeBudgetMs))
       ? Math.max(0, Number(timeBudgetMs) - elapsedMs)
       : Infinity;
-    const result = solveConstraintScope({
+    const result = yield* solveConstraintScopeWork({
       model: graph.scopedModel(componentScope(component)),
       registry,
       dimensions,
+      numericBackend,
+      topologyToken,
       solveMode,
       timeBudgetMs: remainingTimeBudget,
       evaluateParameterTargets: false,
@@ -230,7 +241,9 @@ export function solveConstraintComponents({
 
   timings.totalMs = now() - startedAt;
   const jacobianStats = aggregateJacobianStats(componentResults, jacobianMode);
+  const backends = new Set(componentResults.map(result => result.backend).filter(Boolean));
   const common = {
+    backend: backends.size > 1 ? 'mixed' : [...backends][0] || 'javascript',
     solveMode: solveMode === 'interactive' ? 'interactive' : 'final',
     iterations,
     initialError,

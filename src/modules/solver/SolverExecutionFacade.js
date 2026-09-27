@@ -22,6 +22,8 @@ const resyncMethods = new Set([
   'setDocumentMetadata',
   'setDrawingProperties',
   'setStackState',
+  'setStackFrame',
+  'restoreStackPlacementState',
   'setExternalStackRelationships',
   'refreshStackParticipation',
   'solve',
@@ -238,6 +240,7 @@ export class SolverExecutionFacade {
     }
     return Promise.resolve(pending).then((result) => {
       if (result.status === 'stale' || result.status === 'superseded') return result;
+      this.controller.derivedGeometry = result.derivedGeometry || null;
       this.mutationJournal.accept(revision);
       this.lastAcceptedRevision = Math.max(this.lastAcceptedRevision, revision);
       if (this.mutationJournal.shouldCheckpoint(this.mutationRevision)) {
@@ -261,6 +264,7 @@ export class SolverExecutionFacade {
 
   acceptWorkerResult(result, revision, { checkpoint = true } = {}) {
     if (!result || result.status === 'stale' || result.status === 'superseded') return false;
+    this.controller.derivedGeometry = result.derivedGeometry || null;
     this.mutationJournal.accept(revision);
     this.lastAcceptedRevision = Math.max(this.lastAcceptedRevision, revision);
     if (checkpoint && this.mutationJournal.shouldCheckpoint(this.mutationRevision)) {
@@ -644,8 +648,18 @@ export class SolverExecutionFacade {
   }
 
   invokeController(method, args) {
-    const incremental = solverModelUpdateMethods.has(method) && this.workerClient?.updateModel;
+    const placement = method === 'setStackFrame' || method === 'restoreStackPlacementState';
+    // Frame dragging already commits the connected Stack placements locally.
+    // Mirror those accepted frames and annotations, including cancellation,
+    // without repeating the placement solve or rebuilding the Worker model.
+    const updateMethod = placement ? 'restoreStackPlacementState' : method;
+    const incremental = solverModelUpdateMethods.has(updateMethod) && this.workerClient?.updateModel;
+    if (placement && [...this.pendingModelUpdates.keys()].some(key => key !== 'restoreStackPlacementState:')) {
+      // World-coordinate entity edits between moves depend on the earlier frame.
+      this.flushModelUpdates();
+    }
     const readValue = () => {
+      if (placement) return this.controller.captureStackPlacementState();
       if (method === 'updateDimensionAnnotation') return this.controller.dimensionAnnotations.get(args[0]);
       if (method === 'setDerivedEntity') return this.controller.model.derivedEntities.get(args[0]?.id);
       if (method === 'updateEntity') return this.controller.getEntity(args[0]?.id);
@@ -658,11 +672,11 @@ export class SolverExecutionFacade {
     if (incremental) {
       const annotation = method === 'updateDimensionAnnotation';
       const parameter = annotation ? this.controller.dimensions.get(args[0]) : null;
-      const key = `${method}:${annotation ? args[0] : args[0]?.id || ''}`;
+      const key = `${updateMethod}:${placement ? '' : annotation ? args[0] : args[0]?.id || ''}`;
       if (before !== JSON.stringify(readValue()) || parameter) {
-        const wireArgs = method === 'setExternalStackRelationships' ? [readValue()] : args;
+        const wireArgs = placement || method === 'setExternalStackRelationships' ? [readValue()] : args;
         this.pendingModelUpdates.delete(key);
-        this.pendingModelUpdates.set(key, structuredClone({ method, args: wireArgs,
+        this.pendingModelUpdates.set(key, structuredClone({ method: updateMethod, args: wireArgs,
           ...(parameter ? { parameters: [parameter] } : {}),
         }));
         if (!this.modelUpdateScheduled) {
@@ -731,18 +745,31 @@ export function solverJacobianModeFromEnvironment(environment = globalThis) {
   }
 }
 
+export function solverBackendFromEnvironment(environment = globalThis) {
+  if (environment.PARAMAGIC_SOLVER_BACKEND === 'javascript') return 'javascript';
+  if (environment.PARAMAGIC_SOLVER_BACKEND === 'wasm') return 'wasm';
+  try {
+    return new URLSearchParams(environment.location?.search || '').get('solverBackend') === 'javascript'
+      ? 'javascript'
+      : 'wasm';
+  } catch {
+    return 'wasm';
+  }
+}
+
 export function createSolverExecutionFacade({
   controller = null,
   workerClient = null,
   workerFactory = createBrowserSolverWorkerClient,
   maxRestartAttempts = 2,
   checkpointInterval = 50,
+  backend = solverBackendFromEnvironment(),
   mode = 'sync',
   jacobianMode = 'dense',
 } = {}) {
   const resolvedJacobianMode = jacobianMode === 'blocks' ? 'blocks' : 'dense';
   const resolvedController = controller || createSolverController({ jacobianMode: resolvedJacobianMode });
-  const configuredWorkerFactory = () => workerFactory({ jacobianMode: resolvedJacobianMode });
+  const configuredWorkerFactory = () => workerFactory({ jacobianMode: resolvedJacobianMode, backend });
   let client = workerClient;
   let resolvedMode = mode;
   if (resolvedMode !== 'sync' && !client) {

@@ -47,7 +47,6 @@ export {
   bindFloatingPanelBoundary,
   bindFloatingPanelDrag,
   bindResponsiveToolHeader,
-  createControlTools,
   horizontalToolSectionCount,
   horizontalToolSectionIndexes,
   installToolRepeatShortcut,
@@ -55,6 +54,7 @@ export {
   rememberRepeatableTool,
   setActiveStackToolAvailability,
 } from './modules/CanvasUIControls.js';
+export { createControlTools } from './modules/ControlTools.js';
 export { createDrawingClipboard, retargetClipboardDrawing } from './modules/DrawingClipboard.js';
 export { serializePortablePackageJson } from './modules/ImageSystem.js';
 export { cloneDrawingIdentityGraph } from './modules/DrawingIdentitySystem.js';

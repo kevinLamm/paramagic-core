@@ -56,23 +56,52 @@ function normalizedSymbols(symbols = []) {
     .sort((first, second) => second.name.length - first.name.length);
 }
 
+const symbolMatchers = new WeakMap();
+function symbolMatcher(symbols) {
+  if (symbols.key !== undefined && symbolMatchers.has(symbols)) return symbolMatchers.get(symbols);
+  const candidates = symbols.key !== undefined ? symbols : normalizedSymbols(symbols);
+  const exact = new Map(), folded = new Map(), unicode = [];
+  candidates.forEach((symbol, order) => {
+    if (/[^\x00-\x7f]/.test(symbol.name)) { unicode.push({ symbol, order }); return; }
+    let node = symbol.caseInsensitive ? folded : exact;
+    for (const ch of symbol.caseInsensitive ? symbol.name.toLowerCase() : symbol.name) {
+      if (!node.has(ch)) node.set(ch, new Map()); node = node.get(ch);
+    }
+    if (!node.has('')) node.set('', { symbol, order });
+  });
+  const match = (source, index) => {
+    let result = null;
+    const accept = item => {
+      if (expressionSymbolBoundary(source[index + item.symbol.name.length]) && (!result || item.order < result.order)) result = item;
+    };
+    for (const [root, insensitive] of [[exact, false], [folded, true]]) {
+      let node = root;
+      for (let i = index; i < source.length; i++) {
+        node = node.get(insensitive ? source[i].toLowerCase() : source[i]); if (!node) break;
+        if (node.has('')) accept(node.get(''));
+      }
+    }
+    for (const item of unicode) {
+      const candidate = source.slice(index, index + item.symbol.name.length);
+      if (item.symbol.caseInsensitive ? candidate.toLocaleLowerCase() === item.symbol.name.toLocaleLowerCase() : candidate === item.symbol.name) accept(item);
+    }
+    return result?.symbol;
+  };
+  if (symbols.key !== undefined) symbolMatchers.set(symbols, match);
+  return match;
+}
+
 function tokenize(expression, { symbols = [] } = {}) {
   const source = String(expression).trim();
   if (UNQUOTED_IMAGE_REFERENCE.test(source)) return [JSON.stringify(source)];
   const tokens = [];
-  const candidates = normalizedSymbols(symbols);
+  const matchSymbol = symbolMatcher(symbols);
   const pattern = /(>=|<=|==|!=|&&|\|\||"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\d+(?:\.\d+)?(?:e[+-]?\d+)?|d\d+@[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*|[A-Za-z_][A-Za-z0-9_]*|[()+\-*/^!,<>])/iy;
   let index = 0;
   while (index < source.length) {
     while (/\s/.test(source[index] || '')) index += 1;
     if (index >= source.length) break;
-    const matchedSymbol = candidates.find((symbol) => {
-      const candidate = source.slice(index, index + symbol.name.length);
-      const matches = symbol.caseInsensitive
-        ? candidate.toLocaleLowerCase() === symbol.name.toLocaleLowerCase()
-        : candidate === symbol.name;
-      return matches && expressionSymbolBoundary(source[index + symbol.name.length]);
-    });
+    const matchedSymbol = matchSymbol(source, index);
     if (matchedSymbol) {
       tokens.push(source.slice(index, index + matchedSymbol.name.length));
       index += matchedSymbol.name.length;
@@ -107,7 +136,7 @@ export function expressionSymbolReferences(expression, symbols = []) {
   return references;
 }
 
-function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
+function evaluateTokens(tokens, resolveName, { baseUnit = null, builder = null } = {}) {
   const baseFactor = baseUnit ? units[baseUnit] || 1 : 1;
   let index = 0;
   const peek = () => tokens[index];
@@ -123,6 +152,7 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     const token = take();
     if (token === undefined) throw new Error('Unexpected end of expression.');
     if (token.startsWith('"') || token.startsWith("'")) {
+      if (builder) throw new Error('String expressions use the reference evaluator.');
       const body = token.slice(1, -1);
       return body.replace(/\\(['"\\])/g, '$1');
     }
@@ -130,7 +160,8 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     if (Number.isFinite(numeric)) {
       const unit = units[String(peek()).toLowerCase()];
       if (unit) take();
-      return numeric * (unit ? unit / baseFactor : 1);
+      const value = numeric * (unit ? unit / baseFactor : 1);
+      return builder ? builder.literal(value) : value;
     }
     if (/^[A-Za-z_]/.test(token)) {
       const normalized = token.toLowerCase();
@@ -147,20 +178,21 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
           } while (peek() !== ')');
         }
         if (take() !== ')') throw new Error(`Missing closing parenthesis for ${token}.`);
-        const result = fn(...args);
+        const result = builder ? builder.call(normalized, args) : fn(...args);
         if (typeof result === 'number' && !Number.isFinite(result)) throw new Error(`${token} produced a non-finite value.`);
         return result;
       }
-      if (Object.hasOwn(constants, normalized)) return constants[normalized];
+      if (Object.hasOwn(constants, normalized)) return builder ? builder.literal(constants[normalized]) : constants[normalized];
       return resolveName(token);
     }
     throw new Error(`Unexpected token: ${token}`);
   }
 
   function unary() {
-    if (peek() === '-') { take(); return -Number(unary()); }
-    if (peek() === '+') { take(); return Number(unary()); }
-    if (peek() === '!') { take(); return !unary(); }
+    if (['-', '+', '!'].includes(peek())) {
+      const op = take(), value = unary();
+      return builder ? builder.unary(op, value) : op === '-' ? -Number(value) : op === '+' ? Number(value) : !value;
+    }
     return primary();
   }
 
@@ -168,7 +200,8 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     const left = unary();
     if (peek() !== '^') return left;
     take();
-    return Number(left) ** Number(power());
+    const right = power();
+    return builder ? builder.binary('^', left, right) : Number(left) ** Number(right);
   }
 
   function product() {
@@ -176,7 +209,7 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     while (peek() === '*' || peek() === '/') {
       const operator = take();
       const right = power();
-      value = operator === '*' ? Number(value) * Number(right) : Number(value) / Number(right);
+      value = builder ? builder.binary(operator, value, right) : operator === '*' ? Number(value) * Number(right) : Number(value) / Number(right);
     }
     return value;
   }
@@ -186,7 +219,7 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     while (peek() === '+' || peek() === '-') {
       const operator = take();
       const right = product();
-      value = operator === '+' ? Number(value) + Number(right) : Number(value) - Number(right);
+      value = builder ? builder.binary(operator, value, right) : operator === '+' ? Number(value) + Number(right) : Number(value) - Number(right);
     }
     return value;
   }
@@ -196,6 +229,7 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     while (['<', '<=', '>', '>='].includes(peek())) {
       const operator = take();
       const right = sum();
+      if (builder) { value = builder.binary(operator, value, right); continue; }
       if (operator === '<') value = value < right;
       if (operator === '<=') value = value <= right;
       if (operator === '>') value = value > right;
@@ -209,20 +243,20 @@ function evaluateTokens(tokens, resolveName, { baseUnit = null } = {}) {
     while (peek() === '==' || peek() === '!=') {
       const operator = take();
       const right = comparison();
-      value = operator === '==' ? value === right : value !== right;
+      value = builder ? builder.binary(operator, value, right) : operator === '==' ? value === right : value !== right;
     }
     return value;
   }
 
   function logicalAnd() {
     let value = equality();
-    while (peek() === '&&') { take(); const right = equality(); value = Boolean(value) && Boolean(right); }
+    while (peek() === '&&') { take(); const right = equality(); value = builder ? builder.binary('&&', value, right) : Boolean(value) && Boolean(right); }
     return value;
   }
 
   function logicalOr() {
     let value = logicalAnd();
-    while (peek() === '||') { take(); const right = logicalAnd(); value = Boolean(value) || Boolean(right); }
+    while (peek() === '||') { take(); const right = logicalAnd(); value = builder ? builder.binary('||', value, right) : Boolean(value) || Boolean(right); }
     return value;
   }
 
@@ -258,6 +292,7 @@ export class ParameterRepository {
     this.listeners = new Set();
     this.computedResolvers = new Map();
     this.compiledExpressions = new Map();
+    this.symbolCache = new Map();
     this.dependencies = new Map();
     this.dependents = new Map();
     this.dirtyEntries = new Set();
@@ -269,6 +304,7 @@ export class ParameterRepository {
   }
 
   rebuildStackIndexes() {
+    this.symbolCache?.clear();
     this.stackNamesById = new Map(this.stackState.stacks.map((stack) => [stack.id, stack.name]));
     this.stackIdsByName = new Map(this.stackState.stacks.map((stack) => [stack.name.toLocaleLowerCase(), stack.id]));
     this.stackVariables = new Map(this.stackState.stacks.map(stack => {
@@ -359,6 +395,7 @@ export class ParameterRepository {
   }
 
   rebuildNameIndexes() {
+    this.symbolCache.clear();
     const collectionError = dimensionCollectionNameError([...this.entries.values()], {
       defaultStackId: this.defaultStackId(),
     });
@@ -397,6 +434,7 @@ export class ParameterRepository {
   }
 
   symbolDefinitions(stackId = null) {
+    if (this.symbolCache.has(stackId)) return this.symbolCache.get(stackId);
     const symbols = [];
     this.entries.forEach((entry) => {
       if (entry.kind !== 'dimension') {
@@ -410,7 +448,10 @@ export class ParameterRepository {
     });
     this.externalVariables.forEach((entry) => symbols.push({ name: entry.name, symbolKey: entry.symbolKey, caseInsensitive: false }));
     this.stackVariableEntries(stackId).forEach(entry => symbols.push({ name: entry.name, symbolKey: entry.symbolKey, caseInsensitive: true }));
-    return normalizedSymbols(symbols);
+    const result = normalizedSymbols(symbols);
+    result.key = result.map(symbol => `${symbol.caseInsensitive ? 'i' : 's'}:${symbol.name}`).join('\u0000');
+    this.symbolCache.set(stackId, result);
+    return result;
   }
 
   expressionSymbols({ stackId = null, includeLocalAliases = false } = {}) {
@@ -547,6 +588,7 @@ export class ParameterRepository {
   }
 
   markAllDirty() {
+    this.symbolCache.clear();
     this.entries.forEach((_entry, id) => this.dirtyEntries.add(id));
   }
 
@@ -833,6 +875,7 @@ export class ParameterRepository {
           this.names.set(nextName, id);
         }
         entry.name = nextName;
+        this.symbolCache.clear();
         this.entries.forEach((candidate) => {
           if (candidate.id === id || candidate.computed) return;
           const knownNames = this.symbolDefinitions(candidate.kind === 'dimension' ? candidate.stackId : null)
@@ -931,7 +974,7 @@ export class ParameterRepository {
         const drawingUnitFactor = this.defaultLengthUnit ? unitFactors[this.defaultLengthUnit] : 1;
         const contextStackId = entry.kind === 'dimension' ? (entry.stackId || this.defaultStackId()) : null;
         const symbols = this.symbolDefinitions(contextStackId);
-        const symbolKey = symbols.map((symbol) => `${symbol.caseInsensitive ? 'i' : 's'}:${symbol.name}`).join('\u0000');
+        const symbolKey = symbols.key;
         const cached = this.compiledExpressions.get(id);
         const tokens = cached?.expression === entry.expression && cached?.symbolKey === symbolKey
           ? cached.tokens
@@ -989,6 +1032,14 @@ export class ParameterRepository {
         this.dirtyEntries.delete(id);
       }
     };
+    if (this.numericEvaluator) {
+      for (const id of [...this.dirtyEntries]) {
+        const entry = this.entries.get(id);
+        if (!entry?.computed || !this.isEntryAvailable(entry)) continue;
+        try { evaluate(id); } catch (error) { visiting.clear(); if (strict) throw error; }
+      }
+      for (const [id, value] of this.numericEvaluator.evaluate(this)) resolved.set(id, value);
+    }
     for (const id of [...this.dirtyEntries]) {
       const entry = this.entries.get(id);
       if (!entry) continue;
@@ -1226,4 +1277,4 @@ export class ParameterRepository {
   }
 }
 
-export { parseExpression };
+export { parseExpression, tokenize, evaluateTokens, isLengthParameter };

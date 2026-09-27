@@ -7,14 +7,16 @@ import {
 const now = () => globalThis.performance?.now?.() ?? Date.now();
 
 export class SolverWorkerClient {
-  constructor(worker) {
+  constructor(worker, { backend = 'javascript' } = {}) {
     if (!worker?.postMessage) throw new TypeError('SolverWorkerClient requires a Worker-compatible transport.');
     this.worker = worker;
+    this.backend = backend;
     this.nextRequestToken = 1;
     this.nextGeneration = 1;
     this.latestInteractiveGeneration = 0;
     this.inFlight = null;
     this.queue = [];
+    this.withheldDeltas = new Map();
     this.handleMessage = this.handleMessage.bind(this);
     this.handleError = this.handleError.bind(this);
     this.worker.addEventListener?.('message', this.handleMessage);
@@ -49,6 +51,7 @@ export class SolverWorkerClient {
         previous.resolve({
           version: previous.request.version,
           requestToken: previous.request.requestToken,
+          revision: previous.request.requestToken,
           generation: previous.request.generation,
           type: 'result',
           commandType: previous.request.type,
@@ -62,6 +65,13 @@ export class SolverWorkerClient {
         });
       } else {
         this.queue.push(entry);
+      }
+      // Only consecutive edits to the same target supersede an active transaction.
+      // Structural commands and other parameter edits remain ordered barriers.
+      if (this.backend === 'wasm' && coalesceKey && this.inFlight?.coalesceKey === coalesceKey
+          && this.queue.every(queued => queued.coalesceKey === coalesceKey)) {
+        this.inFlight.supersededByRevision = entry.request.requestToken;
+        this.worker.postMessage({ type: 'supersede', requestToken: this.inFlight.request.requestToken });
       }
       this.pump();
     });
@@ -95,6 +105,26 @@ export class SolverWorkerClient {
         roundTripMs: Math.max(0, now() - entry.dispatchedAt),
       },
     };
+    if (entry.supersededByRevision) {
+      // Cancellation can race a completed native transaction. Hide that old
+      // revision, but retain its committed delta for the next accepted result.
+      const delta = this.withheldDeltas.get(entry.coalesceKey) || { entities: new Map(), parameters: new Map() };
+      result.changedEntities.forEach(entity => delta.entities.set(entity.id, entity));
+      (result.changedParameters || []).forEach(parameter => delta.parameters.set(parameter.id, parameter));
+      this.withheldDeltas.set(entry.coalesceKey, delta);
+      entry.resolve({ ...timedResult, status: 'superseded', changedEntities: [], changedParameters: [],
+        diagnostics: { ...timedResult.diagnostics, supersededByRevision: entry.supersededByRevision } });
+      this.pump();
+      return;
+    }
+    const withheld = this.withheldDeltas.get(entry.coalesceKey);
+    if (withheld) {
+      result.changedEntities.forEach(entity => withheld.entities.set(entity.id, entity));
+      (result.changedParameters || []).forEach(parameter => withheld.parameters.set(parameter.id, parameter));
+      timedResult.changedEntities = [...withheld.entities.values()];
+      timedResult.changedParameters = [...withheld.parameters.values()];
+      this.withheldDeltas.delete(entry.coalesceKey);
+    }
     if (entry.interactive && result.generation < this.latestInteractiveGeneration) {
       // The Worker had already started this solve before a newer pointer
       // position arrived. Its internal model may use the result as the base
@@ -119,6 +149,7 @@ export class SolverWorkerClient {
   }
 
   handleError(event) {
+    this.withheldDeltas.clear();
     const error = event?.error || new Error(event?.message || 'Solver worker failed.');
     this.inFlight?.reject(error);
     this.inFlight = null;
@@ -181,7 +212,9 @@ export class SolverWorkerClient {
   }
 
   setDimension(dimensionId, expression) {
-    return this.request('set-dimension', { dimensionId, expression });
+    return this.request('set-dimension', { dimensionId, expression }, {
+      coalesceKey: this.backend === 'wasm' ? `dimension:${dimensionId}` : null,
+    });
   }
 
   updateParameter(parameterId, patch, options = {}) {
@@ -197,6 +230,7 @@ export class SolverWorkerClient {
   }
 
   terminate() {
+    this.withheldDeltas.clear();
     this.worker.removeEventListener?.('message', this.handleMessage);
     this.worker.removeEventListener?.('error', this.handleError);
     this.worker.terminate?.();
@@ -207,8 +241,10 @@ export function createSolverWorkerClient(worker) {
   return new SolverWorkerClient(worker);
 }
 
-export function createBrowserSolverWorkerClient({ jacobianMode = 'dense' } = {}) {
-  const workerUrl = new URL('./SolverWorker.js', import.meta.url);
-  if (jacobianMode === 'blocks') workerUrl.searchParams.set('jacobianMode', 'blocks');
-  return new SolverWorkerClient(new Worker(workerUrl, { type: 'module' }));
+export function createBrowserSolverWorkerClient({ jacobianMode = 'dense', backend = 'javascript' } = {}) {
+  // Keep the URL literal inside the constructor so Vite bundles the Worker
+  // dependency graph and the native asset for both deployment targets.
+  const worker = new Worker(new URL('./SolverWorker.js', import.meta.url), { type: 'module' });
+  worker.postMessage({ type: 'initialize', jacobianMode, backend });
+  return new SolverWorkerClient(worker, { backend });
 }

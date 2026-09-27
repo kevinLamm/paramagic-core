@@ -867,8 +867,10 @@ export function createSwellTools({
     const next = evaluateGeometry({
       entities: drawing.entities || [],
       constraints: drawing.constraints || [],
+      nativeGeometry: canvas.getNumericalDerivedGeometry?.()?.swell,
       evaluateLength: (expression, entity) => canvas.evaluateLengthExpression?.(expression, entity) ?? Number(expression),
     });
+    objectLayer.dataset.swellGeometryBackend = evaluateGeometry.stats.lastBackend;
     const changedOwners = new Set();
     const removeOwner = (ownerId) => {
       for (const layer of [objectLayer, handleLayer]) {

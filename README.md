@@ -21,6 +21,20 @@ Public entry points:
 - `@paramagic/core/images` — image fills, catalogs, portable image assets, and host resource configuration.
 - `@paramagic/core/export` — DXF and SVG output.
 
+### Browser solver selection
+
+The application's normal Worker mode now selects the native WASM solver by default.
+No URL flag is needed. `?solverBackend=javascript` selects the reference backend;
+`?solverBackend=wasm` remains supported. A valid `PARAMAGIC_SOLVER_BACKEND` host
+override takes precedence over the URL. Standalone synchronous controllers remain
+JavaScript, and the app retains JavaScript for local transactions, verification and
+fallback when native initialization or component preparation is unavailable.
+
+Keep the reference solver when distributing the core. The native binary and its
+verified build manifest are included in the normal application build workflow;
+end users install nothing. Selecting WASM does not change document formats,
+final convergence tolerances, or the single-threaded browser CPU execution model.
+
 For a frontend-only host, keep the built-in image files and manifest in the app and configure
 their public URLs before creating the editor:
 
@@ -44,3 +58,27 @@ Manifest entries use stable logical references such as `basic/Fabric/linen.webp`
 move its deployed asset directory without changing references stored in ParaMagic documents.
 OpenCV.js is supplied by the pinned `@techstark/opencv-js` dependency; the host controls the
 public URL used to load that script.
+
+### Trace Region execution
+
+Trace Region uses the pinned OpenCV WASM operations in a separate, persistent module
+Worker. `ImageTraceClient` transfers decoded RGBA pixels once when tracing an image;
+later requests contain only a seed and settings. `ImageTraceKernel` retains native
+Mats and completed stages, including connected-component labels and contours. Edge
+Detail changes therefore rerun only polygon approximation. Superseded requests stop
+between native stages. The Worker does no further work after producing a result.
+
+Closing Trace Region releases image Mats while retaining the initialized OpenCV
+module for reuse. WASM heap capacity can remain at its high-water mark. Initial
+image decoding and canvas readback still occur on the main thread. This path uses
+single-threaded WASM and ordinary transferable buffers; it requires no shared
+memory, COOP/COEP headers, or end-user installation. The configured OpenCV script
+must be loadable from a module Worker. Vite emits the Worker and OpenCV assets in
+the normal application builds.
+
+`ImageTrace.js` retains the original tracing implementation for numerical comparison.
+Apply Trace uses the same atomic line-chain creation path as the Polyline tool,
+including Auto Constraint and the normal final solver tolerance. With Auto Constraint
+enabled, relationships are inferred from the whole original outline before solving;
+this can differ from the former per-segment path, which repeatedly inferred against
+already-adjusted segments. A rejected batch preserves the trace preview for retry.

@@ -13,4 +13,5 @@ export * from './modules/solver/SolverMutationJournal.js';
 export * from './modules/solver/SolverWorkerClient.js';
 export * from './modules/solver/SolverWorkerProtocol.js';
 export * from './modules/solver/SolverWorkerRuntime.js';
+export * from './modules/solver/WasmSolverSession.js';
 export * from './modules/solver/Units.js';

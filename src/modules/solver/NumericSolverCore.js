@@ -416,10 +416,21 @@ export const residualImplementations = {
   },
   Horizontal(model, constraint) {
     const line = segment(model, constraint.featureRefs[0]);
+    // Frame rotation needs an angular error: the endpoint-height derivative
+    // vanishes for an exactly vertical starting edge. Keep the selected ray
+    // and length scale so final alignment has the usual distance tolerance.
+    if (constraint.axisDirection && constraint.solveDomain === 'stack-frame') {
+      const dx = line.end[0] - line.start[0], dy = line.end[1] - line.start[1];
+      return [Math.hypot(dx, dy) * Math.atan2(constraint.axisDirection * dy, constraint.axisDirection * dx)];
+    }
     return [line.start[1] - line.end[1]];
   },
   Vertical(model, constraint) {
     const line = segment(model, constraint.featureRefs[0]);
+    if (constraint.axisDirection && constraint.solveDomain === 'stack-frame') {
+      const dx = line.end[0] - line.start[0], dy = line.end[1] - line.start[1];
+      return [Math.hypot(dx, dy) * Math.atan2(-constraint.axisDirection * dx, constraint.axisDirection * dy)];
+    }
     return [line.start[0] - line.end[0]];
   },
   Parallel(model, constraint) {
@@ -644,6 +655,11 @@ export const residualImplementations = {
     return [variable.value - target(constraint, dimensions)];
   },
   Fixed(model, constraint) {
+    if (constraint.fixedFrame && constraint.solveDomain === 'stack-frame') {
+      const frame = model.stackFrame(constraint.movingStackId), target = constraint.fixedFrame;
+      const angle = frame.rotation - target.rotation;
+      return [frame.x - target.x, frame.y - target.y, Math.atan2(Math.sin(angle), Math.cos(angle))];
+    }
     const pointRef = constraint.featureRefs?.find((ref) => ref.kind === 'point' || ref.type === 'point');
     if (!pointRef || !constraint.fixedPoint) return [];
     const current = point(model, pointRef);
@@ -933,10 +949,9 @@ export function solveLevenbergMarquardt({
       if (error < convergenceThreshold) {
         return finish({ status: 'converged', iterations: iteration, initialError, finalError: error, acceptedSteps, rejectedSteps, changedEntityIds: changedEntityIds(), problematicConstraintIds: [], message: 'Constraints converged.' });
       }
-      if (squaredNorm(step) < 1e-18) {
-        terminationReason = 'stagnation';
-        break;
-      }
+      // A small accepted correction is still progress. In particular, tight
+      // tolerances across stacks can need several sub-nanometre corrections.
+      // Stop on failed improvement (the damping limit), never step size alone.
     } else {
       activeVariables.forEach((variable, index) => { variable.value = previous[index]; });
       arcGeometry.project();

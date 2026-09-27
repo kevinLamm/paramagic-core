@@ -128,10 +128,12 @@ export class ScopedSketchModel {
 
 export class ConstraintGraph {
   constructor(model, {
+    nativeGraph = null,
     includeEntity = () => true,
     includeConstraint = () => true,
   } = {}) {
     this.model = model;
+    this.nativeGraph = nativeGraph;
     this.includeEntity = includeEntity;
     this.includeConstraint = includeConstraint;
     this.variableConstraints = new Map();
@@ -228,6 +230,10 @@ export class ConstraintGraph {
       binding.allVariables().forEach((variable) => this.connect(intrinsicNode, variable.id));
     }
 
+    if (this.nativeGraph) {
+      for (const group of this.nativeGraph.components(variables.map(v => v.id), [...this.constraintVariables.keys()], this.constraintVariables)) this.installComponent(group.variables, group.nodes);
+      return this;
+    }
     const visitedVariables = new Set();
     for (const variable of variables) {
       if (visitedVariables.has(variable.id)) continue;
@@ -316,16 +322,22 @@ export class ConstraintGraph {
 
   rebuildComponentsForVariables(seedVariableIds) {
     const affected = new Set();
+    const expandedComponents = new Set(), expandedNodes = new Set();
     const pending = [...seedVariableIds].filter((id) => this.variableConstraints.has(id));
     while (pending.length) {
       const variableId = pending.pop();
       if (affected.has(variableId) || !this.variableConstraints.has(variableId)) continue;
       affected.add(variableId);
       const previousComponent = this.components.get(this.componentForVariable.get(variableId));
-      previousComponent?.variableIds.forEach((id) => {
+      if (previousComponent && !expandedComponents.has(previousComponent)) {
+        expandedComponents.add(previousComponent);
+        previousComponent.variableIds.forEach((id) => {
         if (!affected.has(id) && this.variableConstraints.has(id)) pending.push(id);
-      });
+        });
+      }
       for (const constraintNode of this.variableConstraints.get(variableId) || []) {
+        if (expandedNodes.has(constraintNode)) continue;
+        expandedNodes.add(constraintNode);
         for (const connectedVariableId of this.constraintVariables.get(constraintNode) || []) {
           if (!affected.has(connectedVariableId)) pending.push(connectedVariableId);
         }
@@ -335,6 +347,11 @@ export class ConstraintGraph {
       .map((id) => this.componentForVariable.get(id))
       .filter(Boolean));
     this.removeComponents(removedComponentIds);
+
+    if (this.nativeGraph) {
+      for (const group of this.nativeGraph.components([...affected], [...expandedNodes], this.constraintVariables)) this.installComponent(group.variables, group.nodes);
+      return;
+    }
 
     const visited = new Set();
     for (const startId of affected) {
