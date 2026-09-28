@@ -1,5 +1,6 @@
 export { drawingTools, constraintGroups, dimensionTools, sampleEntities } from './modules/config.js';
 export { createInfiniteCanvas } from './modules/infiniteCanvas.js';
+export { createDrawingFeatures } from './modules/DrawingFeatures.js';
 export { createDrawingTools } from './modules/DrawingTools.js';
 export { createFilletTools } from './modules/FilletSystem.js';
 export { createSubtractTools } from './modules/SubtractSystem.js';

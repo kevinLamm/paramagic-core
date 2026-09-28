@@ -4250,6 +4250,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   });
 
   function zoomAll() {
+    drawingUpdates.flush();
     if (!records.length) {
       camera = defaultCamera();
       render();
