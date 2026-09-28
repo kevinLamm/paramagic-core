@@ -1096,26 +1096,24 @@ export function catalogImageFillSizePatch(asset = {}, formatLength = String) {
   };
 }
 
-async function digestHex(bytes) {
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('');
-}
-
 export async function importPortableCatalogImage(asset) {
-  if (isImageFillReference(asset.reference)) {
-    try {
-      const contentUrl = staticImageFillContentUrl(asset.reference);
-      if (!contentUrl) throw new Error('Image reference is not available.');
-      const existing = await fetch(contentUrl);
-      if (existing.ok) {
-        const bytes = new Uint8Array(await existing.arrayBuffer());
-        if (await digestHex(bytes) === String(asset.sha256).toLowerCase()) return asset.reference;
-      }
-    } catch {
-      // The original reference is not available in this installation.
-    }
+  const bytes = asset.bytes instanceof Uint8Array ? asset.bytes : new Uint8Array(asset.bytes);
+  const checksum = await sha256(bytes);
+  if (checksum !== String(asset.sha256).toLowerCase()) {
+    throw new Error('Portable drawing contains an image checksum mismatch.');
   }
-  throw new Error('Importing document images is not configured for this application.');
+  const mimeType = svgImageMimeType(asset.mimeType, asset.fileName || asset.reference);
+  if (!mimeType.startsWith('image/')) throw new Error('Portable drawing contains an unsupported image type.');
+  // Embedded bytes belong to this document; the installed catalog may contain a
+  // different version (including one that has not been reduced for drawing use).
+  const reference = `imported/${checksum}/${mimeType.slice(6)}`;
+  if (!runtimeCatalogImageUrls.has(reference)) {
+    const blob = new Blob([bytes], { type: mimeType });
+    const contentUrl = globalThis.URL.createObjectURL(blob);
+    runtimeCatalogImageUrls.set(reference, { contentUrl, byteSize: blob.size, isObjectUrl: true });
+    runtimeCatalogReferencesByUrl.set(contentUrl, reference);
+  }
+  return reference;
 }
 
 export function createImageCatalog({
