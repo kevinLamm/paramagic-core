@@ -42,7 +42,7 @@ import { drawingGeometryHitTargetClass, createSegmentSelectionNodes } from './Dr
 import { createFilletSystem } from './FilletSystem.js';
 import { createNotchSystem } from './NotchSystem.js';
 import { isNotchEntity, projectPointToNotchFeature, createNotchBoundaryResolver } from './NotchSystem.js';
-import { bindCanvasKeyboardFocus, createOverlapSelectionCycler, cameraWorldToScreen, cameraScreenToWorld, rotateCameraAt, scaleCameraAt, cameraViewportBounds, fitCameraBounds } from './CanvasViewport.js';
+import { bindCanvasKeyboardFocus, createOverlapSelectionCycler, cameraWorldToScreen, cameraScreenToWorld, rotateCameraAt, scaleCameraAt, cameraViewportBounds, fitCameraBounds, cameraContainsBounds } from './CanvasViewport.js';
 import {
   canvasOriginPointFeature,
 } from './CanvasOrigin.js';
@@ -80,7 +80,7 @@ import { organizeDerivedPaintNodes } from './CanvasPaintOrder.js';
 import { canvasPointerDragReady } from './CanvasPointerDrag.js';
 import { resolveWindowSelectionIds, canvasPointHandleHitDistance } from './CanvasSelection.js';
 
-export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver, interactive = true }) {
+export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver, interactive = true, showAxes = true }) {
   // Display-only canvases still render solver snapshots, but never route editing input.
   canvas.inert = !interactive;
   if (interactive) bindCanvasKeyboardFocus(canvas);
@@ -146,6 +146,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   const ns = 'http://www.w3.org/2000/svg';
   const g = document.createElementNS(ns, 'g');
   const axisLayer = document.createElementNS(ns, 'g');
+  axisLayer.style.display = showAxes ? '' : 'none';
   const objectLayer = document.createElementNS(ns, 'g');
   const stackHoverLayer = document.createElementNS(ns, 'g');
   const hoverLayer = document.createElementNS(ns, 'g');
@@ -4249,7 +4250,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
     if (event.key === 'Delete' || event.key === 'Backspace') deleteSelection();
   });
 
-  function zoomAll() {
+  function zoomAll({ onlyIfNeeded = false } = {}) {
     drawingUpdates.flush();
     if (!records.length) {
       camera = defaultCamera();
@@ -4266,10 +4267,12 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
       bounds = null;
     }
     if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
+      if (onlyIfNeeded) return;
       camera = defaultCamera();
       render();
       return;
     }
+    if (onlyIfNeeded && cameraContainsBounds(camera, bounds, canvas.clientWidth, canvas.clientHeight)) return;
     camera = fitCameraBounds(camera, bounds, canvas.clientWidth, canvas.clientHeight);
     render();
   }
@@ -4280,6 +4283,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   render();
 
   return {
+    fitDrawing: zoomAll,
     addObject,
     getNumericalDerivedGeometry: () => solver.derivedGeometry || null,
     addObjects,

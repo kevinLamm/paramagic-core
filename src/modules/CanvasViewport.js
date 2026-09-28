@@ -64,6 +64,14 @@ export function fitCameraBounds(camera, bounds, width, height) {
   return { ...camera, scale, x: width / 2 - (left + right) * scale / 2, y: height / 2 - (top + bottom) * scale / 2 };
 }
 
+export function cameraContainsBounds(camera, bounds, width, height, padding = 12) {
+  if (width <= padding * 2 || height <= padding * 2) return false;
+  return [[bounds.x, bounds.y], [bounds.x + bounds.width, bounds.y],
+    [bounds.x + bounds.width, bounds.y + bounds.height], [bounds.x, bounds.y + bounds.height]]
+    .map(point => cameraWorldToScreen(camera, point))
+    .every(([x, y]) => x >= padding && x <= width - padding && y >= padding && y <= height - padding);
+}
+
 export function clampCanvasZoom(value) {
   const requested = Number(value);
   if (!Number.isFinite(requested)) return 1;

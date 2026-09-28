@@ -646,7 +646,7 @@ function controlRuntimeMarkup(item, state) {
   </div>`;
 }
 
-export function controlRowMarkup(item, state, editing, childrenMarkup = '') {
+export function controlRowMarkup(item, state, editing, childrenMarkup = '', { showParameterNames = true } = {}) {
   const configurationError = state.error || '';
   const visibilityError = state.visibilityError || '';
   const error = configurationError || visibilityError;
@@ -659,7 +659,7 @@ export function controlRowMarkup(item, state, editing, childrenMarkup = '') {
       ${editing
         ? `<input class="panel-control-label-input" data-control-label value="${escapeHtml(item.label)}" placeholder="Control label" aria-label="${escapeHtml(item.parameterName)} label" />`
         : `<span class="panel-control-label">${escapeHtml(item.label || (container ? 'Container' : ''))}</span>`}
-      <span class="panel-control-parameter">${escapeHtml(item.parameterName)}</span>
+      ${showParameterNames ? `<span class="panel-control-parameter">${escapeHtml(item.parameterName)}</span>` : ''}
       ${editing ? `<button type="button" class="panel-control-visibility" data-control-visibility aria-pressed="${item.visible}" title="${item.visible ? 'Hide control in regular view' : 'Show control in regular view'}" aria-label="${item.visible ? 'Hide' : 'Show'} ${escapeHtml(item.parameterName)} in regular view">${svgIcon(item.visible ? 'visible' : 'hidden')}</button>` : ''}
       ${editing ? `<button type="button" class="panel-control-remove" data-control-remove title="Remove control" aria-label="Remove ${escapeHtml(item.parameterName)}">${svgIcon('remove')}</button>` : ''}
     </div>
@@ -717,6 +717,8 @@ export function createControlTools({
   onVisibilityChange = () => {},
   allowEditing = true,
   floating = true,
+  showHeader = true,
+  showParameterNames = true,
 } = {}) {
   const button = toolbar?.matches?.('[data-controls-toggle]')
     ? toolbar
@@ -747,7 +749,7 @@ export function createControlTools({
   panel.hidden = true;
   panel.setAttribute('aria-label', 'Controls');
   panel.innerHTML = `
-    <div class="controls-panel-header">
+    <div class="controls-panel-header"${showHeader ? '' : ' hidden'}>
       <h2>Controls</h2>
       <div class="controls-panel-header-actions">
         <button type="button" class="controls-edit-toggle" data-controls-edit aria-pressed="false" title="Edit controls" aria-label="Edit controls">${svgIcon('edit')}</button>
@@ -941,7 +943,7 @@ export function createControlTools({
       children.get(parentId).push(row);
     });
     const markup = (parentId) => (children.get(parentId) || []).map(({ item, state }) => (
-      controlRowMarkup(item, state, editing, markup(item.id))
+      controlRowMarkup(item, state, editing, markup(item.id), { showParameterNames })
     )).join('');
     list.innerHTML = displayedRows.length
       ? markup(null)
