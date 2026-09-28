@@ -80,8 +80,10 @@ import { organizeDerivedPaintNodes } from './CanvasPaintOrder.js';
 import { canvasPointerDragReady } from './CanvasPointerDrag.js';
 import { resolveWindowSelectionIds, canvasPointHandleHitDistance } from './CanvasSelection.js';
 
-export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver }) {
-  bindCanvasKeyboardFocus(canvas);
+export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entities, solver, interactive = true }) {
+  // Display-only canvases still render solver snapshots, but never route editing input.
+  canvas.inert = !interactive;
+  if (interactive) bindCanvasKeyboardFocus(canvas);
   const defaultCamera = () => ({ x: canvas.clientWidth / 2, y: canvas.clientHeight / 2, scale: 1, rotation: 0 });
   let camera = defaultCamera();
   let panStart = null;
@@ -4235,7 +4237,7 @@ export function createInfiniteCanvas({ canvas, grid, svg, status, reset, entitie
   }, { capture: true });
 
   document.addEventListener('keydown', (event) => {
-    if (event.defaultPrevented) return;
+    if (!interactive || event.defaultPrevented) return;
     // Editing a property or text field must never invoke canvas commands.
     // In particular, Backspace/Delete in the Fill Color expression used to
     // fall through here and delete the selected drawing object.

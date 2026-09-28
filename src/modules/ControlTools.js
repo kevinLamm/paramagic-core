@@ -715,6 +715,8 @@ export function createControlTools({
   solver,
   host = document.querySelector('.app-shell') || document.body,
   onVisibilityChange = () => {},
+  allowEditing = true,
+  floating = true,
 } = {}) {
   const button = toolbar?.matches?.('[data-controls-toggle]')
     ? toolbar
@@ -769,17 +771,19 @@ export function createControlTools({
   const list = panel.querySelector('[data-controls-list]');
   const actions = panel.querySelector('.controls-panel-actions');
   const editButton = panel.querySelector('[data-controls-edit]');
+  editButton.hidden = !allowEditing;
+  editButton.disabled = !allowEditing;
   const addSelect = panel.querySelector('[data-control-add]');
   const visibilityExpressionSymbols = panel.querySelector('#controlVisibilityExpressionSymbols');
-  const panelDragController = bindFloatingPanelDrag(panel, {
+  const panelDragController = floating ? bindFloatingPanelDrag(panel, {
     ignoreSelector: 'button, input, select, textarea, label, .controls-list',
-  });
+  }) : null;
 
   function setVisible(visible) {
     panel.hidden = !visible;
     if (visible) {
       render();
-      panelDragController.clamp();
+      panelDragController?.clamp();
     } else {
       controlExpressionLookups.forEach((lookup) => lookup.close());
     }
@@ -789,7 +793,7 @@ export function createControlTools({
   }
 
   function setEditing(value) {
-    editing = Boolean(value);
+    editing = allowEditing && Boolean(value);
     panel.classList.toggle('editing', editing);
     editButton.classList.toggle('active', editing);
     editButton.setAttribute('aria-pressed', String(editing));
@@ -1282,7 +1286,7 @@ export function createControlTools({
       destroyControlExpressionLookups();
       stopSolverSubscription?.();
       unregisterExtension?.();
-      panelDragController.destroy();
+      panelDragController?.destroy();
       panel.remove();
     },
   };
